@@ -1,0 +1,13 @@
+Suikai General Sell UI v5 - 4 steps
+1 ข้อมูลสินค้า
+2 รูปภาพ
+3 ตำแหน่ง
+4 ยืนยันการลงขาย
+
+Install:
+cd ~/Desktop/suikai
+cp lib/features/home/home_page.dart lib/features/home/home_page_backup_before_sell_v5.dart
+unzip -o ~/Downloads/suikai_general_sell_ui_v5.zip -d .
+flutter clean
+flutter pub get
+flutter run -d PJYTOZSOGI5TE675
