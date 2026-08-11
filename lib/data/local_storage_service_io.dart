@@ -5,7 +5,12 @@ import 'repositories.dart';
 
 class LocalStorageService implements StorageService {
   @override
-  Future<String> persistImage(String sourcePath, String extension) async {
+  Future<String> persistImage(
+    String sourcePath,
+    String extension, {
+    String? bucket,
+    String? objectPrefix,
+  }) async {
     final root = await getApplicationDocumentsDirectory();
     final dir = Directory('${root.path}/suikai_media');
     await dir.create(recursive: true);

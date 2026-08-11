@@ -691,6 +691,7 @@ class MockRepo {
   static List<MockProduct> get feedProducts {
     return products.where((product) {
       if (product.status == ProductStatus.sold ||
+          product.status == ProductStatus.outOfStock ||
           product.status == ProductStatus.deleted) {
         return false;
       }
@@ -1299,6 +1300,7 @@ class _HomePageState extends State<HomePage> {
     final source = MockRepo.feedProducts;
     final items = source.where((product) {
       if (product.status == ProductStatus.sold ||
+          product.status == ProductStatus.outOfStock ||
           product.status == ProductStatus.deleted) {
         return false;
       }
@@ -2701,8 +2703,8 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
                             ),
                             for (final status in const [
                               ProductStatus.available,
-                              ProductStatus.reserved,
-                              ProductStatus.sold,
+                              ProductStatus.outOfStock,
+                              ProductStatus.deleted,
                             ])
                               PopupMenuItem(
                                 value: status.name,
@@ -3011,11 +3013,17 @@ class _EditListingPageState extends State<EditListingPage> {
                     isExpanded: true,
                     decoration: InputDecoration(labelText: l10n.productStatus),
                     items:
-                        const [
-                              ProductStatus.available,
-                              ProductStatus.reserved,
-                              ProductStatus.sold,
-                            ]
+                        (product.isStoreProduct
+                                ? const [
+                                    ProductStatus.available,
+                                    ProductStatus.outOfStock,
+                                    ProductStatus.deleted,
+                                  ]
+                                : const [
+                                    ProductStatus.available,
+                                    ProductStatus.reserved,
+                                    ProductStatus.sold,
+                                  ])
                             .map(
                               (status) => DropdownMenuItem(
                                 value: status,
@@ -3228,6 +3236,7 @@ class _EditListingPageState extends State<EditListingPage> {
             .where((image) => image.selectedImage != null)
             .map((image) => image.selectedImage!)
             .toList(),
+        listingId: product.id,
       );
       var selectedIndex = 0;
       final finalImages = [
@@ -3449,8 +3458,8 @@ class _PostPageState extends State<PostPage> {
     final l10n = AppLocalizations.of(context);
     final statuses = const [
       ProductStatus.available,
-      ProductStatus.reserved,
-      ProductStatus.sold,
+      ProductStatus.outOfStock,
+      ProductStatus.deleted,
     ];
     return Scaffold(
       appBar: AppBar(title: LocalizedText(l10n.addStoreProduct)),
@@ -6438,8 +6447,8 @@ class _ProfilePageState extends State<ProfilePage> {
                             items:
                                 const [
                                       ProductStatus.available,
-                                      ProductStatus.reserved,
-                                      ProductStatus.sold,
+                                      ProductStatus.outOfStock,
+                                      ProductStatus.deleted,
                                     ]
                                     .map(
                                       (status) => DropdownMenuItem(
@@ -6560,32 +6569,120 @@ class SearchPage extends StatefulWidget {
   State<SearchPage> createState() => _SearchPageState();
 }
 
-class NotificationsPage extends StatelessWidget {
+class NotificationsPage extends StatefulWidget {
   const NotificationsPage({super.key});
+
+  @override
+  State<NotificationsPage> createState() => _NotificationsPageState();
+}
+
+class _NotificationsPageState extends State<NotificationsPage> {
+  late Future<List<NotificationRecord>> _future =
+      SuikaiService.fetchNotifications();
+
+  String _label(String type) => switch (type) {
+    'store_application_approved' => 'อนุมัติร้านแล้ว',
+    'store_application_rejected' => 'ไม่อนุมัติร้าน',
+    'store_edit_approved' => 'อนุมัติการแก้ไขร้านแล้ว',
+    'store_edit_rejected' => 'ไม่อนุมัติการแก้ไขร้าน',
+    'promotion_approved' => 'อนุมัติการโปรโมตร้านแล้ว',
+    'promotion_rejected' => 'ไม่อนุมัติการโปรโมตร้าน',
+    _ => type.replaceAll('_', ' '),
+  };
+
+  Future<void> _read(NotificationRecord value) async {
+    if (!value.isRead) await SuikaiService.markNotificationRead(value.id);
+    if (mounted) {
+      setState(() => _future = SuikaiService.fetchNotifications());
+    }
+  }
 
   @override
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(title: const LocalizedText('การแจ้งเตือน')),
-    body: const Center(
-      child: Padding(
-        padding: EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.notifications_none_rounded,
-              size: 58,
-              color: AppTheme.orange,
+    body: FutureBuilder<List<NotificationRecord>>(
+      future: _future,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final values = snapshot.data ?? const [];
+        if (values.isEmpty) {
+          return const Center(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.notifications_none_rounded,
+                    size: 58,
+                    color: AppTheme.orange,
+                  ),
+                  SizedBox(height: 12),
+                  LocalizedText(
+                    'ยังไม่มีการแจ้งเตือนใหม่',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: AppTheme.textMuted),
+                  ),
+                ],
+              ),
             ),
-            SizedBox(height: 12),
-            LocalizedText(
-              'ยังไม่มีการแจ้งเตือนใหม่',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: AppTheme.textMuted),
+          );
+        }
+        final unread = values.where((value) => !value.isRead).length;
+        return Column(
+          children: [
+            if (unread > 0)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    '$unread',
+                    style: const TextStyle(
+                      color: AppTheme.orange,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+              ),
+            Expanded(
+              child: ListView.separated(
+                itemCount: values.length,
+                separatorBuilder: (_, _) => const Divider(height: 1),
+                itemBuilder: (context, index) {
+                  final value = values[index];
+                  return ListTile(
+                    leading: Icon(
+                      value.isRead
+                          ? Icons.notifications_none_rounded
+                          : Icons.notifications_active_rounded,
+                      color: value.isRead
+                          ? AppTheme.textMuted
+                          : AppTheme.orange,
+                    ),
+                    title: LocalizedText(
+                      _label(value.eventType),
+                      style: TextStyle(
+                        fontWeight: value.isRead
+                            ? FontWeight.w500
+                            : FontWeight.w800,
+                      ),
+                    ),
+                    subtitle: Text(
+                      '${value.payload['review_note'] ?? ''}\n${value.createdAt.toLocal()}',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    onTap: () => _read(value),
+                  );
+                },
+              ),
             ),
           ],
-        ),
-      ),
+        );
+      },
     ),
   );
 }
@@ -6924,11 +7021,17 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
                     labelText: AppLocalizations.of(context).source('สถานะ'),
                   ),
                   items:
-                      const [
-                            ProductStatus.available,
-                            ProductStatus.reserved,
-                            ProductStatus.sold,
-                          ]
+                      (product.isStoreProduct
+                              ? const [
+                                  ProductStatus.available,
+                                  ProductStatus.outOfStock,
+                                  ProductStatus.deleted,
+                                ]
+                              : const [
+                                  ProductStatus.available,
+                                  ProductStatus.reserved,
+                                  ProductStatus.sold,
+                                ])
                           .map(
                             (v) => DropdownMenuItem(
                               value: v,

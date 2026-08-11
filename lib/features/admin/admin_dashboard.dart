@@ -66,11 +66,12 @@ class _AdminDashboardState extends State<AdminDashboard> {
                 child: Text(busy ? 'กำลังตรวจสอบ...' : 'เข้าสู่ระบบ Admin'),
               ),
               const SizedBox(height: 12),
-              const Text(
-                'Local Mock: admin@suikai.local / admin1234',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: AppTheme.textMuted, fontSize: 12),
-              ),
+              if (!SuikaiService.usesSupabase)
+                const Text(
+                  'Local Mock: admin@suikai.local / admin1234',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: AppTheme.textMuted, fontSize: 12),
+                ),
             ],
           ),
         ),
@@ -403,7 +404,12 @@ class _ListingsState extends State<_Listings> {
                   itemBuilder: (_) => [
                     for (final s
                         in widget.storeProducts
-                            ? const ['available', 'reserved', 'sold', 'hidden']
+                            ? const [
+                                'available',
+                                'out_of_stock',
+                                'deleted',
+                                'hidden',
+                              ]
                             : const ['available', 'reserved', 'sold', 'hidden'])
                       PopupMenuItem(value: s, child: Text(s)),
                     const PopupMenuDivider(),

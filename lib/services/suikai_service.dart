@@ -7,7 +7,9 @@ import 'package:share_plus/share_plus.dart';
 import 'package:uuid/uuid.dart';
 import '../data/local_repositories.dart';
 import '../data/models.dart';
+import '../data/repositories.dart';
 import '../data/store_categories.dart';
+import '../data/supabase_repositories.dart';
 
 class SelectedImage {
   final XFile file;
@@ -18,29 +20,63 @@ class SelectedImage {
 }
 
 class SuikaiService {
-  static final auth = LocalAuthRepository();
-  static final profiles = LocalProfileRepository();
-  static final listings = LocalListingRepository();
-  static final stores = LocalStoreRepository();
-  static final storeRequests = LocalStoreRequestRepository();
-  static final categoryRepository = LocalCategoryRepository();
-  static final likes = LocalLikeRepository();
-  static final reports = LocalReportRepository();
-  static final storage = createLocalStorageService();
-  static final admin = LocalAdminRepository();
+  static AuthRepository auth = LocalAuthRepository();
+  static ProfileRepository profiles = LocalProfileRepository();
+  static ListingRepository listings = LocalListingRepository();
+  static StoreRepository stores = LocalStoreRepository();
+  static StoreRequestRepository storeRequests = LocalStoreRequestRepository();
+  static CategoryRepository categoryRepository = LocalCategoryRepository();
+  static LikeRepository likes = LocalLikeRepository();
+  static ReportRepository reports = LocalReportRepository();
+  static NotificationRepository notifications = LocalNotificationRepository();
+  static StorageService storage = createLocalStorageService();
+  static AdminRepository admin = LocalAdminRepository();
   static final _picker = ImagePicker();
   static List<CategoryRecord> _categoryCache = [...initialCategoryRecords];
   static late String deviceId;
+  static bool get usesSupabase => SupabaseBackend.enabled;
   static String? get currentUserId => auth.currentUserId;
   static bool get isLoggedIn => currentUserId != null;
 
   static Future<bool> initialize() async {
     await LocalDatabase.initialize();
-    await categoryRepository.seedDefaults();
-    await categoryRepository.migrateLegacyReferences();
+    if (usesSupabase) {
+      await SupabaseBackend.initialize();
+      final client = SupabaseBackend.client;
+      auth = SupabaseAuthRepository(client);
+      profiles = SupabaseProfileRepository(client);
+      listings = SupabaseListingRepository(client);
+      stores = SupabaseStoreRepository(client);
+      storeRequests = SupabaseStoreRequestRepository(client);
+      categoryRepository = SupabaseCategoryRepository(client);
+      likes = SupabaseLikeRepository(client);
+      reports = SupabaseReportRepository(client);
+      notifications = SupabaseNotificationRepository(client);
+      storage = SupabaseStorageService(client);
+      admin = SupabaseAdminRepository(client);
+      await (auth as SupabaseAuthRepository).restore();
+      await (admin as SupabaseAdminRepository).restore();
+    } else {
+      final localAuth = LocalAuthRepository();
+      final localCategories = LocalCategoryRepository();
+      final localAdmin = LocalAdminRepository();
+      auth = localAuth;
+      profiles = LocalProfileRepository();
+      listings = LocalListingRepository();
+      stores = LocalStoreRepository();
+      storeRequests = LocalStoreRequestRepository();
+      categoryRepository = localCategories;
+      likes = LocalLikeRepository();
+      reports = LocalReportRepository();
+      notifications = LocalNotificationRepository();
+      storage = createLocalStorageService();
+      admin = localAdmin;
+      await localCategories.seedDefaults();
+      await localCategories.migrateLegacyReferences();
+      await localAuth.restore();
+      await localAdmin.restore();
+    }
     await refreshCategories();
-    await auth.restore();
-    await admin.restore();
     final prefs = await SharedPreferences.getInstance();
     deviceId = prefs.getString('local_device_id') ?? const Uuid().v4();
     await prefs.setString('local_device_id', deviceId);
@@ -184,10 +220,21 @@ class SuikaiService {
     return SelectedImage(file: picked, bytes: bytes);
   }
 
-  static Future<List<String>> _saveImages(List<SelectedImage> values) async {
+  static Future<List<String>> _saveImages(
+    List<SelectedImage> values, {
+    String? bucket,
+    String? objectPrefix,
+  }) async {
     final out = <String>[];
     for (final i in values) {
-      out.add(await storage.persistImage(i.file.path, i.extension));
+      out.add(
+        await storage.persistImage(
+          i.file.path,
+          i.extension,
+          bucket: bucket,
+          objectPrefix: objectPrefix,
+        ),
+      );
     }
     return out;
   }
@@ -216,9 +263,16 @@ class SuikaiService {
     bool isLocationVisible = true,
   }) async {
     final now = DateTime.now();
-    final saved = await _saveImages(images);
+    final id = const Uuid().v4();
+    final saved = await _saveImages(
+      images,
+      bucket: 'listing-images',
+      objectPrefix: usesSupabase
+          ? 'listings/drafts/${_requireUser()}/$id'
+          : 'listings/$id',
+    );
     final value = ListingRecord(
-      id: const Uuid().v4(),
+      id: id,
       ownerId: _requireUser(),
       storeId: storeId,
       title: title,
@@ -261,7 +315,11 @@ class SuikaiService {
     final all = await listings.all();
     final old = all.where((e) => e.id == listingId).firstOrNull;
     if (old == null) throw StateError('not_found');
-    final extra = await _saveImages(newImages);
+    final extra = await _saveImages(
+      newImages,
+      bucket: 'listing-images',
+      objectPrefix: 'listings/$listingId',
+    );
     await listings.update(
       ListingRecord(
         id: old.id,
@@ -295,8 +353,13 @@ class SuikaiService {
   }
 
   static Future<List<String>> persistSelectedImages(
-    List<SelectedImage> images,
-  ) => _saveImages(images);
+    List<SelectedImage> images, {
+    String? listingId,
+  }) => _saveImages(
+    images,
+    bucket: listingId == null ? null : 'listing-images',
+    objectPrefix: listingId == null ? null : 'listings/$listingId',
+  );
 
   static Future<void> deleteListing(String id) =>
       listings.delete(id, _requireUser());
@@ -315,13 +378,27 @@ class SuikaiService {
     double? latitude,
     double? longitude,
   }) async {
-    final logoPath = await storage.persistImage(logo.file.path, logo.extension);
+    final id = const Uuid().v4();
+    final ownerId = _requireUser();
+    final logoPath = await storage.persistImage(
+      logo.file.path,
+      logo.extension,
+      bucket: 'store-images',
+      objectPrefix: usesSupabase ? 'stores/drafts/$ownerId/$id' : 'stores/$id',
+    );
     final coverPath = cover == null
         ? ''
-        : await storage.persistImage(cover.file.path, cover.extension);
+        : await storage.persistImage(
+            cover.file.path,
+            cover.extension,
+            bucket: 'store-images',
+            objectPrefix: usesSupabase
+                ? 'stores/drafts/$ownerId/$id'
+                : 'stores/$id',
+          );
     final value = StoreRecord(
-      id: const Uuid().v4(),
-      ownerId: _requireUser(),
+      id: id,
+      ownerId: ownerId,
       name: name,
       logo: logoPath,
       cover: coverPath,
@@ -332,7 +409,7 @@ class SuikaiService {
       city: city,
       location: '$city${latitude == null ? '' : ',$latitude,$longitude'}',
       openingHours: hours,
-      status: 'approved',
+      status: usesSupabase ? 'pending' : 'approved',
       email: email ?? '',
       latitude: latitude,
       longitude: longitude,
@@ -353,7 +430,12 @@ class SuikaiService {
     if (old == null) throw StateError('not_found');
     final logoPath = logo == null
         ? old.logo
-        : await storage.persistImage(logo.file.path, logo.extension);
+        : await storage.persistImage(
+            logo.file.path,
+            logo.extension,
+            bucket: 'store-images',
+            objectPrefix: 'stores/$storeId',
+          );
     await stores.update(
       StoreRecord(
         id: old.id,
@@ -396,12 +478,16 @@ class SuikaiService {
       proposed['logo_url'] = await storage.persistImage(
         logo.file.path,
         logo.extension,
+        bucket: 'store-images',
+        objectPrefix: 'stores/$storeId/requests',
       );
     }
     if (cover != null) {
       proposed['cover_url'] = await storage.persistImage(
         cover.file.path,
         cover.extension,
+        bucket: 'store-images',
+        objectPrefix: 'stores/$storeId/requests',
       );
     }
     await storeRequests.submitEdit(
@@ -463,11 +549,13 @@ class SuikaiService {
   };
   static Future<void> likeListing(String id) async {
     if (!await likes.like(id, deviceId)) return;
+    if (usesSupabase) return;
     await _bump(id, like: true);
   }
 
   static Future<void> trackView(String id) async {
     if (!await likes.view(id, deviceId)) return;
+    if (usesSupabase) return;
     await _bump(id, like: false);
   }
 
@@ -496,6 +584,12 @@ class SuikaiService {
       createdAt: DateTime.now(),
     ),
   );
+  static Future<List<NotificationRecord>> fetchNotifications() =>
+      isLoggedIn ? notifications.all() : Future.value(const []);
+  static Future<int> unreadNotificationCount() =>
+      isLoggedIn ? notifications.unreadCount() : Future.value(0);
+  static Future<void> markNotificationRead(String id) =>
+      isLoggedIn ? notifications.markRead(id) : Future.value();
   static Future<Position?> getCurrentPosition({bool request = true}) async {
     if (!await Geolocator.isLocationServiceEnabled()) return null;
     var p = await Geolocator.checkPermission();

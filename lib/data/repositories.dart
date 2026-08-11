@@ -57,8 +57,19 @@ abstract interface class ReportRepository {
   Future<void> create(ReportRecord report);
 }
 
+abstract interface class NotificationRepository {
+  Future<List<NotificationRecord>> all();
+  Future<void> markRead(String id);
+  Future<int> unreadCount();
+}
+
 abstract interface class StorageService {
-  Future<String> persistImage(String sourcePath, String extension);
+  Future<String> persistImage(
+    String sourcePath,
+    String extension, {
+    String? bucket,
+    String? objectPrefix,
+  });
 }
 
 /// Backend-neutral contract used only by privileged administration UI.

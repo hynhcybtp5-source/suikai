@@ -325,3 +325,38 @@ class ReportRecord {
     'created_at': createdAt.toIso8601String(),
   };
 }
+
+class NotificationRecord {
+  final String id, eventType;
+  final Map<String, dynamic> payload;
+  final bool isRead;
+  final DateTime createdAt;
+  final DateTime? readAt;
+  const NotificationRecord({
+    required this.id,
+    required this.eventType,
+    required this.payload,
+    required this.isRead,
+    required this.createdAt,
+    this.readAt,
+  });
+
+  factory NotificationRecord.fromJson(Map<String, dynamic> json) =>
+      NotificationRecord(
+        id: '${json['id']}',
+        eventType: '${json['event_type'] ?? ''}',
+        payload: Map<String, dynamic>.from(json['payload'] as Map? ?? const {}),
+        isRead: json['is_read'] == true,
+        createdAt: DateTime.tryParse('${json['created_at']}') ?? DateTime.now(),
+        readAt: DateTime.tryParse('${json['read_at']}'),
+      );
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'event_type': eventType,
+    'payload': payload,
+    'is_read': isRead,
+    'created_at': createdAt.toIso8601String(),
+    'read_at': readAt?.toIso8601String(),
+  };
+}

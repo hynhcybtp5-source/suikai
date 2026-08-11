@@ -22,6 +22,7 @@ class LocalDatabase {
       storeEditRequests,
       promotionRequests,
       categories;
+  static Box<dynamic>? notifications;
   static Future<void> initialize() async {
     await Hive.initFlutter('suikai_local');
     users = await Hive.openBox('users_v1');
@@ -32,6 +33,7 @@ class LocalDatabase {
     storeEditRequests = await Hive.openBox('store_edit_requests_v1');
     promotionRequests = await Hive.openBox('promotion_requests_v1');
     categories = await Hive.openBox('categories_v1');
+    notifications = await Hive.openBox('notifications_v1');
   }
 }
 
@@ -336,6 +338,34 @@ class LocalReportRepository implements ReportRepository {
   @override
   Future<void> create(ReportRecord r) =>
       LocalDatabase.reports.put(r.id, r.toJson());
+}
+
+class LocalNotificationRepository implements NotificationRepository {
+  @override
+  Future<List<NotificationRecord>> all() async {
+    final box = LocalDatabase.notifications;
+    if (box == null) return const [];
+    return box.values
+        .map((value) => NotificationRecord.fromJson(_map(value)))
+        .toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+  }
+
+  @override
+  Future<void> markRead(String id) async {
+    final box = LocalDatabase.notifications;
+    final raw = box?.get(id);
+    if (raw == null) return;
+    await box!.put(id, {
+      ..._map(raw),
+      'is_read': true,
+      'read_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  @override
+  Future<int> unreadCount() async =>
+      (await all()).where((value) => !value.isRead).length;
 }
 
 class LocalAdminRepository implements AdminRepository {

@@ -213,7 +213,7 @@ void main() {
   });
 
   testWidgets(
-    'Store product form exposes five image slots and shared statuses',
+    'Store product form exposes five image slots and store statuses',
     (tester) async {
       await tester.pumpWidget(
         MaterialApp(
@@ -240,8 +240,8 @@ void main() {
       await tester.tap(statusDropdown);
       await tester.pumpAndSettle();
       expect(find.text('Available'), findsWidgets);
-      expect(find.text('Reserved'), findsOneWidget);
-      expect(find.text('Sold'), findsOneWidget);
+      expect(find.text('Out of stock'), findsOneWidget);
+      expect(find.text('Deleted'), findsOneWidget);
       expect(tester.takeException(), isNull);
     },
   );
