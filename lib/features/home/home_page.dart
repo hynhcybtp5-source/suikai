@@ -1,16 +1,23 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:flutter_map/flutter_map.dart' as fmap;
+import 'package:latlong2/latlong.dart' as latlng;
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/locale_controller.dart';
+import '../../core/app_route_observer.dart';
 import '../../l10n/app_localizations.dart';
 import '../../l10n/mobile_localizations.dart';
 import '../../core/theme/app_theme.dart';
+import '../../core/category_icons.dart';
 import '../../services/suikai_service.dart';
 import '../../services/fx_service.dart';
 import '../../data/models.dart';
+import '../../widgets/tiktok_embed_player.dart';
+import '../../widgets/location_picker_map.dart';
 import '../admin/admin_dashboard.dart';
 import '../auth/auth_page.dart';
 
@@ -19,6 +26,7 @@ class SuikaiRoutes {
   static const stores = '/stores';
   static const post = '/post';
   static const map = '/map';
+  static const shortVideos = '/short-videos';
   static const profile = '/profile';
   static const search = '/search';
   static const notifications = '/notifications';
@@ -30,13 +38,14 @@ class SuikaiRoutes {
   static const login = '/login';
 
   static Widget _protected(String route, Widget child) =>
-      SuikaiService.isLoggedIn ? child : LoginPage(pendingRoute: route);
+      SuikaiService.hasValidSession ? child : LoginPage(pendingRoute: route);
 
   static Map<String, WidgetBuilder> get routes => {
     home: (_) => const HomePage(),
     stores: (_) => const StoreListPage(),
     post: (_) => _protected(post, const PostPage()),
     map: (_) => const MapPage(),
+    shortVideos: (_) => const ShortVideoFeedPage(),
     profile: (_) => _protected(profile, const ProfilePage()),
     search: (_) => const SearchPage(),
     notifications: (_) => const NotificationsPage(),
@@ -98,11 +107,13 @@ extension ProductStatusX on ProductStatus {
   }
 }
 
-class MockStore {
+class StoreViewModel {
   final String id;
   final String name;
   final String type;
   final String city;
+  final String? cityId;
+  final CityRecord? cityRecord;
   final String distance;
   final String logo;
   final String description;
@@ -110,6 +121,7 @@ class MockStore {
   final String viber;
   final String hours;
   final bool approved;
+  final String status;
   final String searchableProducts;
   final String? ownerId;
   final String? coverUrl;
@@ -120,11 +132,13 @@ class MockStore {
   final double? latitude;
   final double? longitude;
 
-  const MockStore({
+  const StoreViewModel({
     required this.id,
     required this.name,
     required this.type,
     required this.city,
+    this.cityId,
+    this.cityRecord,
     required this.distance,
     required this.logo,
     required this.description,
@@ -132,6 +146,7 @@ class MockStore {
     required this.viber,
     required this.hours,
     required this.approved,
+    this.status = '',
     this.searchableProducts = '',
     this.ownerId,
     this.coverUrl,
@@ -143,6 +158,16 @@ class MockStore {
     this.longitude,
   });
 
+  String get effectiveStatus =>
+      status.isEmpty ? (approved ? 'approved' : 'pending') : status;
+
+  String localizedCity(String localeCode, {String fallback = ''}) {
+    if (city.trim().isNotEmpty) return city.trim();
+    final translated = cityRecord?.localizedName(localeCode) ?? '';
+    if (translated.trim().isNotEmpty) return translated.trim();
+    return fallback;
+  }
+
   bool get promotionIsActive {
     if (!isPromoted) return false;
     final now = DateTime.now();
@@ -151,23 +176,13 @@ class MockStore {
   }
 }
 
-IconData _storeCategoryIcon(String value) => switch (value) {
-  'store_food' || 'listing_food' => Icons.restaurant_rounded,
-  'store_cafe' => Icons.local_cafe_rounded,
-  'store_auto_repair' || 'listing_vehicles' => Icons.car_repair_rounded,
-  'store_hotpot' => Icons.soup_kitchen_rounded,
-  'store_grill' => Icons.outdoor_grill_rounded,
-  'store_supermarket' => Icons.shopping_basket_rounded,
-  'store_beauty' => Icons.content_cut_rounded,
-  'store_pets' => Icons.pets_rounded,
-  'store_pharmacy' => Icons.medical_services_rounded,
-  'store_mobile' || 'listing_mobile' => Icons.phone_android_rounded,
-  'store_electronics' || 'listing_electronics' => Icons.devices_rounded,
-  'store_fashion' || 'listing_fashion' => Icons.checkroom_rounded,
-  'store_home' || 'listing_home' => Icons.home_outlined,
-  'store_services' || 'listing_tools' => Icons.handyman_outlined,
-  _ => Icons.more_horiz_rounded,
-};
+IconData _categoryIcon(String value) {
+  final category = [
+    ...SuikaiService.categoryRecords('store'),
+    ...SuikaiService.categoryRecords('listing'),
+  ].where((item) => item.matches(value)).firstOrNull;
+  return categoryIconData(category?.iconKey);
+}
 
 String _categoryLabel(BuildContext context, String type, String value) =>
     SuikaiService.categoryLabel(
@@ -176,7 +191,16 @@ String _categoryLabel(BuildContext context, String type, String value) =>
       Localizations.localeOf(context).languageCode,
     );
 
-class MockProduct {
+bool mapCategoryMatches(String categoryId, String selectedCategoryId) =>
+    selectedCategoryId == 'all' || categoryId == selectedCategoryId;
+
+Uri storeNavigationUri(double latitude, double longitude) => Uri.https(
+  'www.google.com',
+  '/maps/dir/',
+  {'api': '1', 'destination': '$latitude,$longitude', 'travelmode': 'driving'},
+);
+
+class ProductViewModel {
   final String id;
   final String title;
   final int priceValue;
@@ -184,6 +208,8 @@ class MockProduct {
   final String description;
   final String category;
   final String city;
+  final String? cityId;
+  final CityRecord? cityRecord;
   final String location;
   final String time;
   final String image;
@@ -199,7 +225,7 @@ class MockProduct {
   final double? longitude;
   final bool isLocationVisible;
 
-  const MockProduct({
+  const ProductViewModel({
     required this.id,
     required this.title,
     required this.priceValue,
@@ -207,6 +233,8 @@ class MockProduct {
     required this.description,
     required this.category,
     required this.city,
+    this.cityId,
+    this.cityRecord,
     required this.location,
     required this.time,
     required this.image,
@@ -225,13 +253,45 @@ class MockProduct {
 
   bool get isStoreProduct => storeId != null;
   String get price => formatPrice(priceValue, currencyCode);
-  List<String> get imageUrls => images.isEmpty ? [image] : images;
+  String localizedCity(String localeCode, {String fallback = ''}) {
+    if (city.trim().isNotEmpty) return city.trim();
+    final translated = cityRecord?.localizedName(localeCode) ?? '';
+    if (translated.trim().isNotEmpty) return translated.trim();
+    return fallback;
+  }
+
+  double? get publicLatitude => isLocationVisible ? latitude : null;
+  double? get publicLongitude => isLocationVisible ? longitude : null;
+
+  List<String> get imageUrls {
+    final values = (images.isEmpty ? [image] : images)
+        .map((value) => value.trim())
+        .where((value) => value.isNotEmpty)
+        .toSet()
+        .toList();
+    return values;
+  }
 }
 
-String? primaryProductImage(MockProduct product) {
+String? primaryProductImage(ProductViewModel product) {
   final source = product.images.firstOrNull ?? product.image;
   return source.trim().isEmpty ? null : source;
 }
+
+String? validateRequiredCity(String? value) =>
+    normalizeText(value).isEmpty ? 'กรุณากรอกชื่อเมือง' : null;
+
+String productCityLabel(BuildContext context, ProductViewModel product) =>
+    product.localizedCity(
+      Localizations.localeOf(context).languageCode,
+      fallback: AppLocalizations.of(context).source('ไม่ระบุเมือง'),
+    );
+
+String storeCityLabel(BuildContext context, StoreViewModel store) =>
+    store.localizedCity(
+      Localizations.localeOf(context).languageCode,
+      fallback: AppLocalizations.of(context).source('ไม่ระบุเมือง'),
+    );
 
 String formatPrice(int value, String currencyCode) {
   final formatted = value.toString().replaceAllMapped(
@@ -273,6 +333,121 @@ int? parsePriceValue(String? value) {
   return int.tryParse(text);
 }
 
+class _ThousandsInputFormatter extends TextInputFormatter {
+  const _ThousandsInputFormatter();
+
+  @override
+  TextEditingValue formatEditUpdate(
+    TextEditingValue oldValue,
+    TextEditingValue newValue,
+  ) {
+    var digits = newValue.text.replaceAll(RegExp(r'\D'), '');
+    digits = digits.replaceFirst(RegExp(r'^0+(?=\d)'), '');
+    if (digits.isEmpty) return const TextEditingValue();
+    final formatted = digits.replaceAllMapped(
+      RegExp(r'(\d{1,3})(?=(\d{3})+(?!\d))'),
+      (match) => '${match[1]},',
+    );
+    return TextEditingValue(
+      text: formatted,
+      selection: TextSelection.collapsed(offset: formatted.length),
+    );
+  }
+}
+
+class _NumericPriceRange extends StatelessWidget {
+  final TextEditingController minimum, maximum;
+  final String currency;
+  final ValueChanged<String> onCurrencyChanged;
+  final VoidCallback onChanged;
+
+  const _NumericPriceRange({
+    required this.minimum,
+    required this.maximum,
+    required this.currency,
+    required this.onCurrencyChanged,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final min = parsePriceValue(minimum.text);
+    final max = parsePriceValue(maximum.text);
+    final invalid = min != null && max != null && min > max;
+    Widget amountField(TextEditingController controller, String label) =>
+        TextField(
+          controller: controller,
+          keyboardType: TextInputType.number,
+          inputFormatters: const [_ThousandsInputFormatter()],
+          onChanged: (_) => onChanged(),
+          decoration: InputDecoration(
+            labelText: AppLocalizations.of(context).source(label),
+            hintText: label == 'ราคาต่ำสุด' ? '100,000' : '5,000,000',
+            errorText: invalid ? ' ' : null,
+          ),
+        );
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final fields = [
+              Expanded(child: amountField(minimum, 'ราคาต่ำสุด')),
+              const SizedBox(width: 10),
+              Expanded(child: amountField(maximum, 'ราคาสูงสุด')),
+              const SizedBox(width: 10),
+              SizedBox(
+                width: 92,
+                child: DropdownButtonFormField<String>(
+                  initialValue: currency,
+                  isExpanded: true,
+                  decoration: InputDecoration(
+                    labelText: AppLocalizations.of(context).source('สกุลเงิน'),
+                  ),
+                  items: const ['MMK', 'THB', 'USD', 'CNY']
+                      .map(
+                        (value) =>
+                            DropdownMenuItem(value: value, child: Text(value)),
+                      )
+                      .toList(),
+                  onChanged: (value) {
+                    if (value != null) onCurrencyChanged(value);
+                  },
+                ),
+              ),
+            ];
+            if (constraints.maxWidth >= 390) {
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: fields,
+              );
+            }
+            return Column(
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: fields.take(3).toList(),
+                ),
+                const SizedBox(height: 10),
+                Align(alignment: Alignment.centerLeft, child: fields.last),
+              ],
+            );
+          },
+        ),
+        if (invalid)
+          const Padding(
+            padding: EdgeInsets.only(top: 2),
+            child: LocalizedText(
+              'ราคาต่ำสุดต้องไม่เกินราคาสูงสุด',
+              style: TextStyle(color: Colors.red, fontSize: 12),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
 String normalizePhone(String? value) {
   final normalized = normalizeText(value).replaceAll(RegExp(r'[^0-9+]'), '');
   if (normalized.isEmpty) {
@@ -299,396 +474,15 @@ String? validateEmail(String? value) {
   return isValid ? null : 'รูปแบบอีเมลไม่ถูกต้อง';
 }
 
-class MockRepo {
-  static final stores = <MockStore>[
-    MockStore(
-      id: 's1',
-      name: 'Nang Auto House',
-      type: 'ยานพาหนะ',
-      city: 'เมืองนาง',
-      distance: '1.2 กม.',
-      logo:
-          'https://images.unsplash.com/photo-1549924231-f129b911e442?auto=format&fit=crop&w=300&q=80',
-      description: 'รถมือสองคุณภาพ พร้อมตรวจเช็คก่อนส่งมอบ',
-      phone: '0205551111',
-      viber: '0205551111',
-      hours: '08:00 - 18:00',
-      approved: true,
-    ),
-    MockStore(
-      id: 's2',
-      name: 'Mobi Center',
-      type: 'มือถือ & แท็บเล็ต',
-      city: 'เมืองนาง',
-      distance: '2.0 กม.',
-      logo:
-          'https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?auto=format&fit=crop&w=300&q=80',
-      description: 'เครื่องแท้ อุปกรณ์ครบ มีรับประกันร้าน',
-      phone: '0205552222',
-      viber: '0205552222',
-      hours: '09:00 - 19:00',
-      approved: true,
-    ),
-    MockStore(
-      id: 's3',
-      name: 'Home Loft Market',
-      type: 'บ้าน & สวน',
-      city: 'หาดคำ',
-      distance: '3.8 กม.',
-      logo:
-          'https://images.unsplash.com/photo-1484154218962-a197022b5858?auto=format&fit=crop&w=300&q=80',
-      description: 'เฟอร์นิเจอร์และของแต่งบ้านสภาพดี',
-      phone: '0205553333',
-      viber: '0205553333',
-      hours: '10:00 - 20:00',
-      approved: true,
-    ),
-    MockStore(
-      id: 's4',
-      name: 'Pending Gadget Shop',
-      type: 'มือถือ & แท็บเล็ต',
-      city: 'เมืองนาง',
-      distance: '5.0 กม.',
-      logo:
-          'https://images.unsplash.com/photo-1468495244123-6c6c332eeece?auto=format&fit=crop&w=300&q=80',
-      description: 'ร้านยังรอการอนุมัติ',
-      phone: '0205554444',
-      viber: '0205554444',
-      hours: '08:00 - 17:00',
-      approved: false,
-    ),
-  ];
+class MarketplaceCache {
+  static final stores = <StoreViewModel>[];
+  static final products = <ProductViewModel>[];
+  static final productsRevision = ValueNotifier<int>(0);
 
-  static final products = <MockProduct>[
-    MockProduct(
-      id: 'p1',
-      title: 'Toyota Vios 2019',
-      priceValue: 325000,
-      description: 'รถบ้านสภาพดี ไมล์แท้ พร้อมโอน',
-      category: 'ยานพาหนะ',
-      city: 'เมืองนาง',
-      location: 'น้ำจ่าง, เมืองนาง',
-      time: '2 ชั่วโมงที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1549317661-bd32c8ce0db2?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110001',
-      viber: '0201110001',
-      likeCount: 42,
-      viewCount: 760,
-      status: ProductStatus.available,
-    ),
-    MockProduct(
-      id: 'p2',
-      title: 'iPhone 13 Pro Max 256GB',
-      priceValue: 18500,
-      description: 'เครื่องศูนย์ แบตดี 88%',
-      category: 'มือถือ & แท็บเล็ต',
-      city: 'เมืองนาง',
-      location: 'น้ำจ่าง, เมืองนาง',
-      time: '3 ชั่วโมงที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1592750475338-74b7b21085ab?auto=format&fit=crop&w=700&q=80',
-      images: [
-        'https://images.unsplash.com/photo-1592750475338-74b7b21085ab?auto=format&fit=crop&w=700&q=80',
-        'https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?auto=format&fit=crop&w=700&q=80',
-        'https://images.unsplash.com/photo-1580910051074-3eb694886505?auto=format&fit=crop&w=700&q=80',
-      ],
-      phone: '0201110002',
-      viber: '0201110002',
-      likeCount: 27,
-      viewCount: 530,
-      status: ProductStatus.available,
-    ),
-    MockProduct(
-      id: 'p3',
-      title: 'โซฟา 3 ที่นั่ง สภาพดี',
-      priceValue: 4200,
-      description: 'ใช้งานน้อย ไม่มีรอยขาด',
-      category: 'บ้าน & สวน',
-      city: 'หาดคำ',
-      location: 'หาดคำ, เมืองนาง',
-      time: '5 ชั่วโมงที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1555041469-a586c61ea9bc?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110003',
-      viber: '0201110003',
-      likeCount: 18,
-      viewCount: 240,
-      status: ProductStatus.reserved,
-    ),
-    MockProduct(
-      id: 'p4',
-      title: 'Yamaha Exciter 150cc',
-      priceValue: 28000,
-      description: 'รถพร้อมใช้งาน เอกสารครบ',
-      category: 'ยานพาหนะ',
-      city: 'เมืองนาง',
-      location: 'หนองบัว, เมืองนาง',
-      time: '1 วันที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1558981806-ec527fa84c39?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110004',
-      viber: '0201110004',
-      likeCount: 35,
-      viewCount: 412,
-      status: ProductStatus.sold,
-    ),
-    MockProduct(
-      id: 'p5',
-      title: 'MacBook Air M1 256GB',
-      priceValue: 21500,
-      description: 'อุปกรณ์ครบ ใช้งานปกติ',
-      category: 'มือถือ & แท็บเล็ต',
-      city: 'เมืองนาง',
-      location: 'น้ำจ่าง, เมืองนาง',
-      time: '1 วันที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1517336714731-489689fd1ca8?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110005',
-      viber: '0201110005',
-      likeCount: 48,
-      viewCount: 1002,
-      status: ProductStatus.available,
-      storeId: 's2',
-    ),
-    MockProduct(
-      id: 'p6',
-      title: 'iPhone 11 128GB',
-      priceValue: 12900,
-      description: 'เครื่องศูนย์ไทย มีเคสและสายชาร์จ',
-      category: 'มือถือ & แท็บเล็ต',
-      city: 'เมืองนาง',
-      location: 'น้ำจ่าง, เมืองนาง',
-      time: '2 วันที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1574755393849-623942496936?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110006',
-      viber: '0201110006',
-      likeCount: 22,
-      viewCount: 390,
-      status: ProductStatus.outOfStock,
-      storeId: 's2',
-    ),
-    MockProduct(
-      id: 'p7',
-      title: 'โต๊ะอาหาร 4 ที่นั่ง',
-      priceValue: 7800,
-      description: 'ไม้จริง แข็งแรง',
-      category: 'บ้าน & สวน',
-      city: 'หาดคำ',
-      location: 'หาดคำ, เมืองนาง',
-      time: '2 วันที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1577140917170-285929fb55b7?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110007',
-      viber: '0201110007',
-      likeCount: 15,
-      viewCount: 206,
-      status: ProductStatus.deleted,
-      storeId: 's3',
-    ),
-    MockProduct(
-      id: 'p8',
-      title: 'Honda City 2018',
-      priceValue: 265000,
-      description: 'เจ้าของขายเอง เอกสารพร้อม',
-      category: 'ยานพาหนะ',
-      city: 'เมืองนาง',
-      location: 'น้ำจ่าง, เมืองนาง',
-      time: '2 วันที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1553440569-bcc63803a83d?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110008',
-      viber: '0201110008',
-      likeCount: 31,
-      viewCount: 460,
-      status: ProductStatus.available,
-      storeId: 's1',
-    ),
-    MockProduct(
-      id: 'p9',
-      title: 'เสื้อแจ็กเก็ตผ้ายีนส์',
-      priceValue: 45,
-      currencyCode: 'USD',
-      description: 'สภาพดี ใส่น้อย',
-      category: 'แฟชั่น',
-      city: 'เมืองนาง',
-      location: 'ตลาดกลาง, เมืองนาง',
-      time: '3 วันที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1551028719-00167b16eac5?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110009',
-      viber: '0201110009',
-      likeCount: 12,
-      viewCount: 184,
-      status: ProductStatus.available,
-    ),
-    MockProduct(
-      id: 'p10',
-      title: 'กาแฟคั่วเมล็ด 1 กิโลกรัม',
-      priceValue: 32000,
-      currencyCode: 'MMK',
-      description: 'คั่วสด กลิ่นหอม',
-      category: 'อาหาร & เครื่องดื่ม',
-      city: 'ตองจี',
-      location: 'ตองจี, รัฐฉาน',
-      time: '4 ชั่วโมงที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1447933601403-0c6688de566e?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110010',
-      viber: '0201110010',
-      likeCount: 33,
-      viewCount: 298,
-      status: ProductStatus.available,
-    ),
-    MockProduct(
-      id: 'p11',
-      title: 'สว่านไร้สายพร้อมแบตเตอรี่',
-      priceValue: 1850,
-      currencyCode: 'THB',
-      description: 'พร้อมกล่องและดอกสว่าน',
-      category: 'เครื่องมือ & อุปกรณ์',
-      city: 'หาดคำ',
-      location: 'หาดคำ, เมืองนาง',
-      time: '6 ชั่วโมงที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1504148455328-c376907d081c?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110011',
-      viber: '0201110011',
-      likeCount: 9,
-      viewCount: 126,
-      status: ProductStatus.reserved,
-    ),
-    MockProduct(
-      id: 'p12',
-      title: 'ลำโพง Bluetooth',
-      priceValue: 260,
-      currencyCode: 'CNY',
-      description: 'เสียงดี แบตใช้งานได้ทั้งวัน',
-      category: 'มือถือ & แท็บเล็ต',
-      city: 'เมืองนาง',
-      location: 'น้ำจ่าง, เมืองนาง',
-      time: 'เมื่อวาน',
-      image:
-          'https://images.unsplash.com/photo-1608043152269-423dbba4e7e1?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110012',
-      viber: '0201110012',
-      likeCount: 21,
-      viewCount: 347,
-      status: ProductStatus.available,
-    ),
-    MockProduct(
-      id: 'p13',
-      title: 'ตู้ไม้เก็บของสองบาน',
-      priceValue: 6500,
-      currencyCode: 'THB',
-      description: 'ไม้แข็งแรง พร้อมใช้งาน',
-      category: 'บ้าน & สวน',
-      city: 'เมืองนาง',
-      location: 'หนองบัว, เมืองนาง',
-      time: '2 วันที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1558997519-83ea9252edf8?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110013',
-      viber: '0201110013',
-      likeCount: 16,
-      viewCount: 211,
-      status: ProductStatus.available,
-    ),
-    MockProduct(
-      id: 'p14',
-      title: 'กล่องสะสมงานหัตถกรรม',
-      priceValue: 75000,
-      currencyCode: 'MMK',
-      description: 'งานทำมือจากชุมชน',
-      category: 'อื่นๆ',
-      city: 'สีป้อ',
-      location: 'สีป้อ, รัฐฉาน',
-      time: '5 วันที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1452860606245-08befc0ff44b?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110014',
-      viber: '0201110014',
-      likeCount: 7,
-      viewCount: 98,
-      status: ProductStatus.available,
-    ),
-    MockProduct(
-      id: 'p15',
-      title: 'หมวกกันน็อกเต็มใบ',
-      priceValue: 2200,
-      description: 'มี มอก. สภาพใหม่',
-      category: 'ยานพาหนะ',
-      city: 'เมืองนาง',
-      location: 'เมืองนาง',
-      time: '1 ชั่วโมงที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1558981359-219d6364c9c8?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110015',
-      viber: '0201110015',
-      likeCount: 14,
-      viewCount: 190,
-      status: ProductStatus.available,
-    ),
-    MockProduct(
-      id: 'p16',
-      title: 'รองเท้าผ้าใบสีขาว',
-      priceValue: 980,
-      description: 'ไซซ์ 40 ไม่เคยใช้งาน',
-      category: 'แฟชั่น',
-      city: 'ตองจี',
-      location: 'ตองจี',
-      time: '8 ชั่วโมงที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110016',
-      viber: '0201110016',
-      likeCount: 25,
-      viewCount: 321,
-      status: ProductStatus.available,
-    ),
-    MockProduct(
-      id: 'p17',
-      title: 'ชุดประแจอเนกประสงค์',
-      priceValue: 48000,
-      currencyCode: 'MMK',
-      description: 'ครบชุดพร้อมกล่อง',
-      category: 'เครื่องมือ & อุปกรณ์',
-      city: 'สีป้อ',
-      location: 'สีป้อ',
-      time: 'เมื่อวาน',
-      image:
-          'https://images.unsplash.com/photo-1581147036324-c1c89c2c8b5c?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110017',
-      viber: '0201110017',
-      likeCount: 11,
-      viewCount: 155,
-      status: ProductStatus.available,
-    ),
-    MockProduct(
-      id: 'p18',
-      title: 'น้ำผึ้งธรรมชาติ 500 กรัม',
-      priceValue: 38,
-      currencyCode: 'CNY',
-      description: 'น้ำผึ้งแท้จากชุมชน',
-      category: 'อาหาร & เครื่องดื่ม',
-      city: 'หาดคำ',
-      location: 'หาดคำ',
-      time: '2 ชั่วโมงที่แล้ว',
-      image:
-          'https://images.unsplash.com/photo-1587049352846-4a222e784d38?auto=format&fit=crop&w=700&q=80',
-      phone: '0201110018',
-      viber: '0201110018',
-      likeCount: 19,
-      viewCount: 267,
-      status: ProductStatus.available,
-    ),
-  ];
-
-  static List<MockStore> get approvedStores =>
+  static List<StoreViewModel> get approvedStores =>
       stores.where((store) => store.approved).toList();
 
-  static List<MockProduct> get feedProducts {
+  static List<ProductViewModel> get feedProducts {
     return products.where((product) {
       if (product.status == ProductStatus.sold ||
           product.status == ProductStatus.outOfStock ||
@@ -703,7 +497,7 @@ class MockRepo {
     }).toList();
   }
 
-  static MockStore? storeById(String id) {
+  static StoreViewModel? storeById(String id) {
     for (final store in stores) {
       if (store.id == id) {
         return store;
@@ -712,7 +506,7 @@ class MockRepo {
     return null;
   }
 
-  static MockProduct? productById(String id) {
+  static ProductViewModel? productById(String id) {
     for (final product in products) {
       if (product.id == id) {
         return product;
@@ -721,7 +515,7 @@ class MockRepo {
     return null;
   }
 
-  static void cacheProducts(Iterable<MockProduct> remote) {
+  static void cacheProducts(Iterable<ProductViewModel> remote) {
     for (final product in remote) {
       final index = products.indexWhere((item) => item.id == product.id);
       if (index < 0)
@@ -731,15 +525,16 @@ class MockRepo {
     }
   }
 
-  static void syncLocalProducts(Iterable<MockProduct> values) {
+  static void syncRemoteProducts(Iterable<ProductViewModel> values) {
     products.removeWhere((item) => item.ownerId != null);
     for (final product in values.toList().reversed) {
       products.removeWhere((item) => item.id == product.id);
       products.insert(0, product);
     }
+    productsRevision.value++;
   }
 
-  static void cacheStores(Iterable<MockStore> remote) {
+  static void cacheStores(Iterable<StoreViewModel> remote) {
     for (final store in remote) {
       final index = stores.indexWhere((item) => item.id == store.id);
       if (index < 0)
@@ -749,16 +544,24 @@ class MockRepo {
     }
   }
 
-  static void syncLocalStores(Iterable<MockStore> values) {
+  static void syncRemoteStores(Iterable<StoreViewModel> values) {
     stores.removeWhere((item) => item.ownerId != null);
     cacheStores(values);
   }
 
-  static List<MockProduct> productsByStore(String storeId) {
+  static List<ProductViewModel> productsByStore(String storeId) {
     return products.where((product) => product.storeId == storeId).toList();
   }
 
-  static List<MockProduct> get managedProducts {
+  static void replaceProductsForStore(
+    String storeId,
+    Iterable<ProductViewModel> remote,
+  ) {
+    products.removeWhere((product) => product.storeId == storeId);
+    products.insertAll(0, remote);
+  }
+
+  static List<ProductViewModel> get managedProducts {
     return products.where((product) {
       if (!product.isStoreProduct) {
         return true;
@@ -773,7 +576,7 @@ class MockRepo {
       return;
     }
     final current = products[index];
-    products[index] = MockProduct(
+    products[index] = ProductViewModel(
       id: current.id,
       title: current.title,
       priceValue: current.priceValue,
@@ -781,6 +584,8 @@ class MockRepo {
       description: current.description,
       category: current.category,
       city: current.city,
+      cityId: current.cityId,
+      cityRecord: current.cityRecord,
       location: current.location,
       time: current.time,
       image: current.image,
@@ -802,7 +607,7 @@ class MockRepo {
     final index = products.indexWhere((p) => p.id == productId);
     if (index < 0) return;
     final p = products[index];
-    products[index] = MockProduct(
+    products[index] = ProductViewModel(
       id: p.id,
       title: p.title,
       priceValue: p.priceValue,
@@ -810,6 +615,8 @@ class MockRepo {
       description: p.description,
       category: p.category,
       city: p.city,
+      cityId: p.cityId,
+      cityRecord: p.cityRecord,
       location: p.location,
       time: p.time,
       image: p.image,
@@ -862,6 +669,7 @@ class InteractionStore {
 
 Widget persistentImage(
   String source, {
+  Key? key,
   double? width,
   double? height,
   BoxFit? fit,
@@ -869,6 +677,7 @@ Widget persistentImage(
 }) {
   if (source.isNotEmpty && !source.startsWith('http')) {
     return Image.file(
+      key: key ?? ValueKey('file-image-$source'),
       File(source),
       width: width,
       height: height,
@@ -877,6 +686,7 @@ Widget persistentImage(
     );
   }
   return Image.network(
+    key: key ?? ValueKey('network-image-$source'),
     source,
     width: width,
     height: height,
@@ -933,7 +743,7 @@ class RootScaffold extends StatelessWidget {
       SuikaiRoutes.home,
       SuikaiRoutes.stores,
       SuikaiRoutes.post,
-      SuikaiRoutes.map,
+      SuikaiRoutes.shortVideos,
       SuikaiRoutes.profile,
     ];
     Navigator.pushNamed(context, routeByIndex[index]);
@@ -943,6 +753,8 @@ class RootScaffold extends StatelessWidget {
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context);
     return Scaffold(
+      drawer: const _SuikaiDrawer(),
+      drawerEnableOpenDragGesture: true,
       body: SafeArea(bottom: false, child: body),
       bottomNavigationBar: NavigationBar(
         height: 72,
@@ -974,9 +786,12 @@ class RootScaffold extends StatelessWidget {
             label: '+${l10n.post}',
           ),
           NavigationDestination(
-            icon: const Icon(Icons.map_outlined),
-            selectedIcon: const Icon(Icons.map_rounded, color: AppTheme.orange),
-            label: l10n.map,
+            icon: const Icon(Icons.play_circle_outline_rounded),
+            selectedIcon: const Icon(
+              Icons.play_circle_fill_rounded,
+              color: AppTheme.orange,
+            ),
+            label: AppLocalizations.of(context).source('วิดีโอสั้น'),
           ),
           NavigationDestination(
             icon: const Icon(Icons.person_outline_rounded),
@@ -994,30 +809,6 @@ class RootScaffold extends StatelessWidget {
 
 class _SuikaiHeader extends StatelessWidget {
   const _SuikaiHeader();
-
-  Future<void> _select(BuildContext context, String value) async {
-    if (value == 'language') {
-      await showDialog<void>(
-        context: context,
-        builder: (_) => const SimpleDialog(
-          title: LocalizedText('เปลี่ยนภาษา'),
-          children: [
-            _LanguageOption(code: 'th', label: 'ไทย'),
-            _LanguageOption(code: 'shn', label: 'လိၵ်ႈတႆး'),
-            _LanguageOption(code: 'en', label: 'English'),
-            _LanguageOption(code: 'my', label: 'မြန်မာ'),
-          ],
-        ),
-      );
-      return;
-    }
-    final route = switch (value) {
-      'map' => SuikaiRoutes.map,
-      'search' => SuikaiRoutes.search,
-      _ => SuikaiRoutes.notifications,
-    };
-    if (context.mounted) Navigator.pushNamed(context, route);
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -1058,43 +849,19 @@ class _SuikaiHeader extends StatelessWidget {
               ],
             ),
           ),
-          PopupMenuButton<String>(
-            tooltip: AppLocalizations.of(context).source('เมนู'),
-            onSelected: (value) => _select(context, value),
-            itemBuilder: (_) => const [
-              PopupMenuItem(
-                value: 'language',
-                child: _HeaderMenuItem(
-                  icon: Icons.language_rounded,
-                  label: 'เปลี่ยนภาษา',
-                ),
+          Builder(
+            builder: (context) => IconButton(
+              tooltip: AppLocalizations.of(context).source('เมนู'),
+              onPressed: () => Scaffold.of(context).openDrawer(),
+              icon: const Icon(
+                Icons.menu_rounded,
+                color: AppTheme.orange,
+                size: 25,
               ),
-              PopupMenuItem(
-                value: 'map',
-                child: _HeaderMenuItem(
-                  icon: Icons.map_outlined,
-                  label: 'แผนที่',
-                ),
+              style: IconButton.styleFrom(
+                backgroundColor: AppTheme.orangeSoft,
+                fixedSize: Size.square(buttonSize),
               ),
-              PopupMenuItem(
-                value: 'search',
-                child: _HeaderMenuItem(
-                  icon: Icons.search_rounded,
-                  label: 'ค้นหา',
-                ),
-              ),
-              PopupMenuItem(
-                value: 'notifications',
-                child: _HeaderMenuItem(
-                  icon: Icons.notifications_none_rounded,
-                  label: 'การแจ้งเตือน',
-                ),
-              ),
-            ],
-            icon: Icon(Icons.menu_rounded, color: AppTheme.orange, size: 25),
-            style: IconButton.styleFrom(
-              backgroundColor: AppTheme.orangeSoft,
-              fixedSize: Size.square(buttonSize),
             ),
           ),
         ],
@@ -1103,24 +870,151 @@ class _SuikaiHeader extends StatelessWidget {
   }
 }
 
-class _HeaderMenuItem extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  const _HeaderMenuItem({required this.icon, required this.label});
+class _SuikaiDrawer extends StatelessWidget {
+  const _SuikaiDrawer();
+
+  Future<void> _language(BuildContext context) async {
+    final navigator = Navigator.of(context);
+    navigator.pop();
+    await Future<void>.delayed(Duration.zero);
+    if (!navigator.mounted) return;
+    await showDialog<void>(
+      context: navigator.context,
+      builder: (_) => const SimpleDialog(
+        title: LocalizedText('เปลี่ยนภาษา'),
+        children: [
+          _LanguageOption(code: 'th', label: 'ไทย'),
+          _LanguageOption(code: 'shn', label: 'လိၵ်ႈတႆး'),
+          _LanguageOption(code: 'en', label: 'English'),
+          _LanguageOption(code: 'my', label: 'မြန်မာ'),
+        ],
+      ),
+    );
+  }
+
+  void _route(BuildContext context, String route) {
+    final navigator = Navigator.of(context);
+    navigator.pop();
+    navigator.pushNamed(route);
+  }
+
+  Future<void> _logout(BuildContext context) async {
+    final navigator = Navigator.of(context);
+    navigator.pop();
+    await Future<void>.delayed(Duration.zero);
+    if (!navigator.mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: navigator.context,
+      builder: (dialogContext) => AlertDialog(
+        title: const LocalizedText('ออกจากระบบ'),
+        content: const LocalizedText('ต้องการออกจากระบบใช่หรือไม่'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const LocalizedText('ยกเลิก'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const LocalizedText('ออกจากระบบ'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await SuikaiService.logout();
+    if (navigator.mounted) {
+      navigator.pushNamedAndRemoveUntil(SuikaiRoutes.home, (_) => false);
+    }
+  }
 
   @override
-  Widget build(BuildContext context) => Row(
-    children: [
-      Icon(icon, color: AppTheme.orange),
-      const SizedBox(width: 12),
-      Flexible(
-        child: LocalizedText(
-          label,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
+  Widget build(BuildContext context) => Drawer(
+    width: MediaQuery.sizeOf(context).width.clamp(280, 340).toDouble(),
+    child: SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(12, 8, 12, 18),
+              child: LocalizedText(
+                'Suikai',
+                style: TextStyle(
+                  color: AppTheme.orange,
+                  fontSize: 30,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ),
+            _DrawerItem(
+              icon: Icons.language_rounded,
+              label: 'เปลี่ยนภาษา',
+              onTap: () => _language(context),
+            ),
+            _DrawerItem(
+              icon: Icons.map_outlined,
+              label: 'แผนที่',
+              onTap: () => _route(context, SuikaiRoutes.map),
+            ),
+            _DrawerItem(
+              icon: Icons.search_rounded,
+              label: 'ค้นหา',
+              onTap: () => _route(context, SuikaiRoutes.search),
+            ),
+            _DrawerItem(
+              icon: Icons.notifications_none_rounded,
+              label: 'การแจ้งเตือน',
+              onTap: () => _route(context, SuikaiRoutes.notifications),
+            ),
+            const Spacer(),
+            const Divider(),
+            if (SuikaiService.isLoggedIn)
+              _DrawerItem(
+                icon: Icons.logout_rounded,
+                label: 'ออกจากระบบ',
+                destructive: true,
+                onTap: () => _logout(context),
+              )
+            else
+              _DrawerItem(
+                icon: Icons.login_rounded,
+                label: 'เข้าสู่ระบบ',
+                onTap: () => _route(context, SuikaiRoutes.login),
+              ),
+          ],
         ),
       ),
-    ],
+    ),
+  );
+}
+
+class _DrawerItem extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  final bool destructive;
+  const _DrawerItem({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.destructive = false,
+  });
+
+  @override
+  Widget build(BuildContext context) => ListTile(
+    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+    leading: Icon(icon, color: destructive ? Colors.red : AppTheme.orange),
+    title: LocalizedText(
+      label,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: TextStyle(
+        color: destructive ? Colors.red : null,
+        fontWeight: FontWeight.w700,
+      ),
+    ),
+    onTap: onTap,
   );
 }
 
@@ -1156,20 +1050,297 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
+class _AdvertisementSlider extends StatefulWidget {
+  final EdgeInsetsGeometry margin;
+  final ValueChanged<String> onCategoryTarget;
+  const _AdvertisementSlider({
+    required this.margin,
+    required this.onCategoryTarget,
+  });
+
+  @override
+  State<_AdvertisementSlider> createState() => _AdvertisementSliderState();
+}
+
+class _AdvertisementSliderState extends State<_AdvertisementSlider>
+    with WidgetsBindingObserver, RouteAware {
+  static const _interval = Duration(seconds: 5);
+  final PageController _controller = PageController();
+  Timer? _timer;
+  List<AdvertisementRecord> _items = [];
+  int _index = 0;
+  bool _appActive = true;
+  bool _routeActive = true;
+  ModalRoute<void>? _route;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final values = await SuikaiService.fetchActiveAdvertisements();
+      if (!mounted) return;
+      setState(() {
+        _items = values;
+        _index = 0;
+      });
+      _schedule();
+    } catch (error, stackTrace) {
+      debugPrint('Supabase advertisements query failed: $error\n$stackTrace');
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appActive = state == AppLifecycleState.resumed;
+    if (_appActive) {
+      _schedule();
+    } else {
+      _timer?.cancel();
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final nextRoute = ModalRoute.of(context);
+    if (nextRoute == _route) return;
+    if (_route != null) appRouteObserver.unsubscribe(this);
+    _route = nextRoute;
+    if (nextRoute != null) appRouteObserver.subscribe(this, nextRoute);
+  }
+
+  @override
+  void didPushNext() {
+    _routeActive = false;
+    _timer?.cancel();
+  }
+
+  @override
+  void didPopNext() {
+    _routeActive = true;
+    _schedule();
+  }
+
+  void _schedule() {
+    _timer?.cancel();
+    if (!_appActive || !_routeActive || _items.length < 2) return;
+    _timer = Timer(_interval, _advance);
+  }
+
+  void _advance() {
+    if (!mounted ||
+        !_appActive ||
+        !_routeActive ||
+        !_controller.hasClients ||
+        _items.length < 2) {
+      _schedule();
+      return;
+    }
+    final next = (_index + 1) % _items.length;
+    _controller.animateToPage(
+      next,
+      duration: const Duration(milliseconds: 420),
+      curve: Curves.easeInOut,
+    );
+  }
+
+  void _changed(int index) {
+    if (mounted) setState(() => _index = index);
+    _schedule();
+  }
+
+  Future<void> _open(AdvertisementRecord value) async {
+    _timer?.cancel();
+    switch (value.targetType) {
+      case 'shop':
+        if (value.targetId != null && mounted) {
+          await Navigator.pushNamed(
+            context,
+            SuikaiRoutes.storeDetail,
+            arguments: value.targetId,
+          );
+        }
+      case 'product':
+        if (value.targetId != null && mounted) {
+          await Navigator.pushNamed(
+            context,
+            SuikaiRoutes.productDetail,
+            arguments: value.targetId,
+          );
+        }
+      case 'category':
+        if (value.targetId != null) widget.onCategoryTarget(value.targetId!);
+      case 'external':
+        final uri = Uri.tryParse(value.externalUrl ?? '');
+        if (uri != null && (uri.scheme == 'https' || uri.scheme == 'http')) {
+          await launchUrl(uri, mode: LaunchMode.externalApplication);
+        }
+    }
+    if (mounted) _schedule();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    appRouteObserver.unsubscribe(this);
+    _timer?.cancel();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_items.isEmpty) return const SizedBox.shrink();
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final height = (constraints.maxWidth * .36).clamp(140.0, 170.0);
+        return Container(
+          height: height,
+          margin: widget.margin,
+          clipBehavior: Clip.antiAlias,
+          decoration: BoxDecoration(
+            color: AppTheme.orangeSoft,
+            borderRadius: BorderRadius.circular(18),
+          ),
+          child: Stack(
+            children: [
+              NotificationListener<ScrollStartNotification>(
+                onNotification: (notification) {
+                  if (notification.dragDetails != null) _schedule();
+                  return false;
+                },
+                child: PageView.builder(
+                  controller: _controller,
+                  itemCount: _items.length,
+                  onPageChanged: _changed,
+                  itemBuilder: (context, index) {
+                    final banner = _items[index];
+                    return InkWell(
+                      onTap: () => _open(banner),
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          persistentImage(
+                            banner.imageUrl,
+                            key: ValueKey('advertisement-${banner.id}'),
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, _, _) => const ColoredBox(
+                              color: AppTheme.orangeSoft,
+                              child: Icon(
+                                Icons.image_not_supported_outlined,
+                                color: AppTheme.orange,
+                              ),
+                            ),
+                          ),
+                          if (banner.title.trim().isNotEmpty)
+                            Positioned(
+                              left: 0,
+                              right: 0,
+                              bottom: 0,
+                              child: Container(
+                                padding: const EdgeInsets.fromLTRB(
+                                  14,
+                                  24,
+                                  14,
+                                  20,
+                                ),
+                                decoration: const BoxDecoration(
+                                  gradient: LinearGradient(
+                                    begin: Alignment.topCenter,
+                                    end: Alignment.bottomCenter,
+                                    colors: [
+                                      Colors.transparent,
+                                      Colors.black54,
+                                    ],
+                                  ),
+                                ),
+                                child: Text(
+                                  banner.title,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w800,
+                                    fontSize: 17,
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+              if (_items.length > 1)
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 6,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      for (var index = 0; index < _items.length; index++)
+                        AnimatedContainer(
+                          duration: const Duration(milliseconds: 160),
+                          width: index == _index ? 16 : 6,
+                          height: 6,
+                          margin: const EdgeInsets.symmetric(horizontal: 2),
+                          decoration: BoxDecoration(
+                            color: index == _index
+                                ? AppTheme.orange
+                                : Colors.white70,
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
 class _HomePageState extends State<HomePage> {
   String _filterCurrency = 'THB';
+  String _appliedCurrency = 'THB';
   String _selectedCategory = 'all';
-  RangeValues _priceRange = const RangeValues(0, 1);
-  double _currencyMaxAmount = 1000000;
+  String _draftCategory = 'all';
+  String _appliedKeyword = '';
+  int? _appliedMinimum;
+  int? _appliedMaximum;
+  bool _searchExpanded = false;
+  final _keyword = TextEditingController();
+  final _minimumPrice = TextEditingController();
+  final _maximumPrice = TextEditingController();
   FxSnapshot? _fx;
   Position? _currentPosition;
 
   @override
   void initState() {
     super.initState();
+    debugPrint('ROOT initState');
     _loadListings();
     _loadFx();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _initializeNearby());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_completeDeferredStartup());
+      _initializeNearby();
+    });
+  }
+
+  Future<void> _completeDeferredStartup() async {
+    await localeController.load();
+    await InteractionStore.restore();
+    await SuikaiService.warmUpAfterFirstFrame();
+    if (mounted) setState(() {});
   }
 
   Future<void> _initializeNearby() async {
@@ -1216,33 +1387,25 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     setState(() {
       _fx = snapshot;
-      _currencyMaxAmount = _safeCurrencyMax(
-        FxService().convert(1000000, 'THB', _filterCurrency, snapshot),
-      );
-      _priceRange = const RangeValues(0, 1);
     });
   }
 
   void _changeCurrency(String currency) {
-    final snapshot = _fx;
-    setState(() {
-      _filterCurrency = currency;
-      if (snapshot != null) {
-        _currencyMaxAmount = _safeCurrencyMax(
-          FxService().convert(1000000, 'THB', currency, snapshot),
-        );
-      }
-      _priceRange = const RangeValues(0, 1);
-    });
+    setState(() => _filterCurrency = currency);
   }
 
-  double _safeCurrencyMax(double value) =>
-      value.isFinite && !value.isNaN && value > 0 ? value : 1000000;
+  @override
+  void dispose() {
+    _keyword.dispose();
+    _minimumPrice.dispose();
+    _maximumPrice.dispose();
+    super.dispose();
+  }
 
   Future<void> _loadListings() async {
     try {
       final data = await SuikaiService.fetchListings();
-      final next = <MockProduct>[];
+      final next = <ProductViewModel>[];
       for (final item in data) {
         final images = item['listing_images'] as List<dynamic>?;
         final stats = item['listing_stats'] as Map<String, dynamic>?;
@@ -1259,7 +1422,7 @@ class _HomePageState extends State<HomePage> {
             .where((url) => url.isNotEmpty)
             .toList();
         next.add(
-          MockProduct(
+          ProductViewModel(
             id: item['id'].toString(),
             title: item['title']?.toString() ?? '',
             priceValue: (item['price'] as num?)?.toInt() ?? 0,
@@ -1267,11 +1430,15 @@ class _HomePageState extends State<HomePage> {
             description: item['description']?.toString() ?? '',
             category: item['category']?.toString() ?? 'อื่นๆ',
             city: item['city']?.toString() ?? '',
+            cityId: item['city_id']?.toString(),
+            cityRecord: item['cities'] is Map
+                ? CityRecord.fromJson(
+                    Map<String, dynamic>.from(item['cities'] as Map),
+                  )
+                : null,
             location: item['city']?.toString() ?? '',
-            time: 'ข้อมูลในเครื่อง',
-            image: image.isEmpty
-                ? 'https://images.unsplash.com/photo-1515923256482-1c04580b477c?auto=format&fit=crop&w=800&q=80'
-                : image,
+            time: item['created_at']?.toString() ?? '',
+            image: image,
             phone: item['phone']?.toString() ?? '',
             viber: item['viber_phone']?.toString() ?? '',
             likeCount:
@@ -1289,7 +1456,7 @@ class _HomePageState extends State<HomePage> {
         );
       }
       if (mounted) {
-        MockRepo.syncLocalProducts(next);
+        MarketplaceCache.syncRemoteProducts(next);
         setState(() {});
       }
     } catch (_) {}
@@ -1297,7 +1464,8 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    final source = MockRepo.feedProducts;
+    debugPrint('ROOT build');
+    final source = MarketplaceCache.feedProducts;
     final items = source.where((product) {
       if (product.status == ProductStatus.sold ||
           product.status == ProductStatus.outOfStock ||
@@ -1308,18 +1476,23 @@ class _HomePageState extends State<HomePage> {
           _selectedCategory == 'all' ||
           SuikaiService.categoryIdForValue('listing', product.category) ==
               _selectedCategory;
+      final keyword = _appliedKeyword.toLowerCase();
+      final matchesKeyword =
+          keyword.isEmpty ||
+          product.title.toLowerCase().contains(keyword) ||
+          product.description.toLowerCase().contains(keyword);
       final productPrice = _fx == null
           ? product.priceValue.toDouble()
           : FxService().convert(
               product.priceValue.toDouble(),
               product.currencyCode,
-              _filterCurrency,
+              _appliedCurrency,
               _fx!,
             );
       final matchesPrice =
           productPrice.isFinite &&
-          productPrice >= _priceRange.start * _currencyMaxAmount &&
-          productPrice <= _priceRange.end * _currencyMaxAmount;
+          (_appliedMinimum == null || productPrice >= _appliedMinimum!) &&
+          (_appliedMaximum == null || productPrice <= _appliedMaximum!);
       final position = _currentPosition;
       final matchesNearby =
           position == null ||
@@ -1330,7 +1503,7 @@ class _HomePageState extends State<HomePage> {
             product.latitude,
             product.longitude,
           );
-      return matchesCategory && matchesPrice && matchesNearby;
+      return matchesKeyword && matchesCategory && matchesPrice && matchesNearby;
     }).toList();
     return RootScaffold(
       selectedIndex: 0,
@@ -1338,8 +1511,8 @@ class _HomePageState extends State<HomePage> {
         slivers: [
           SliverToBoxAdapter(child: _homeHeader(context)),
           SliverToBoxAdapter(child: _priceFilter(context)),
-          SliverToBoxAdapter(child: _banner(context)),
           SliverToBoxAdapter(child: _categories(context)),
+          SliverToBoxAdapter(child: _banner(context)),
           SliverToBoxAdapter(child: _sectionTitle(context)),
           SliverPadding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 26),
@@ -1383,167 +1556,193 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _priceFilter(BuildContext context) {
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 6, 16, 14),
-      padding: const EdgeInsets.fromLTRB(16, 14, 12, 12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: AppTheme.border),
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x08000000),
-            blurRadius: 12,
-            offset: Offset(0, 3),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          LocalizedText(
-            AppLocalizations.of(context).priceRange,
-            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              Expanded(
-                child: Container(
-                  height: 50,
-                  padding: const EdgeInsets.symmetric(horizontal: 14),
-                  decoration: BoxDecoration(
-                    border: Border.all(color: AppTheme.border),
-                    borderRadius: BorderRadius.circular(13),
-                  ),
-                  child: Row(
-                    children: [
-                      Flexible(
-                        child: DropdownButtonHideUnderline(
-                          child: DropdownButton<String>(
-                            isDense: true,
-                            value: _filterCurrency,
-                            items: const ['MMK', 'THB', 'USD', 'CNY']
-                                .map(
-                                  (value) => DropdownMenuItem(
-                                    value: value,
-                                    child: LocalizedText(value),
-                                  ),
-                                )
-                                .toList(),
-                            onChanged: (value) {
-                              if (value != null) _changeCurrency(value);
-                            },
-                          ),
+    final locale = Localizations.localeOf(context).languageCode;
+    final categories = SuikaiService.categoryRecords(
+      'listing',
+      activeOnly: true,
+    );
+    return TapRegion(
+      onTapOutside: (_) {
+        if (_searchExpanded) {
+          FocusScope.of(context).unfocus();
+          setState(() => _searchExpanded = false);
+        }
+      },
+      child: Container(
+        margin: const EdgeInsets.fromLTRB(16, 6, 16, 14),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: AppTheme.border),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x08000000),
+              blurRadius: 12,
+              offset: Offset(0, 3),
+            ),
+          ],
+        ),
+        child: Column(
+          children: [
+            InkWell(
+              borderRadius: BorderRadius.circular(18),
+              onTap: () => setState(() => _searchExpanded = !_searchExpanded),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 14,
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.search_rounded, color: AppTheme.orange),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        _appliedKeyword.isEmpty
+                            ? AppLocalizations.of(context).source('ค้นหาสินค้า')
+                            : _appliedKeyword,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: _appliedKeyword.isEmpty
+                              ? AppTheme.textMuted
+                              : Colors.black87,
+                          fontWeight: FontWeight.w600,
                         ),
                       ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: LocalizedText(
-                          '${formatCurrencyAmount(_priceRange.start * _currencyMaxAmount, _filterCurrency)}–${formatCurrencyAmount(_priceRange.end * _currencyMaxAmount, _filterCurrency)}',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          textAlign: TextAlign.end,
-                          style: const TextStyle(
-                            fontSize: 14,
-                            color: AppTheme.textMuted,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
+                    ),
+                    Icon(
+                      _searchExpanded
+                          ? Icons.keyboard_arrow_up_rounded
+                          : Icons.keyboard_arrow_down_rounded,
+                      color: AppTheme.textMuted,
+                    ),
+                  ],
                 ),
-              ),
-              const SizedBox(width: 10),
-              InkWell(
-                borderRadius: BorderRadius.circular(13),
-                onTap: () =>
-                    setState(() => _priceRange = const RangeValues(0, 1)),
-                child: Container(
-                  width: 54,
-                  height: 50,
-                  decoration: BoxDecoration(
-                    color: AppTheme.orange,
-                    borderRadius: BorderRadius.circular(13),
-                  ),
-                  child: const Icon(Icons.tune_rounded, color: Colors.white),
-                ),
-              ),
-            ],
-          ),
-          RangeSlider(
-            values: _priceRange,
-            min: 0,
-            max: 1,
-            divisions: 100,
-            labels: RangeLabels(
-              formatCurrencyAmount(
-                _priceRange.start * _currencyMaxAmount,
-                _filterCurrency,
-              ),
-              formatCurrencyAmount(
-                _priceRange.end * _currencyMaxAmount,
-                _filterCurrency,
               ),
             ),
-            onChanged: (values) => setState(() => _priceRange = values),
-          ),
-        ],
+            AnimatedSize(
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOut,
+              child: !_searchExpanded
+                  ? const SizedBox.shrink()
+                  : Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+                      decoration: const BoxDecoration(
+                        border: Border(top: BorderSide(color: AppTheme.border)),
+                      ),
+                      child: Column(
+                        children: [
+                          const SizedBox(height: 12),
+                          TextField(
+                            controller: _keyword,
+                            textInputAction: TextInputAction.search,
+                            decoration: InputDecoration(
+                              labelText: AppLocalizations.of(
+                                context,
+                              ).source('ค้นหาสินค้า'),
+                              prefixIcon: const Icon(Icons.search_rounded),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          DropdownButtonFormField<String>(
+                            initialValue: _draftCategory,
+                            isExpanded: true,
+                            decoration: InputDecoration(
+                              labelText: AppLocalizations.of(
+                                context,
+                              ).source('หมวดหมู่'),
+                            ),
+                            items: [
+                              DropdownMenuItem(
+                                value: 'all',
+                                child: Text(
+                                  AppLocalizations.of(
+                                    context,
+                                  ).source('ทั้งหมด'),
+                                ),
+                              ),
+                              for (final category in categories)
+                                DropdownMenuItem(
+                                  value: category.id,
+                                  child: Row(
+                                    children: [
+                                      Icon(
+                                        _categoryIcon(category.id),
+                                        size: 20,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Text(
+                                          category.localizedName(locale),
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                            ],
+                            onChanged: (value) =>
+                                _draftCategory = value ?? 'all',
+                          ),
+                          const SizedBox(height: 10),
+                          _NumericPriceRange(
+                            minimum: _minimumPrice,
+                            maximum: _maximumPrice,
+                            currency: _filterCurrency,
+                            onCurrencyChanged: _changeCurrency,
+                            onChanged: () {},
+                          ),
+                          const SizedBox(height: 12),
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              onPressed: _applyHomeSearch,
+                              icon: const Icon(Icons.search_rounded),
+                              label: const LocalizedText('ค้นหา'),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: AppTheme.orange,
+                                foregroundColor: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+            ),
+          ],
+        ),
       ),
     );
   }
 
+  void _applyHomeSearch() {
+    final minimum = parsePriceValue(_minimumPrice.text);
+    final maximum = parsePriceValue(_maximumPrice.text);
+    if (minimum != null && maximum != null && minimum > maximum) {
+      showInfo(context, 'ราคาต่ำสุดต้องไม่เกินราคาสูงสุด');
+      return;
+    }
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _appliedKeyword = normalizeText(_keyword.text).toLowerCase();
+      _selectedCategory = _draftCategory;
+      _appliedMinimum = minimum;
+      _appliedMaximum = maximum;
+      _appliedCurrency = _filterCurrency;
+      _searchExpanded = false;
+    });
+  }
+
   Widget _banner(BuildContext context) {
-    return Container(
-      height: 190,
+    return _AdvertisementSlider(
       margin: const EdgeInsets.fromLTRB(16, 0, 16, 14),
-      clipBehavior: Clip.antiAlias,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(18),
-        gradient: const LinearGradient(
-          colors: [Color(0xFFFFE7D6), Color(0xFFFFF7EF)],
-        ),
-      ),
-      child: Stack(
-        children: [
-          Positioned(
-            right: -16,
-            bottom: 0,
-            top: 18,
-            width: 280,
-            child: persistentImage(
-              'https://images.unsplash.com/photo-1504215680853-026ed2a45def?auto=format&fit=crop&w=1000&q=85',
-              fit: BoxFit.cover,
-              errorBuilder: (_, error, stackTrace) => const SizedBox(),
-            ),
-          ),
-          Positioned(
-            left: 24,
-            top: 24,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                LocalizedText(
-                  AppLocalizations.of(context).advertisement,
-                  style: const TextStyle(
-                    color: AppTheme.orangeDark,
-                    fontWeight: FontWeight.w800,
-                    fontSize: 29,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                LocalizedText(
-                  AppLocalizations.of(context).featuredPromotions,
-                  style: const TextStyle(
-                    fontSize: 17,
-                    color: Color(0xFF675A52),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
+      onCategoryTarget: (categoryId) => setState(() {
+        _selectedCategory = categoryId;
+        _draftCategory = categoryId;
+      }),
     );
   }
 
@@ -1557,7 +1756,7 @@ class _HomePageState extends State<HomePage> {
       ),
       for (final category in SuikaiService.categoryRecords('listing'))
         (
-          _storeCategoryIcon(category.id),
+          _categoryIcon(category.id),
           category.localizedName(locale),
           category.id,
         ),
@@ -1580,7 +1779,10 @@ class _HomePageState extends State<HomePage> {
               padding: const EdgeInsets.only(right: 10),
               child: InkWell(
                 borderRadius: BorderRadius.circular(12),
-                onTap: () => setState(() => _selectedCategory = category.$3),
+                onTap: () => setState(() {
+                  _selectedCategory = category.$3;
+                  _draftCategory = category.$3;
+                }),
                 child: SizedBox(
                   width: 74,
                   child: Column(
@@ -1639,7 +1841,13 @@ class _HomePageState extends State<HomePage> {
           InkWell(
             onTap: () => setState(() {
               _selectedCategory = 'all';
-              _priceRange = const RangeValues(0, 1);
+              _draftCategory = 'all';
+              _appliedKeyword = '';
+              _appliedMinimum = null;
+              _appliedMaximum = null;
+              _keyword.clear();
+              _minimumPrice.clear();
+              _maximumPrice.clear();
             }),
             child: LocalizedText(
               AppLocalizations.of(context).viewAllProducts,
@@ -1678,11 +1886,17 @@ class _StoreListPageState extends State<StoreListPage> {
     try {
       final data = await SuikaiService.fetchStores();
       final next = data.map((item) {
-        return MockStore(
+        return StoreViewModel(
           id: item['id'].toString(),
           name: item['name']?.toString() ?? '',
           type: item['category']?.toString() ?? 'ร้านค้า',
           city: item['city']?.toString() ?? '',
+          cityId: item['city_id']?.toString(),
+          cityRecord: item['cities'] is Map
+              ? CityRecord.fromJson(
+                  Map<String, dynamic>.from(item['cities'] as Map),
+                )
+              : null,
           distance: '0 กม.',
           logo: item['logo_url']?.toString() ?? '',
           description: item['description']?.toString() ?? '',
@@ -1704,7 +1918,7 @@ class _StoreListPageState extends State<StoreListPage> {
         );
       }).toList();
       if (mounted) {
-        MockRepo.syncLocalStores(next);
+        MarketplaceCache.syncRemoteStores(next);
         setState(() {});
       }
     } catch (_) {}
@@ -1720,7 +1934,7 @@ class _StoreListPageState extends State<StoreListPage> {
   @override
   Widget build(BuildContext context) {
     final query = _searchController.text.toLowerCase().trim();
-    final source = MockRepo.approvedStores;
+    final source = MarketplaceCache.approvedStores;
     final stores = source.where((store) {
       final matchesQuery =
           query.isEmpty ||
@@ -1730,10 +1944,10 @@ class _StoreListPageState extends State<StoreListPage> {
             'store',
             store.type,
           ).toLowerCase().contains(query) ||
-          store.city.toLowerCase().contains(query);
+          storeCityLabel(context, store).toLowerCase().contains(query);
       final matchesStoreProduct =
           store.searchableProducts.toLowerCase().contains(query) ||
-          MockRepo.productsByStore(store.id).any(
+          MarketplaceCache.productsByStore(store.id).any(
             (product) =>
                 product.title.toLowerCase().contains(query) ||
                 _categoryLabel(
@@ -1834,76 +2048,18 @@ class _StoreListPageState extends State<StoreListPage> {
   }
 
   Widget _actionSelector() {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
-      child: Container(
-        padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(color: AppTheme.border),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(.025),
-              blurRadius: 14,
-              offset: const Offset(0, 5),
-            ),
-          ],
-        ),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(14),
-          child: SizedBox(
-            height: 120,
-            width: double.infinity,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                persistentImage(
-                  'https://images.unsplash.com/photo-1441986300917-64674bd600d8?auto=format&fit=crop&w=1200&q=80',
-                  fit: BoxFit.cover,
-                  errorBuilder: (_, _, _) =>
-                      const ColoredBox(color: AppTheme.orangeSoft),
-                ),
-                const DecoratedBox(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [Color(0xBB000000), Color(0x22000000)],
-                    ),
-                  ),
-                ),
-                const Padding(
-                  padding: EdgeInsets.all(18),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: [
-                      LocalizedText(
-                        'พื้นที่โฆษณา',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 19,
-                          fontWeight: FontWeight.w800,
-                        ),
-                      ),
-                      LocalizedText(
-                        'โปรโมชันและร้านค้าแนะนำบน Suikai',
-                        style: TextStyle(color: Colors.white),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
+    return _AdvertisementSlider(
+      margin: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+      onCategoryTarget: (categoryId) => setState(() {
+        _selectedType = categoryId;
+      }),
     );
   }
 
   Widget _categorySection() {
     final categories = <_StoreCategoryData>[
       for (final category in SuikaiService.categoryRecords('store'))
-        _StoreCategoryData(category.id, _storeCategoryIcon(category.id)),
+        _StoreCategoryData(category.id, _categoryIcon(category.id)),
       const _StoreCategoryData('all', Icons.grid_view_rounded),
     ];
     return Padding(
@@ -2088,7 +2244,7 @@ class _StoreActionCard extends StatelessWidget {
 }
 
 class _StoreGridCard extends StatelessWidget {
-  final MockStore store;
+  final StoreViewModel store;
   const _StoreGridCard({required this.store});
 
   @override
@@ -2166,7 +2322,7 @@ class _StoreGridCard extends StatelessWidget {
                       const SizedBox(width: 2),
                       Expanded(
                         child: LocalizedText(
-                          store.city,
+                          storeCityLabel(context, store),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
@@ -2243,7 +2399,48 @@ class StoreDetailPage extends StatefulWidget {
 }
 
 class _StoreDetailPageState extends State<StoreDetailPage> {
-  Future<void> _manageProduct(MockProduct product, String action) async {
+  Future<void> _refreshStoreProducts() async {
+    final rows = await SuikaiService.fetchListingsForStore(widget.storeId);
+    final products = rows.map((item) {
+      final images = (item['listing_images'] as List? ?? const [])
+          .map((entry) => '${(entry as Map)['image_url'] ?? ''}')
+          .where((url) => url.isNotEmpty)
+          .toList();
+      return ProductViewModel(
+        id: '${item['id']}',
+        title: '${item['title'] ?? ''}',
+        priceValue: (item['price'] as num?)?.toInt() ?? 0,
+        currencyCode: '${item['currency'] ?? 'MMK'}',
+        description: '${item['description'] ?? ''}',
+        category: '${item['category'] ?? ''}',
+        city: '${item['city'] ?? ''}',
+        cityId: item['city_id']?.toString(),
+        cityRecord: item['cities'] is Map
+            ? CityRecord.fromJson(
+                Map<String, dynamic>.from(item['cities'] as Map),
+              )
+            : null,
+        location: '${item['city'] ?? ''}',
+        time: '${item['created_at'] ?? ''}',
+        image: images.firstOrNull ?? '',
+        phone: '${item['phone'] ?? ''}',
+        viber: '${item['viber_phone'] ?? ''}',
+        likeCount: 0,
+        viewCount: 0,
+        status: _productStatus('${item['status']}'),
+        storeId: '${item['store_id']}',
+        ownerId: '${item['owner_id']}',
+        images: images,
+        latitude: (item['latitude'] as num?)?.toDouble(),
+        longitude: (item['longitude'] as num?)?.toDouble(),
+        isLocationVisible: item['is_location_visible'] != false,
+      );
+    }).toList();
+    MarketplaceCache.replaceProductsForStore(widget.storeId, products);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _manageProduct(ProductViewModel product, String action) async {
     if (action == 'edit') {
       await Navigator.push<bool>(
         context,
@@ -2256,7 +2453,7 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
     }
     if (action == 'delete') {
       await SuikaiService.deleteListing(product.id);
-      MockRepo.removeProduct(product.id);
+      MarketplaceCache.removeProduct(product.id);
     } else {
       final status = _productStatus(action);
       await SuikaiService.updateListing(
@@ -2270,20 +2467,41 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
         currency: product.currencyCode,
         status: action,
       );
-      MockRepo.setStatus(product.id, status);
+      MarketplaceCache.setStatus(product.id, status);
     }
     if (mounted) setState(() {});
   }
 
-  Future<void> _ownerAction(MockStore store, String action) async {
+  Future<void> _ownerAction(StoreViewModel store, String action) async {
+    if (action == 'edit') {
+      await _editStore(context, store);
+      return;
+    }
+    if (action == 'delete') {
+      if (store.approved) {
+        showInfo(context, 'ลบได้เฉพาะร้านที่รออนุมัติหรือไม่ผ่านการอนุมัติ');
+        return;
+      }
+      await SuikaiService.deleteStore(store.id);
+      MarketplaceCache.stores.removeWhere((value) => value.id == store.id);
+      if (mounted) Navigator.pop(context, true);
+      return;
+    }
+    if (!store.approved) {
+      showInfo(
+        context,
+        store.effectiveStatus == 'rejected'
+            ? 'ร้านไม่ผ่านการอนุมัติ'
+            : 'ร้านกำลังรอการอนุมัติ',
+      );
+      return;
+    }
     if (action == 'add') {
       final added = await Navigator.push<bool>(
         context,
         MaterialPageRoute(builder: (_) => PostPage(storeId: store.id)),
       );
-      if (added == true && mounted) setState(() {});
-    } else if (action == 'edit') {
-      await _editStore(context, store);
+      if (added == true) await _refreshStoreProducts();
     } else if (action == 'promote') {
       try {
         await SuikaiService.submitPromotionRequest(store.id);
@@ -2294,7 +2512,7 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
     }
   }
 
-  Future<void> _editStore(BuildContext context, MockStore store) async {
+  Future<void> _editStore(BuildContext context, StoreViewModel store) async {
     final name = TextEditingController(text: store.name);
     final category = TextEditingController(
       text: SuikaiService.categoryIdForValue('store', store.type),
@@ -2401,7 +2619,7 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
                 TextField(
                   controller: city,
                   decoration: InputDecoration(
-                    labelText: AppLocalizations.of(context).source('Location'),
+                    labelText: AppLocalizations.of(context).source('เมือง'),
                   ),
                 ),
                 Row(
@@ -2449,7 +2667,8 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
               onPressed: () async {
                 if (name.text.trim().isEmpty ||
                     normalizePhone(phone.text).isEmpty ||
-                    validateEmail(email.text) != null) {
+                    validateEmail(email.text) != null ||
+                    normalizeText(city.text).isEmpty) {
                   showInfo(context, 'กรุณาตรวจสอบข้อมูลร้าน');
                   return;
                 }
@@ -2465,8 +2684,8 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
                       'email': email.text.trim().isEmpty
                           ? null
                           : email.text.trim(),
-                      'city': city.text.trim(),
-                      'location': city.text.trim(),
+                      'city': normalizeText(city.text),
+                      'city_id': store.cityId,
                       'opening_time': hours.text.split('-').first.trim(),
                       'closing_time': hours.text.contains('-')
                           ? hours.text.split('-').last.trim()
@@ -2505,11 +2724,11 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
 
   @override
   Widget build(BuildContext context) {
-    final store = MockRepo.storeById(widget.storeId);
+    final store = MarketplaceCache.storeById(widget.storeId);
     if (store == null) {
       return const _MissingPage(title: 'ไม่พบร้าน');
     }
-    final products = MockRepo.productsByStore(store.id);
+    final products = MarketplaceCache.productsByStore(store.id);
 
     return Scaffold(
       appBar: AppBar(
@@ -2528,16 +2747,26 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
               store.ownerId == SuikaiService.currentUserId)
             PopupMenuButton<String>(
               onSelected: (value) => _ownerAction(store, value),
-              itemBuilder: (_) => const [
-                PopupMenuItem(
-                  value: 'add',
-                  child: LocalizedText('เพิ่มสินค้า'),
+              itemBuilder: (_) => [
+                if (store.approved)
+                  const PopupMenuItem(
+                    value: 'add',
+                    child: LocalizedText('เพิ่มสินค้า'),
+                  ),
+                const PopupMenuItem(
+                  value: 'edit',
+                  child: LocalizedText('แก้ไขร้าน'),
                 ),
-                PopupMenuItem(value: 'edit', child: LocalizedText('แก้ไขร้าน')),
-                PopupMenuItem(
-                  value: 'promote',
-                  child: LocalizedText('ขอโปรโมตร้าน'),
-                ),
+                if (store.approved)
+                  const PopupMenuItem(
+                    value: 'promote',
+                    child: LocalizedText('ขอโปรโมตร้าน'),
+                  ),
+                if (!store.approved)
+                  const PopupMenuItem(
+                    value: 'delete',
+                    child: LocalizedText('ลบร้าน'),
+                  ),
               ],
             ),
         ],
@@ -2545,6 +2774,25 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 10, 16, 20),
         children: [
+          if (!store.approved) ...[
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: store.effectiveStatus == 'rejected'
+                    ? const Color(0xFFFFEBEE)
+                    : AppTheme.orangeSoft,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: LocalizedText(
+                store.effectiveStatus == 'rejected'
+                    ? 'ไม่ผ่านการอนุมัติ'
+                    : 'รออนุมัติ',
+                style: const TextStyle(fontWeight: FontWeight.w800),
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
           Row(
             children: [
               ClipRRect(
@@ -2693,7 +2941,8 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
                           ],
                         ),
                       ),
-                      if (store.ownerId == SuikaiService.currentUserId)
+                      if (store.approved &&
+                          store.ownerId == SuikaiService.currentUserId)
                         PopupMenuButton<String>(
                           onSelected: (value) => _manageProduct(product, value),
                           itemBuilder: (_) => [
@@ -2746,7 +2995,7 @@ class EditListingPage extends StatefulWidget {
 
 class _EditListingPageState extends State<EditListingPage> {
   final _formKey = GlobalKey<FormState>();
-  late final MockProduct? _original;
+  late final ProductViewModel? _original;
   late final TextEditingController _name;
   late final TextEditingController _description;
   late final TextEditingController _price;
@@ -2759,11 +3008,12 @@ class _EditListingPageState extends State<EditListingPage> {
   String? _category;
   bool _saving = false;
   late bool _isLocationVisible;
+  latlng.LatLng? _editLocation;
 
   @override
   void initState() {
     super.initState();
-    _original = MockRepo.productById(widget.productId);
+    _original = MarketplaceCache.productById(widget.productId);
     final product = _original;
     _name = TextEditingController(text: product?.title ?? '');
     _description = TextEditingController(text: product?.description ?? '');
@@ -2776,6 +3026,9 @@ class _EditListingPageState extends State<EditListingPage> {
     _currency = product?.currencyCode ?? 'MMK';
     _status = product?.status ?? ProductStatus.available;
     _isLocationVisible = product?.isLocationVisible ?? true;
+    if (product?.latitude != null && product?.longitude != null) {
+      _editLocation = latlng.LatLng(product!.latitude!, product.longitude!);
+    }
     final matchedCategory = product == null
         ? null
         : SuikaiService.categoryForValue('listing', product.category);
@@ -2807,14 +3060,15 @@ class _EditListingPageState extends State<EditListingPage> {
 
   Future<void> _pickImage({int? replaceIndex}) async {
     if (replaceIndex == null && _images.length >= 5) return;
-    final selected = await SuikaiService.pickImage();
-    if (!mounted || selected == null) return;
+    final selected = await SuikaiService.pickImages(
+      maxCount: replaceIndex == null ? 5 - _images.length : 1,
+    );
+    if (!mounted || selected.isEmpty) return;
     setState(() {
-      final draft = _ProductImageDraft.selected(selected);
       if (replaceIndex == null) {
-        _images.add(draft);
+        _images.addAll(selected.map(_ProductImageDraft.selected));
       } else {
-        _images[replaceIndex] = draft;
+        _images[replaceIndex] = _ProductImageDraft.selected(selected.first);
       }
     });
   }
@@ -2983,8 +3237,8 @@ class _EditListingPageState extends State<EditListingPage> {
                         ),
                       ),
                       const SizedBox(width: 10),
-                      SizedBox(
-                        width: 104,
+                      Flexible(
+                        flex: 2,
                         child: DropdownButtonFormField<String>(
                           initialValue: _currency,
                           isExpanded: true,
@@ -3061,6 +3315,11 @@ class _EditListingPageState extends State<EditListingPage> {
                         context,
                       ).source('ตำแหน่ง/เมือง'),
                     ),
+                    validator: (value) => normalizeText(value).isEmpty
+                        ? AppLocalizations.of(
+                            context,
+                          ).source('กรุณากรอกชื่อเมือง')
+                        : null,
                   ),
                   if (!product.isStoreProduct) ...[
                     const SizedBox(height: 10),
@@ -3076,6 +3335,25 @@ class _EditListingPageState extends State<EditListingPage> {
                         onChanged: (value) =>
                             setState(() => _isLocationVisible = value),
                       ),
+                    ),
+                  ],
+                  if (!product.isStoreProduct && _isLocationVisible) ...[
+                    const SizedBox(height: 10),
+                    LocationPickerMap(
+                      value: _editLocation,
+                      onChanged: (point) =>
+                          setState(() => _editLocation = point),
+                      currentLocation: () async {
+                        final position =
+                            await SuikaiService.getCurrentPosition();
+                        return position == null
+                            ? null
+                            : latlng.LatLng(
+                                position.latitude,
+                                position.longitude,
+                              );
+                      },
+                      height: 240,
                     ),
                   ],
                   const SizedBox(height: 14),
@@ -3245,20 +3523,14 @@ class _EditListingPageState extends State<EditListingPage> {
       ];
       final amount = parsePriceValue(_price.text)!;
       final category = _category ?? product.category;
-      Position? position;
-      if (!product.isStoreProduct &&
-          _isLocationVisible &&
-          product.latitude == null) {
-        position = await SuikaiService.getCurrentPosition();
-        if (position == null && mounted) {
-          showInfo(context, 'บันทึกประกาศโดยไม่มีตำแหน่ง GPS');
-        }
-      }
+      final cityName = normalizeText(_city.text);
+      if (cityName.isEmpty) throw StateError('listing_city_required');
       await SuikaiService.updateListing(
         listingId: product.id,
         title: normalizeText(_name.text),
         description: normalizeText(_description.text),
-        city: normalizeText(_city.text),
+        city: cityName,
+        cityId: product.cityId,
         phone: normalizePhone(_phone.text),
         viber: normalizePhone(_viber.text),
         price: amount.toDouble(),
@@ -3266,22 +3538,24 @@ class _EditListingPageState extends State<EditListingPage> {
         status: _status.name,
         category: category,
         images: finalImages,
-        latitude: position?.latitude,
-        longitude: position?.longitude,
+        latitude: _editLocation?.latitude,
+        longitude: _editLocation?.longitude,
         isLocationVisible: product.isStoreProduct
             ? product.isLocationVisible
             : _isLocationVisible,
       );
-      MockRepo.cacheProducts([
-        MockProduct(
+      MarketplaceCache.cacheProducts([
+        ProductViewModel(
           id: product.id,
           title: normalizeText(_name.text),
           priceValue: amount,
           currencyCode: _currency,
           description: normalizeText(_description.text),
           category: category,
-          city: normalizeText(_city.text),
-          location: normalizeText(_city.text),
+          city: cityName,
+          cityId: product.cityId,
+          cityRecord: product.cityRecord,
+          location: cityName,
           time: product.time,
           image: finalImages.first,
           phone: normalizePhone(_phone.text),
@@ -3293,10 +3567,10 @@ class _EditListingPageState extends State<EditListingPage> {
           ownerId: product.ownerId,
           images: finalImages,
           latitude: _isLocationVisible
-              ? (position?.latitude ?? product.latitude)
+              ? (_editLocation?.latitude ?? product.latitude)
               : null,
           longitude: _isLocationVisible
-              ? (position?.longitude ?? product.longitude)
+              ? (_editLocation?.longitude ?? product.longitude)
               : null,
           isLocationVisible: product.isStoreProduct
               ? product.isLocationVisible
@@ -3332,6 +3606,8 @@ class PostPage extends StatefulWidget {
 
 class _PostPageState extends State<PostPage> {
   final _formKey = GlobalKey<FormState>();
+  final _basicStepFormKey = GlobalKey<FormState>();
+  final _locationStepFormKey = GlobalKey<FormState>();
   bool _showGeneralWizard = false;
   int _step = 0;
 
@@ -3341,22 +3617,28 @@ class _PostPageState extends State<PostPage> {
   final _phoneController = TextEditingController(text: '09 9999 9999');
   final _viberController = TextEditingController(text: '09 8888 8888');
   final _locationNoteController = TextEditingController();
+  final _cityController = TextEditingController();
 
   String _category = '';
   String _currency = 'MMK';
   String _condition = 'มือหนึ่ง';
-  bool _negotiable = false;
   bool _isLocationVisible = true;
   bool _submitting = false;
-  Position? _listingPosition;
+  latlng.LatLng? _listingPosition;
   ProductStatus _listingStatus = ProductStatus.available;
   final List<SelectedImage> _selectedImages = [];
-  String _address = 'บ้านน้ำจ๋าง, เมืองน้ำจ๋าง, รัฐฉาน\nใกล้ ตลาดสดน้ำจ๋าง';
 
   @override
   void initState() {
     super.initState();
     _showGeneralWizard = widget.startGeneral || widget.storeId != null;
+    _category = widget.storeId == null
+        ? ''
+        : SuikaiService.categoryRecords(
+                'listing',
+                activeOnly: true,
+              ).firstOrNull?.id ??
+              '';
   }
 
   @override
@@ -3367,12 +3649,13 @@ class _PostPageState extends State<PostPage> {
     _phoneController.dispose();
     _viberController.dispose();
     _locationNoteController.dispose();
+    _cityController.dispose();
     super.dispose();
   }
 
   void _next() {
     if (_step == 0) {
-      if (!_formKey.currentState!.validate()) {
+      if (!(_basicStepFormKey.currentState?.validate() ?? false)) {
         return;
       }
       final price = parsePriceValue(_priceController.text);
@@ -3394,6 +3677,11 @@ class _PostPageState extends State<PostPage> {
       showInfo(context, 'กรุณาเพิ่มรูปสินค้าอย่างน้อย 1 รูป');
       return;
     }
+    if (_step == 2 &&
+        !(_locationStepFormKey.currentState?.validate() ?? false)) {
+      showInfo(context, 'กรุณากรอกชื่อเมือง');
+      return;
+    }
     if (_step < 3) {
       setState(() => _step++);
     }
@@ -3403,7 +3691,14 @@ class _PostPageState extends State<PostPage> {
     try {
       final position = await SuikaiService.getCurrentPosition();
       if (!mounted) return;
-      setState(() => _listingPosition = position);
+      if (position != null) {
+        setState(
+          () => _listingPosition = latlng.LatLng(
+            position.latitude,
+            position.longitude,
+          ),
+        );
+      }
       if (notify) {
         showInfo(
           context,
@@ -3421,13 +3716,17 @@ class _PostPageState extends State<PostPage> {
     final limit = widget.storeId == null ? 8 : 5;
     if (replaceIndex == null && _selectedImages.length >= limit) return;
     try {
-      final image = await SuikaiService.pickImage();
-      if (!mounted || image == null) return;
+      final images = replaceIndex == null
+          ? await SuikaiService.pickImages(
+              maxCount: limit - _selectedImages.length,
+            )
+          : await SuikaiService.pickImages(maxCount: 1);
+      if (!mounted || images.isEmpty) return;
       setState(() {
         if (replaceIndex == null) {
-          _selectedImages.add(image);
+          _selectedImages.addAll(images);
         } else {
-          _selectedImages[replaceIndex] = image;
+          _selectedImages[replaceIndex] = images.first;
         }
       });
     } catch (_) {
@@ -3594,6 +3893,32 @@ class _PostPageState extends State<PostPage> {
                   : null,
             ),
             const SizedBox(height: 12),
+            DropdownButtonFormField<String>(
+              initialValue: _category.isEmpty ? null : _category,
+              isExpanded: true,
+              decoration: InputDecoration(labelText: l10n.category),
+              items: SuikaiService.categoryRecords('listing', activeOnly: true)
+                  .map(
+                    (category) => DropdownMenuItem(
+                      value: category.id,
+                      child: Text(
+                        category.localizedName(
+                          Localizations.localeOf(context).languageCode,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  )
+                  .toList(),
+              validator: (value) => value == null || value.isEmpty
+                  ? AppLocalizations.of(
+                      context,
+                    ).source('กรุณาเลือกหมวดหมู่สินค้า')
+                  : null,
+              onChanged: (value) => setState(() => _category = value ?? ''),
+            ),
+            const SizedBox(height: 12),
             TextFormField(
               controller: _detailsController,
               maxLines: 4,
@@ -3621,16 +3946,21 @@ class _PostPageState extends State<PostPage> {
                   ),
                 ),
                 const SizedBox(width: 10),
-                SizedBox(
-                  width: 92,
+                Flexible(
+                  flex: 2,
                   child: DropdownButtonFormField<String>(
                     initialValue: _currency,
+                    isExpanded: true,
                     decoration: InputDecoration(labelText: l10n.currency),
                     items: const ['MMK', 'THB', 'USD', 'CNY']
                         .map(
                           (value) => DropdownMenuItem(
                             value: value,
-                            child: LocalizedText(value),
+                            child: Text(
+                              value,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
                         )
                         .toList(),
@@ -3686,11 +4016,18 @@ class _PostPageState extends State<PostPage> {
     setState(() => _submitting = true);
     try {
       final price = parsePriceValue(_priceController.text)!;
-      final listing = await SuikaiService.createListing(
+      final store = (await SuikaiService.fetchStores())
+          .where((value) => '${value['id']}' == widget.storeId)
+          .firstOrNull;
+      final storeCityId = store?['city_id']?.toString();
+      final storeCity = normalizeText(store?['city']?.toString());
+      if (storeCity.isEmpty) throw StateError('store_city_required');
+      await SuikaiService.createListing(
         title: normalizeText(_nameController.text),
         description: normalizeText(_detailsController.text),
-        category: 'store-product',
-        city: '',
+        category: _category,
+        city: storeCity,
+        cityId: storeCityId,
         phone: normalizePhone(_phoneController.text),
         viber: normalizePhone(_viberController.text),
         price: price.toDouble(),
@@ -3700,35 +4037,11 @@ class _PostPageState extends State<PostPage> {
         status: _listingStatus.name,
         images: _selectedImages,
       );
-      if (listing != null) {
-        MockRepo.products.insert(
-          0,
-          MockProduct(
-            id: '${listing['id']}',
-            title: normalizeText(_nameController.text),
-            priceValue: price,
-            currencyCode: _currency,
-            description: normalizeText(_detailsController.text),
-            category: 'store-product',
-            city: '',
-            location: '',
-            time: l10n.justPosted,
-            image: (listing['images'] as List).first.toString(),
-            phone: normalizePhone(_phoneController.text),
-            viber: normalizePhone(_viberController.text),
-            likeCount: 0,
-            viewCount: 0,
-            status: _listingStatus,
-            storeId: widget.storeId,
-            ownerId: SuikaiService.currentUserId,
-            images: List<String>.from(listing['images'] ?? const []),
-          ),
-        );
-      }
       if (mounted) Navigator.pop(context, true);
-    } catch (_) {
+    } catch (error, stackTrace) {
+      debugPrint('Save store product failed: $error\n$stackTrace');
       if (mounted) {
-        showInfo(context, l10n.saveFailed);
+        showInfo(context, '${l10n.saveFailed}: $error');
         setState(() => _submitting = false);
       }
     }
@@ -3836,24 +4149,21 @@ class _PostPageState extends State<PostPage> {
       child: Scaffold(
         backgroundColor: Colors.white,
         body: SafeArea(
-          child: Form(
-            key: _formKey,
-            child: Column(
-              children: [
-                _wizardHeader(),
-                Expanded(
-                  child: IndexedStack(
-                    index: _step,
-                    children: [
-                      _stepBasic(),
-                      _stepPhotos(),
-                      _stepLocation(),
-                      _stepConfirm(),
-                    ],
-                  ),
+          child: Column(
+            children: [
+              _wizardHeader(),
+              Expanded(
+                child: IndexedStack(
+                  index: _step,
+                  children: [
+                    _stepBasic(),
+                    _stepPhotos(),
+                    _stepLocation(),
+                    _stepConfirm(),
+                  ],
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),
@@ -3877,7 +4187,7 @@ class _PostPageState extends State<PostPage> {
                 ),
               ),
               TextButton(
-                onPressed: () => showInfo(context, 'บันทึกฉบับร่างแล้ว (mock)'),
+                onPressed: () => showInfo(context, 'บันทึกฉบับร่างแล้ว'),
                 child: const LocalizedText(
                   'บันทึกฉบับร่าง',
                   style: TextStyle(
@@ -3975,167 +4285,173 @@ class _PostPageState extends State<PostPage> {
   }
 
   Widget _stepBasic() {
-    return _stepScroll([
-      _sectionCard(
-        title: 'ข้อมูลพื้นฐาน',
-        children: [
-          const _FieldLabel('หมวดหมู่'),
-          DropdownButtonFormField<String>(
-            value: _category.isEmpty ? null : _category,
-            hint: const LocalizedText('เลือกหมวดหมู่สินค้า'),
-            decoration: _inputDecoration(),
-            items: SuikaiService.categoryRecords('listing', activeOnly: true)
-                .map(
-                  (category) => DropdownMenuItem(
-                    value: category.id,
-                    child: Text(
-                      category.localizedName(
-                        Localizations.localeOf(context).languageCode,
+    return Form(
+      key: _basicStepFormKey,
+      child: _stepScroll([
+        _sectionCard(
+          title: 'ข้อมูลพื้นฐาน',
+          children: [
+            const _FieldLabel('หมวดหมู่'),
+            DropdownButtonFormField<String>(
+              value: _category.isEmpty ? null : _category,
+              hint: const LocalizedText('เลือกหมวดหมู่สินค้า'),
+              decoration: _inputDecoration(),
+              items: SuikaiService.categoryRecords('listing', activeOnly: true)
+                  .map(
+                    (category) => DropdownMenuItem(
+                      value: category.id,
+                      child: Text(
+                        category.localizedName(
+                          Localizations.localeOf(context).languageCode,
+                        ),
                       ),
                     ),
+                  )
+                  .toList(),
+              onChanged: (v) => setState(() => _category = v ?? _category),
+              validator: (value) => value == null || value.isEmpty
+                  ? AppLocalizations.of(
+                      context,
+                    ).source('กรุณาเลือกหมวดหมู่สินค้า')
+                  : null,
+            ),
+            const SizedBox(height: 18),
+            const _FieldLabel('ชื่อสินค้า *'),
+            TextFormField(
+              controller: _nameController,
+              maxLength: 100,
+              decoration: _inputDecoration(
+                hint: 'ใส่ชื่อสินค้าที่ต้องการขาย',
+                counter: true,
+              ),
+              validator: (value) => normalizeText(value).isEmpty
+                  ? AppLocalizations.of(context).source('กรุณาใส่ชื่อสินค้า')
+                  : null,
+            ),
+            const SizedBox(height: 10),
+            const _FieldLabel('ราคา *'),
+            Row(
+              children: [
+                Expanded(
+                  child: TextFormField(
+                    controller: _priceController,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                    decoration: _inputDecoration(hint: 'ระบุราคา'),
+                    validator: (value) {
+                      final price = parsePriceValue(value);
+                      return price != null && price >= 0
+                          ? null
+                          : AppLocalizations.of(
+                              context,
+                            ).source('กรุณากรอกราคาที่ถูกต้อง');
+                    },
                   ),
-                )
-                .toList(),
-            onChanged: (v) => setState(() => _category = v ?? _category),
-          ),
-          const SizedBox(height: 18),
-          const _FieldLabel('ชื่อสินค้า *'),
-          TextFormField(
-            controller: _nameController,
-            maxLength: 100,
-            decoration: _inputDecoration(
-              hint: 'ใส่ชื่อสินค้าที่ต้องการขาย',
-              counter: true,
-            ),
-            validator: (value) => normalizeText(value).isEmpty
-                ? AppLocalizations.of(context).source('กรุณาใส่ชื่อสินค้า')
-                : null,
-          ),
-          const SizedBox(height: 10),
-          const _FieldLabel('ราคา *'),
-          Row(
-            children: [
-              Expanded(
-                child: TextFormField(
-                  controller: _priceController,
-                  keyboardType: TextInputType.number,
-                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                  decoration: _inputDecoration(hint: 'ระบุราคา'),
-                  validator: (value) {
-                    final price = parsePriceValue(value);
-                    return price != null && price >= 0
-                        ? null
-                        : AppLocalizations.of(
-                            context,
-                          ).source('กรุณากรอกราคาที่ถูกต้อง');
-                  },
                 ),
-              ),
-              const SizedBox(width: 12),
-              SizedBox(
-                width: 88,
-                child: DropdownButtonFormField<String>(
-                  initialValue: _currency,
-                  decoration: _inputDecoration(),
-                  items: const ['MMK', 'THB', 'USD', 'CNY']
-                      .map(
-                        (value) => DropdownMenuItem(
-                          value: value,
-                          child: LocalizedText(value),
-                        ),
-                      )
-                      .toList(),
-                  onChanged: (value) =>
-                      setState(() => _currency = value ?? _currency),
+                const SizedBox(width: 12),
+                Flexible(
+                  flex: 2,
+                  child: DropdownButtonFormField<String>(
+                    initialValue: _currency,
+                    isExpanded: true,
+                    decoration: _inputDecoration(),
+                    items: const ['MMK', 'THB', 'USD', 'CNY']
+                        .map(
+                          (value) => DropdownMenuItem(
+                            value: value,
+                            child: Text(
+                              value,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        )
+                        .toList(),
+                    onChanged: (value) =>
+                        setState(() => _currency = value ?? _currency),
+                  ),
                 ),
-              ),
-              const SizedBox(width: 12),
-              Switch.adaptive(
-                value: _negotiable,
-                activeColor: AppTheme.orange,
-                onChanged: (v) => setState(() => _negotiable = v),
-              ),
-              const LocalizedText(
-                'ต่อรองได้',
-                style: TextStyle(fontWeight: FontWeight.w600),
-              ),
-            ],
-          ),
-        ],
-      ),
-      const SizedBox(height: 16),
-      _sectionCard(
-        title: 'สภาพสินค้า',
-        children: [
-          Row(
-            children: [
-              _conditionButton('มือหนึ่ง', Icons.inventory_2_outlined),
-              const SizedBox(width: 8),
-              _conditionButton('มือสอง\nสภาพดี', Icons.thumb_up_alt_outlined),
-              const SizedBox(width: 8),
-              _conditionButton(
-                'มือสอง\nสภาพปานกลาง',
-                Icons.sentiment_neutral_outlined,
-              ),
-              const SizedBox(width: 8),
-              _conditionButton('มือสอง\nต้องซ่อม', Icons.build_outlined),
-            ],
-          ),
-        ],
-      ),
-      const SizedBox(height: 16),
-      _sectionCard(
-        title: 'รายละเอียดสินค้า',
-        children: [
-          TextFormField(
-            controller: _detailsController,
-            maxLines: 5,
-            maxLength: 1000,
-            decoration: _inputDecoration(
-              hint:
-                  'อธิบายรายละเอียดสินค้า เช่น สภาพการใช้งาน จุดเด่น อุปกรณ์ที่มีให้ เป็นต้น',
-              counter: true,
+              ],
             ),
-          ),
-        ],
-      ),
-      const SizedBox(height: 16),
-      _sectionCard(
-        title: 'ข้อมูลการติดต่อ',
-        children: [
-          TextFormField(
-            controller: _phoneController,
-            keyboardType: TextInputType.phone,
-            decoration: _inputDecoration(
-              hint: 'เบอร์โทรศัพท์',
-              prefixIcon: Icons.phone_outlined,
+          ],
+        ),
+        const SizedBox(height: 16),
+        _sectionCard(
+          title: 'สภาพสินค้า',
+          children: [
+            Row(
+              children: [
+                _conditionButton('มือหนึ่ง', Icons.inventory_2_outlined),
+                const SizedBox(width: 8),
+                _conditionButton('มือสอง\nสภาพดี', Icons.thumb_up_alt_outlined),
+                const SizedBox(width: 8),
+                _conditionButton(
+                  'มือสอง\nสภาพปานกลาง',
+                  Icons.sentiment_neutral_outlined,
+                ),
+                const SizedBox(width: 8),
+                _conditionButton('มือสอง\nต้องซ่อม', Icons.build_outlined),
+              ],
             ),
-            validator: (value) => validatePhone(value),
-          ),
-          const SizedBox(height: 12),
-          const LocalizedText(
-            'เบอร์โทรที่จะแสดงให้ผู้สนใจติดต่อคุณ',
-            style: TextStyle(fontSize: 12, color: AppTheme.textMuted),
-          ),
-          const SizedBox(height: 16),
-          TextFormField(
-            controller: _viberController,
-            keyboardType: TextInputType.phone,
-            decoration: _inputDecoration(
-              hint: 'เบอร์โทร Viber',
-              prefixIcon: Icons.phone_in_talk_outlined,
+          ],
+        ),
+        const SizedBox(height: 16),
+        _sectionCard(
+          title: 'รายละเอียดสินค้า',
+          children: [
+            TextFormField(
+              controller: _detailsController,
+              maxLines: 5,
+              maxLength: 1000,
+              decoration: _inputDecoration(
+                hint:
+                    'อธิบายรายละเอียดสินค้า เช่น สภาพการใช้งาน จุดเด่น อุปกรณ์ที่มีให้ เป็นต้น',
+                counter: true,
+              ),
             ),
-          ),
-          const SizedBox(height: 12),
-          const LocalizedText(
-            'เบอร์ Viber ที่จะแสดงให้ผู้สนใจติดต่อคุณ',
-            style: TextStyle(fontSize: 12, color: AppTheme.textMuted),
-          ),
-        ],
-      ),
-      const SizedBox(height: 18),
-      _primaryButton('ถัดไป', _next),
-    ]);
+          ],
+        ),
+        const SizedBox(height: 16),
+        _sectionCard(
+          title: 'ข้อมูลการติดต่อ',
+          children: [
+            TextFormField(
+              controller: _phoneController,
+              keyboardType: TextInputType.phone,
+              decoration: _inputDecoration(
+                hint: 'เบอร์โทรศัพท์',
+                prefixIcon: Icons.phone_outlined,
+              ),
+              validator: (value) => validatePhone(value),
+            ),
+            const SizedBox(height: 12),
+            const LocalizedText(
+              'เบอร์โทรที่จะแสดงให้ผู้สนใจติดต่อคุณ',
+              style: TextStyle(fontSize: 12, color: AppTheme.textMuted),
+            ),
+            const SizedBox(height: 16),
+            TextFormField(
+              controller: _viberController,
+              keyboardType: TextInputType.phone,
+              decoration: _inputDecoration(
+                hint: 'เบอร์โทร Viber',
+                prefixIcon: Icons.phone_in_talk_outlined,
+              ),
+            ),
+            const SizedBox(height: 12),
+            const LocalizedText(
+              'เบอร์ Viber ที่จะแสดงให้ผู้สนใจติดต่อคุณ',
+              style: TextStyle(fontSize: 12, color: AppTheme.textMuted),
+            ),
+          ],
+        ),
+        const SizedBox(height: 18),
+        KeyedSubtree(
+          key: const ValueKey('general-basic-next'),
+          child: _primaryButton('ถัดไป', _next),
+        ),
+      ]),
+    );
   }
 
   Widget _stepPhotos() {
@@ -4273,195 +4589,105 @@ class _PostPageState extends State<PostPage> {
   }
 
   Widget _stepLocation() {
-    return _stepScroll([
-      _sectionCard(
-        title: 'ตำแหน่งสินค้า',
-        children: [
-          if (widget.storeId == null) ...[
-            Material(
-              type: MaterialType.transparency,
-              child: SwitchListTile.adaptive(
-                contentPadding: EdgeInsets.zero,
-                value: _isLocationVisible,
-                title: const LocalizedText('เปิดเผยตำแหน่งสินค้า'),
-                subtitle: const LocalizedText(
-                  'ใช้เพื่อแสดงสินค้าใกล้เคียง โดยไม่แสดงพิกัดตัวเลข',
-                ),
-                onChanged: (value) => setState(() {
-                  _isLocationVisible = value;
-                  if (!value) _listingPosition = null;
-                }),
-              ),
-            ),
-            const SizedBox(height: 8),
-          ],
-          Row(
-            children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: _isLocationVisible
-                      ? _captureListingLocation
-                      : null,
-                  icon: const Icon(Icons.location_on_rounded),
-                  label: const LocalizedText('ตำแหน่งปัจจุบัน'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: AppTheme.orange,
-                    side: const BorderSide(color: AppTheme.orange),
-                    minimumSize: const Size.fromHeight(54),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
+    return Form(
+      key: _locationStepFormKey,
+      child: _stepScroll([
+        _sectionCard(
+          title: 'ตำแหน่งสินค้า',
+          children: [
+            if (widget.storeId == null) ...[
+              Material(
+                type: MaterialType.transparency,
+                child: SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  value: _isLocationVisible,
+                  title: const LocalizedText('เปิดเผยตำแหน่งสินค้า'),
+                  subtitle: const LocalizedText(
+                    'ใช้เพื่อแสดงสินค้าใกล้เคียง โดยไม่แสดงพิกัดตัวเลข',
                   ),
+                  onChanged: (value) => setState(() {
+                    _isLocationVisible = value;
+                    if (!value) _listingPosition = null;
+                  }),
                 ),
               ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: () =>
-                      showInfo(context, 'เลือกตำแหน่งบนแผนที่ (mock)'),
-                  icon: const Icon(Icons.map_outlined),
-                  label: const LocalizedText('เลือกบนแผนที่'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: AppTheme.textPrimary,
-                    side: const BorderSide(color: AppTheme.border),
-                    minimumSize: const Size.fromHeight(54),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                  ),
-                ),
-              ),
+              const SizedBox(height: 8),
             ],
-          ),
-          const SizedBox(height: 16),
-          Container(
-            height: 285,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(16),
-              color: const Color(0xFFF2F1EC),
-              border: Border.all(color: AppTheme.border),
+            if (_isLocationVisible)
+              LocationPickerMap(
+                value: _listingPosition,
+                onChanged: (point) => setState(() => _listingPosition = point),
+                currentLocation: () async {
+                  final position = await SuikaiService.getCurrentPosition();
+                  return position == null
+                      ? null
+                      : latlng.LatLng(position.latitude, position.longitude);
+                },
+                height: 285,
+              ),
+            const SizedBox(height: 18),
+            const _FieldLabel('เมือง'),
+            TextFormField(
+              controller: _cityController,
+              decoration: _inputDecoration(hint: 'กรอกชื่อเมือง'),
+              validator: (value) {
+                final error = validateRequiredCity(value);
+                return error == null
+                    ? null
+                    : AppLocalizations.of(context).source(error);
+              },
             ),
-            clipBehavior: Clip.antiAlias,
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  child: CustomPaint(painter: _MiniLocationMapPainter()),
-                ),
-                const Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.location_on_rounded,
-                        size: 62,
-                        color: AppTheme.orange,
-                      ),
-                      CircleAvatar(radius: 7, backgroundColor: Colors.blue),
-                    ],
-                  ),
-                ),
-                Positioned(
-                  right: 14,
-                  bottom: 14,
-                  child: Material(
-                    color: Colors.white,
-                    elevation: 2,
-                    shape: const CircleBorder(),
-                    child: IconButton(
-                      onPressed: null,
-                      icon: Icon(
-                        Icons.my_location_rounded,
-                        color: AppTheme.textPrimary,
-                      ),
+            const SizedBox(height: 18),
+            const _FieldLabel('รายละเอียดตำแหน่ง (ไม่บังคับ)'),
+            TextField(
+              controller: _locationNoteController,
+              maxLength: 200,
+              maxLines: 4,
+              decoration: _inputDecoration(
+                hint: 'เช่น ใกล้ 7-11, ตรงข้ามโรงเรียน...',
+                counter: true,
+              ),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFFF4EC),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.shield_outlined, color: AppTheme.orange),
+                  SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        LocalizedText(
+                          'ข้อมูลตำแหน่งจะถูกเก็บเป็นความลับ',
+                          style: TextStyle(fontWeight: FontWeight.w800),
+                        ),
+                        SizedBox(height: 3),
+                        LocalizedText(
+                          'ตำแหน่งที่แสดงจะเป็นเพียงตำแหน่งโดยประมาณ เพื่อความปลอดภัยของคุณ',
+                          style: TextStyle(
+                            color: AppTheme.textMuted,
+                            height: 1.4,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-          const SizedBox(height: 18),
-          const _FieldLabel('ที่อยู่สินค้า'),
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              border: Border.all(color: AppTheme.border),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Icon(
-                  Icons.location_on_outlined,
-                  color: AppTheme.textMuted,
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: LocalizedText(
-                    _address,
-                    style: const TextStyle(height: 1.55),
-                  ),
-                ),
-                TextButton(
-                  onPressed: () {},
-                  child: const LocalizedText(
-                    'แก้ไข',
-                    style: TextStyle(color: AppTheme.orange),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 18),
-          const _FieldLabel('รายละเอียดตำแหน่ง (ไม่บังคับ)'),
-          TextField(
-            controller: _locationNoteController,
-            maxLength: 200,
-            maxLines: 4,
-            decoration: _inputDecoration(
-              hint: 'เช่น ใกล้ 7-11, ตรงข้ามโรงเรียน...',
-              counter: true,
-            ),
-          ),
-          const SizedBox(height: 16),
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: const Color(0xFFFFF4EC),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: const Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Icon(Icons.shield_outlined, color: AppTheme.orange),
-                SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      LocalizedText(
-                        'ข้อมูลตำแหน่งจะถูกเก็บเป็นความลับ',
-                        style: TextStyle(fontWeight: FontWeight.w800),
-                      ),
-                      SizedBox(height: 3),
-                      LocalizedText(
-                        'ตำแหน่งที่แสดงจะเป็นเพียงตำแหน่งโดยประมาณ เพื่อความปลอดภัยของคุณ',
-                        style: TextStyle(
-                          color: AppTheme.textMuted,
-                          height: 1.4,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-      const SizedBox(height: 18),
-      _bottomPair(backText: 'ย้อนกลับ', nextText: 'ถัดไป'),
-    ]);
+          ],
+        ),
+        const SizedBox(height: 18),
+        _bottomPair(backText: 'ย้อนกลับ', nextText: 'ถัดไป'),
+      ]),
+    );
   }
 
   Widget _stepConfirm() {
@@ -4549,7 +4775,9 @@ class _PostPageState extends State<PostPage> {
           const Divider(height: 30),
           _confirmSection(
             'ตำแหน่งสินค้า',
-            _address,
+            normalizeText(_cityController.text).isEmpty
+                ? AppLocalizations.of(context).source('ไม่ระบุเมือง')
+                : normalizeText(_cityController.text),
             icon: Icons.location_on_outlined,
           ),
           const Divider(height: 30),
@@ -4614,7 +4842,13 @@ class _PostPageState extends State<PostPage> {
               _submitting
                   ? null
                   : () async {
-                      if (!_formKey.currentState!.validate()) {
+                      final basicValid =
+                          _basicStepFormKey.currentState?.validate() ?? false;
+                      final locationValid =
+                          _locationStepFormKey.currentState?.validate() ??
+                          false;
+                      if (!basicValid || !locationValid) {
+                        showInfo(context, 'กรุณาตรวจสอบข้อมูลที่จำเป็น');
                         return;
                       }
                       final price = parsePriceValue(_priceController.text);
@@ -4631,18 +4865,18 @@ class _PostPageState extends State<PostPage> {
                         showInfo(context, 'กรุณาเพิ่มรูปสินค้าอย่างน้อย 1 รูป');
                         return;
                       }
+                      if (normalizeText(_cityController.text).isEmpty) {
+                        showInfo(context, 'กรุณากรอกชื่อเมือง');
+                        return;
+                      }
                       setState(() => _submitting = true);
                       try {
-                        if (widget.storeId == null &&
-                            _isLocationVisible &&
-                            _listingPosition == null) {
-                          await _captureListingLocation(notify: false);
-                        }
-                        final listing = await SuikaiService.createListing(
+                        await SuikaiService.createListing(
                           title: normalizeText(_nameController.text),
                           description: normalizeText(_detailsController.text),
                           category: _category,
-                          city: 'เมืองนาง',
+                          city: normalizeText(_cityController.text),
+                          cityId: null,
                           phone: phone,
                           viber: normalizePhone(_viberController.text),
                           price: price.toDouble(),
@@ -4657,46 +4891,6 @@ class _PostPageState extends State<PostPage> {
                           isLocationVisible:
                               widget.storeId != null || _isLocationVisible,
                         );
-                        if (listing != null) {
-                          MockRepo.products.insert(
-                            0,
-                            MockProduct(
-                              id:
-                                  listing['id']?.toString() ??
-                                  'mock-${DateTime.now().millisecondsSinceEpoch}',
-                              title: normalizeText(_nameController.text),
-                              priceValue: price,
-                              currencyCode: _currency,
-                              description: normalizeText(
-                                _detailsController.text,
-                              ),
-                              category: _category,
-                              city: 'เมืองนาง',
-                              location: _address,
-                              time: 'เพิ่งลงประกาศ',
-                              image:
-                                  (listing['images'] as List?)?.firstOrNull
-                                      ?.toString() ??
-                                  'https://images.unsplash.com/photo-1515923256482-1c04580b477c?auto=format&fit=crop&w=800&q=80',
-                              phone: phone,
-                              viber: normalizePhone(_viberController.text),
-                              likeCount: 0,
-                              viewCount: 0,
-                              status: ProductStatus.available,
-                              storeId: widget.storeId,
-                              ownerId: SuikaiService.currentUserId,
-                              images: List<String>.from(
-                                listing['images'] ?? const [],
-                              ),
-                              latitude: (listing['latitude'] as num?)
-                                  ?.toDouble(),
-                              longitude: (listing['longitude'] as num?)
-                                  ?.toDouble(),
-                              isLocationVisible:
-                                  listing['is_location_visible'] != false,
-                            ),
-                          );
-                        }
                         if (!context.mounted) {
                           return;
                         }
@@ -4709,11 +4903,14 @@ class _PostPageState extends State<PostPage> {
                             SuikaiRoutes.home,
                           );
                         }
-                      } catch (_) {
+                      } catch (error, stackTrace) {
+                        debugPrint(
+                          'Submit listing failed: $error\n$stackTrace',
+                        );
                         if (!context.mounted) {
                           return;
                         }
-                        showInfo(context, 'ลงประกาศไม่สำเร็จ กรุณาลองใหม่');
+                        showInfo(context, 'ลงประกาศไม่สำเร็จ: $error');
                         setState(() => _submitting = false);
                       }
                     },
@@ -5148,6 +5345,257 @@ class _MiniLocationMapPainter extends CustomPainter {
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
+class ShortVideoFeedPage extends StatefulWidget {
+  const ShortVideoFeedPage({super.key});
+
+  @override
+  State<ShortVideoFeedPage> createState() => _ShortVideoFeedPageState();
+}
+
+class _ShortVideoFeedPageState extends State<ShortVideoFeedPage>
+    with RouteAware, WidgetsBindingObserver {
+  late final Future<List<ShortVideoRecord>> _videos =
+      SuikaiService.fetchActiveShortVideos();
+  int _currentIndex = 0;
+  bool _isMuted = false;
+  bool _routeVisible = true;
+  bool _appActive = true;
+  ModalRoute<void>? _route;
+
+  bool get _playbackActive => _routeVisible && _appActive;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (_route == route) return;
+    if (_route != null) appRouteObserver.unsubscribe(this);
+    _route = route;
+    if (route != null) appRouteObserver.subscribe(this, route);
+  }
+
+  void _setRouteVisible(bool value) {
+    if (mounted && _routeVisible != value) {
+      setState(() => _routeVisible = value);
+    }
+  }
+
+  @override
+  void didPush() => _setRouteVisible(true);
+
+  @override
+  void didPopNext() => _setRouteVisible(true);
+
+  @override
+  void didPushNext() => _setRouteVisible(false);
+
+  @override
+  void didPop() => _setRouteVisible(false);
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final active = state == AppLifecycleState.resumed;
+    if (mounted && _appActive != active) {
+      setState(() => _appActive = active);
+    }
+  }
+
+  @override
+  void dispose() {
+    appRouteObserver.unsubscribe(this);
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => RootScaffold(
+    selectedIndex: 3,
+    body: FutureBuilder<List<ShortVideoRecord>>(
+      future: _videos,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final videos = snapshot.data ?? const [];
+        if (videos.isEmpty) {
+          return const Center(
+            child: LocalizedText(
+              'ยังไม่มีวิดีโอสั้น',
+              style: TextStyle(color: AppTheme.textMuted),
+            ),
+          );
+        }
+        return SafeArea(
+          bottom: false,
+          child: LayoutBuilder(
+            builder: (context, constraints) => SizedBox(
+              width: constraints.maxWidth,
+              height: constraints.maxHeight,
+              child: PageView.builder(
+                scrollDirection: Axis.vertical,
+                physics: const PageScrollPhysics(),
+                itemCount: videos.length,
+                onPageChanged: (index) => setState(() {
+                  _currentIndex = index;
+                  _isMuted = false;
+                }),
+                itemBuilder: (_, index) {
+                  final video = videos[index];
+                  if (index != _currentIndex) {
+                    return ColoredBox(
+                      key: ValueKey('short-video-placeholder-${video.id}'),
+                      color: Colors.black,
+                    );
+                  }
+                  return _TikTokVideoPage(
+                    key: ValueKey('short-video-${video.id}'),
+                    video: video,
+                    active: _playbackActive,
+                    muted: _isMuted,
+                    onMutedChanged: (value) => setState(() => _isMuted = value),
+                  );
+                },
+              ),
+            ),
+          ),
+        );
+      },
+    ),
+  );
+}
+
+class _TikTokVideoPage extends StatefulWidget {
+  final ShortVideoRecord video;
+  final bool active;
+  final bool muted;
+  final ValueChanged<bool> onMutedChanged;
+  const _TikTokVideoPage({
+    super.key,
+    required this.video,
+    required this.active,
+    required this.muted,
+    required this.onMutedChanged,
+  });
+
+  @override
+  State<_TikTokVideoPage> createState() => _TikTokVideoPageState();
+}
+
+class _TikTokVideoPageState extends State<_TikTokVideoPage> {
+  bool _failed = false;
+
+  String? get _videoId {
+    final uri = Uri.tryParse(widget.video.tiktokUrl);
+    if (uri == null) return null;
+    final videoIndex = uri.pathSegments.indexOf('video');
+    if (videoIndex >= 0 && videoIndex + 1 < uri.pathSegments.length) {
+      final id = uri.pathSegments[videoIndex + 1];
+      if (RegExp(r'^\d+$').hasMatch(id)) return id;
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final videoId = _videoId;
+    final unavailable = _failed || videoId == null;
+    return ColoredBox(
+      color: Colors.black,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          if (!unavailable)
+            Center(
+              child: AspectRatio(
+                aspectRatio: 9 / 16,
+                child: TikTokEmbedPlayer(
+                  key: ValueKey('tiktok-player-$videoId'),
+                  videoId: videoId,
+                  active: widget.active,
+                  muted: widget.muted,
+                  onFailed: () {
+                    if (mounted) setState(() => _failed = true);
+                  },
+                ),
+              ),
+            ),
+          if (unavailable)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.video_file_outlined,
+                      color: AppTheme.orange,
+                      size: 58,
+                    ),
+                    const SizedBox(height: 12),
+                    const LocalizedText('ไม่สามารถเล่นวิดีโอนี้ได้'),
+                  ],
+                ),
+              ),
+            ),
+          if (widget.video.title.isNotEmpty)
+            Positioned(
+              left: 16,
+              right: 16,
+              bottom: 18,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: .62),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 10,
+                  ),
+                  child: Text(
+                    widget.video.title,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          Positioned(
+            top: 16,
+            right: 16,
+            child: Material(
+              color: Colors.black.withValues(alpha: .68),
+              shape: const CircleBorder(),
+              child: IconButton(
+                tooltip: AppLocalizations.of(
+                  context,
+                ).source(widget.muted ? 'เปิดเสียง' : 'ปิดเสียง'),
+                onPressed: () => widget.onMutedChanged(!widget.muted),
+                color: Colors.white,
+                icon: Icon(
+                  widget.muted
+                      ? Icons.volume_off_rounded
+                      : Icons.volume_up_rounded,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class MapPage extends StatefulWidget {
   const MapPage({super.key});
 
@@ -5156,20 +5604,31 @@ class MapPage extends StatefulWidget {
 }
 
 class _MapPageState extends State<MapPage> {
-  MockStore? _selected;
+  final fmap.MapController _mapController = fmap.MapController();
+  final TextEditingController _mapSearch = TextEditingController();
+  StoreViewModel? _selected;
+  ProductViewModel? _selectedProduct;
   bool _showFilter = false;
   bool _loading = true;
   String _category = 'all';
   String _distance = '25 เมตร';
-  List<MockStore> _stores = [];
+  List<StoreViewModel> _stores = [];
+  List<ProductViewModel> _mapProducts = [];
   bool _filterApplied = false;
   Position? _currentPosition;
+  String _query = '';
 
   @override
   void initState() {
     super.initState();
-    _loadStores();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _requestLocation());
+    _loadMapData();
+  }
+
+  @override
+  void dispose() {
+    _mapSearch.dispose();
+    _mapController.dispose();
+    super.dispose();
   }
 
   Future<void> _requestLocation() async {
@@ -5177,28 +5636,40 @@ class _MapPageState extends State<MapPage> {
       final position = await SuikaiService.getCurrentPosition();
       if (!mounted) return;
       setState(() => _currentPosition = position);
-      if (position == null) {
-        showInfo(
-          context,
-          'เปิดแผนที่ได้ตามปกติ แต่ไม่สามารถแสดงตำแหน่งปัจจุบันได้',
+      if (position != null) {
+        _mapController.move(
+          latlng.LatLng(position.latitude, position.longitude),
+          16,
         );
       }
-    } catch (_) {
+    } on LocationFailure catch (error) {
       if (mounted) {
-        showInfo(context, 'ไม่สามารถใช้บริการตำแหน่งได้');
+        showInfo(context, error.userMessage);
       }
+    } catch (error, stackTrace) {
+      debugPrint('Map current location failed: $error\n$stackTrace');
+      if (mounted) showInfo(context, 'ไม่สามารถอ่านตำแหน่งปัจจุบันได้');
     }
   }
 
-  Future<void> _loadStores() async {
+  Future<void> _loadMapData() async {
     try {
-      final data = await SuikaiService.fetchStores();
-      final next = data.map((item) {
-        return MockStore(
+      final results = await Future.wait([
+        SuikaiService.fetchStores(),
+        SuikaiService.fetchMapListings(),
+      ]);
+      final next = results[0].map((item) {
+        return StoreViewModel(
           id: item['id'].toString(),
           name: item['name']?.toString() ?? '',
           type: item['category']?.toString() ?? 'ร้านค้า',
           city: item['city']?.toString() ?? '',
+          cityId: item['city_id']?.toString(),
+          cityRecord: item['cities'] is Map
+              ? CityRecord.fromJson(
+                  Map<String, dynamic>.from(item['cities'] as Map),
+                )
+              : null,
           distance: '0 กม.',
           logo: item['logo_url']?.toString() ?? '',
           description: item['description']?.toString() ?? '',
@@ -5214,36 +5685,105 @@ class _MapPageState extends State<MapPage> {
           longitude: (item['longitude'] as num?)?.toDouble(),
         );
       }).toList();
+      final products = results[1].map((item) {
+        final images = (item['listing_images'] as List? ?? const [])
+            .map((entry) => '${(entry as Map)['image_url'] ?? ''}')
+            .where((url) => url.isNotEmpty)
+            .toList();
+        return ProductViewModel(
+          id: '${item['id']}',
+          title: '${item['title'] ?? ''}',
+          priceValue: (item['price'] as num?)?.toInt() ?? 0,
+          currencyCode: '${item['currency'] ?? 'MMK'}',
+          description: '${item['description'] ?? ''}',
+          category: '${item['category'] ?? ''}',
+          city: '${item['city'] ?? ''}',
+          cityId: item['city_id']?.toString(),
+          cityRecord: item['cities'] is Map
+              ? CityRecord.fromJson(
+                  Map<String, dynamic>.from(item['cities'] as Map),
+                )
+              : null,
+          location: '${item['city'] ?? ''}',
+          time: '${item['created_at'] ?? ''}',
+          image: images.firstOrNull ?? '',
+          phone: '${item['phone'] ?? ''}',
+          viber: '${item['viber_phone'] ?? ''}',
+          likeCount: 0,
+          viewCount: 0,
+          status: _productStatus('${item['status']}'),
+          storeId: item['store_id']?.toString(),
+          ownerId: item['owner_id']?.toString(),
+          images: images,
+          latitude: (item['latitude'] as num?)?.toDouble(),
+          longitude: (item['longitude'] as num?)?.toDouble(),
+          isLocationVisible: item['is_location_visible'] == true,
+        );
+      }).toList();
       if (mounted) {
         setState(() {
           _stores = next;
+          _mapProducts = products;
+          MarketplaceCache.cacheProducts(products);
           _loading = false;
         });
       }
-    } catch (_) {
+    } catch (error, stackTrace) {
+      debugPrint('Supabase map data query failed: $error\n$stackTrace');
       if (mounted) {
         setState(() => _loading = false);
       }
     }
   }
 
-  List<MockStore> get _storesForView {
-    final approved = _loading ? MockRepo.approvedStores : _stores;
-    if (!_filterApplied) {
-      return approved.where((store) => store.promotionIsActive).toList();
-    }
-    final filtered = _category == 'all'
-        ? approved
-        : approved
+  List<ProductViewModel> get _productsForView {
+    final categoryFiltered = _category == 'all'
+        ? _mapProducts
+        : _mapProducts
+              .where(
+                (product) => mapCategoryMatches(product.category, _category),
+              )
+              .toList();
+    final query = _query.trim().toLowerCase();
+    if (query.isEmpty) return categoryFiltered;
+    return categoryFiltered
+        .where(
+          (product) =>
+              product.title.toLowerCase().contains(query) ||
+              _categoryLabel(
+                context,
+                'listing',
+                product.category,
+              ).toLowerCase().contains(query),
+        )
+        .toList();
+  }
+
+  List<StoreViewModel> get _storesForView {
+    final categoryFiltered = _stores
+        .where(
+          (store) =>
+              store.approved && mapCategoryMatches(store.type, _category),
+        )
+        .toList();
+    final normalizedQuery = _query.trim().toLowerCase();
+    final searched = normalizedQuery.isEmpty
+        ? categoryFiltered
+        : categoryFiltered
               .where(
                 (store) =>
-                    SuikaiService.categoryIdForValue('store', store.type) ==
-                    _category,
+                    store.name.toLowerCase().contains(normalizedQuery) ||
+                    store.type.toLowerCase().contains(normalizedQuery) ||
+                    _categoryLabel(
+                      context,
+                      'store',
+                      store.type,
+                    ).toLowerCase().contains(normalizedQuery),
               )
               .toList();
     final position = _currentPosition;
-    if (position == null) return filtered;
-    return filtered.where((store) {
+    if (position == null || !_filterApplied) return searched;
+    return searched.where((store) {
       if (store.latitude == null || store.longitude == null) return true;
       return SuikaiService.isWithin500Km(
         position,
@@ -5256,12 +5796,13 @@ class _MapPageState extends State<MapPage> {
   @override
   Widget build(BuildContext context) {
     final stores = _storesForView;
+    final products = _productsForView;
 
     return RootScaffold(
       selectedIndex: 3,
       body: Stack(
         children: [
-          Positioned.fill(child: CustomPaint(painter: _SuikaiMapPainter())),
+          const Positioned.fill(child: ColoredBox(color: Color(0xFFF2F1EC))),
           SafeArea(
             child: Column(
               children: [
@@ -5270,7 +5811,25 @@ class _MapPageState extends State<MapPage> {
                 Expanded(
                   child: Stack(
                     children: [
-                      Positioned.fill(child: _mapMarkers(stores)),
+                      Positioned.fill(child: _mapMarkers(stores, products)),
+                      if (!_loading && stores.isEmpty && products.isEmpty)
+                        const Positioned(
+                          left: 16,
+                          right: 16,
+                          top: 16,
+                          child: Material(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.all(Radius.circular(12)),
+                            child: Padding(
+                              padding: EdgeInsets.all(12),
+                              child: Center(
+                                child: LocalizedText(
+                                  'ไม่พบรายการในหมวดหมู่นี้',
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
                       Positioned(
                         left: 14,
                         bottom: 210,
@@ -5285,6 +5844,13 @@ class _MapPageState extends State<MapPage> {
                           right: 14,
                           bottom: 12,
                           child: _selectedStoreCard(_selected!),
+                        ),
+                      if (_selectedProduct != null)
+                        Positioned(
+                          left: 14,
+                          right: 14,
+                          bottom: 12,
+                          child: _selectedProductCard(_selectedProduct!),
                         ),
                     ],
                   ),
@@ -5309,12 +5875,16 @@ class _MapPageState extends State<MapPage> {
             children: [
               Expanded(
                 child: TextField(
-                  readOnly: true,
-                  onTap: () => showInfo(context, 'ค้นหาร้านค้าบนแผนที่ (mock)'),
+                  controller: _mapSearch,
+                  onChanged: (value) => setState(() {
+                    _query = value;
+                    _selected = null;
+                    _selectedProduct = null;
+                  }),
                   decoration: InputDecoration(
                     hintText: AppLocalizations.of(
                       context,
-                    ).source('ค้นหาร้านค้า หรือหมวดหมู่'),
+                    ).source('ค้นหาร้านค้า สินค้า หรือหมวดหมู่'),
                     prefixIcon: const Icon(Icons.search_rounded),
                     filled: true,
                     fillColor: const Color(0xFFF8F8F8),
@@ -5343,15 +5913,79 @@ class _MapPageState extends State<MapPage> {
             ],
           ),
         ),
+        if (_query.trim().isNotEmpty)
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 150),
+            child: _storesForView.isEmpty && _productsForView.isEmpty
+                ? const Padding(
+                    padding: EdgeInsets.only(bottom: 10),
+                    child: LocalizedText('ไม่พบร้านค้าหรือสินค้า'),
+                  )
+                : ListView.builder(
+                    shrinkWrap: true,
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                    itemCount: _storesForView.length + _productsForView.length,
+                    itemBuilder: (context, index) {
+                      if (index >= _storesForView.length) {
+                        final product =
+                            _productsForView[index - _storesForView.length];
+                        return ListTile(
+                          dense: true,
+                          leading: const Icon(
+                            Icons.sell_outlined,
+                            color: Colors.blue,
+                          ),
+                          title: Text(
+                            product.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          subtitle: Text(product.price),
+                          onTap: () {
+                            _mapSearch.text = product.title;
+                            setState(() => _query = '');
+                            _selectProduct(product);
+                          },
+                        );
+                      }
+                      final store = _storesForView[index];
+                      return ListTile(
+                        dense: true,
+                        leading: const Icon(
+                          Icons.storefront_outlined,
+                          color: AppTheme.orange,
+                        ),
+                        title: Text(
+                          store.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: Text(
+                          _categoryLabel(context, 'store', store.type),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        onTap: () {
+                          _mapSearch.text = store.name;
+                          setState(() => _query = '');
+                          _selectStore(store);
+                        },
+                      );
+                    },
+                  ),
+          ),
       ],
     ),
   );
 
   Widget _categoryStrip() {
-    final items = <(String, IconData)>[
-      const ('all', Icons.grid_view_rounded),
-      for (final category in SuikaiService.categoryRecords('store'))
-        (category.id, _storeCategoryIcon(category.id)),
+    final items = <(String, String, IconData)>[
+      const ('all', 'all', Icons.grid_view_rounded),
+      for (final category in [
+        ...SuikaiService.categoryRecords('store', activeOnly: true),
+        ...SuikaiService.categoryRecords('listing', activeOnly: true),
+      ])
+        (category.id, category.type, _categoryIcon(category.id)),
     ];
     return Container(
       height: 76,
@@ -5369,6 +6003,7 @@ class _MapPageState extends State<MapPage> {
             onTap: () => setState(() {
               _category = item.$1;
               _selected = null;
+              _selectedProduct = null;
               _filterApplied = true;
             }),
             child: SizedBox(
@@ -5387,13 +6022,13 @@ class _MapPageState extends State<MapPage> {
                           ? Border.all(color: AppTheme.orange, width: 1.4)
                           : null,
                     ),
-                    child: Icon(item.$2, size: 20, color: AppTheme.orange),
+                    child: Icon(item.$3, size: 20, color: AppTheme.orange),
                   ),
                   const SizedBox(height: 4),
                   Text(
                     item.$1 == 'all'
                         ? AppLocalizations.of(context).source('ทั้งหมด')
-                        : _categoryLabel(context, 'store', item.$1),
+                        : _categoryLabel(context, item.$2, item.$1),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     textAlign: TextAlign.center,
@@ -5411,87 +6046,291 @@ class _MapPageState extends State<MapPage> {
     );
   }
 
-  Widget _mapMarkers(List<MockStore> stores) {
-    return LayoutBuilder(
-      builder: (context, c) {
-        final coords = <Offset>[
-          Offset(c.maxWidth * .28, c.maxHeight * .32),
-          Offset(c.maxWidth * .68, c.maxHeight * .22),
-          Offset(c.maxWidth * .52, c.maxHeight * .50),
-          Offset(c.maxWidth * .78, c.maxHeight * .58),
-          Offset(c.maxWidth * .18, c.maxHeight * .62),
-        ];
-        return Stack(
-          children: [
+  Widget _mapMarkers(
+    List<StoreViewModel> stores,
+    List<ProductViewModel> products,
+  ) {
+    final located = stores
+        .where((store) => store.latitude != null && store.longitude != null)
+        .toList();
+    final initial = _currentPosition == null
+        ? const latlng.LatLng(20.8907, 97.1815)
+        : latlng.LatLng(
+            _currentPosition!.latitude,
+            _currentPosition!.longitude,
+          );
+    return fmap.FlutterMap(
+      mapController: _mapController,
+      options: fmap.MapOptions(initialCenter: initial, initialZoom: 12),
+      children: [
+        fmap.TileLayer(
+          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+          userAgentPackageName: 'com.suikai.app',
+        ),
+        fmap.MarkerLayer(
+          markers: [
             if (_currentPosition != null)
-              Positioned(
-                left: c.maxWidth * .45 - 21,
-                top: c.maxHeight * .38 - 21,
-                child: Container(
-                  width: 42,
-                  height: 42,
-                  decoration: BoxDecoration(
-                    color: Colors.blue.withValues(alpha: .16),
-                    shape: BoxShape.circle,
-                  ),
-                  alignment: Alignment.center,
-                  child: Container(
-                    width: 15,
-                    height: 15,
-                    decoration: BoxDecoration(
-                      color: Colors.blue,
-                      shape: BoxShape.circle,
-                      border: Border.all(color: Colors.white, width: 3),
-                    ),
+              fmap.Marker(
+                point: initial,
+                width: 30,
+                height: 30,
+                child: const Icon(Icons.my_location, color: Colors.blue),
+              ),
+            for (final store in located)
+              fmap.Marker(
+                point: latlng.LatLng(store.latitude!, store.longitude!),
+                width: 104,
+                height: 76,
+                alignment: Alignment.topCenter,
+                child: GestureDetector(
+                  key: ValueKey('map-store-${store.id}'),
+                  onTap: () => _selectStore(store),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 46,
+                        height: 46,
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: _selected?.id == store.id
+                                ? AppTheme.orange
+                                : Colors.white,
+                            width: 3,
+                          ),
+                          boxShadow: const [BoxShadow(blurRadius: 5)],
+                        ),
+                        clipBehavior: Clip.antiAlias,
+                        child: store.logo.trim().isEmpty
+                            ? const Icon(
+                                Icons.storefront_rounded,
+                                color: AppTheme.orange,
+                              )
+                            : persistentImage(
+                                store.logo,
+                                key: ValueKey(
+                                  'map-store-logo-${store.id}-${store.logo}',
+                                ),
+                                fit: BoxFit.cover,
+                                errorBuilder: (_, _, _) => const Icon(
+                                  Icons.storefront_rounded,
+                                  color: AppTheme.orange,
+                                ),
+                              ),
+                      ),
+                      const SizedBox(height: 2),
+                      Container(
+                        constraints: const BoxConstraints(maxWidth: 100),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 5,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: .92),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          store.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
-            for (var i = 0; i < stores.length; i++)
-              Positioned(
-                left: coords[i % coords.length].dx - 20,
-                top: coords[i % coords.length].dy - 20,
-                child: GestureDetector(
-                  onTap: () => setState(() => _selected = stores[i]),
-                  child: Container(
-                    width: 42,
-                    height: 42,
-                    decoration: BoxDecoration(
-                      color: _selected?.id == stores[i].id
-                          ? AppTheme.orange
-                          : const Color(0xFFD86D18),
-                      shape: BoxShape.circle,
-                      border: Border.all(color: Colors.white, width: 3),
-                      boxShadow: const [
-                        BoxShadow(
-                          color: Color(0x22000000),
-                          blurRadius: 8,
-                          offset: Offset(0, 3),
+            for (final product in products)
+              if (product.isLocationVisible &&
+                  product.latitude != null &&
+                  product.longitude != null)
+                fmap.Marker(
+                  point: latlng.LatLng(product.latitude!, product.longitude!),
+                  width: 104,
+                  height: 76,
+                  alignment: Alignment.topCenter,
+                  child: GestureDetector(
+                    key: ValueKey('map-product-${product.id}'),
+                    onTap: () => _selectProduct(product),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 46,
+                          height: 46,
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: _selectedProduct?.id == product.id
+                                  ? Colors.blue.shade700
+                                  : Colors.white,
+                              width: 3,
+                            ),
+                            boxShadow: const [BoxShadow(blurRadius: 5)],
+                          ),
+                          clipBehavior: Clip.antiAlias,
+                          child: product.image.trim().isEmpty
+                              ? const Icon(
+                                  Icons.sell_outlined,
+                                  color: Colors.blue,
+                                )
+                              : persistentImage(
+                                  product.image,
+                                  key: ValueKey(
+                                    'map-product-image-${product.id}-${product.image}',
+                                  ),
+                                  fit: BoxFit.cover,
+                                  errorBuilder: (_, _, _) => const Icon(
+                                    Icons.image_not_supported_outlined,
+                                    color: Colors.blue,
+                                  ),
+                                ),
+                        ),
+                        const SizedBox(height: 2),
+                        Container(
+                          constraints: const BoxConstraints(maxWidth: 100),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 5,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: .92),
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: Text(
+                            product.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
                         ),
                       ],
                     ),
-                    child: Icon(
-                      _storeIcon(stores[i].type),
-                      color: Colors.white,
-                      size: 19,
-                    ),
                   ),
                 ),
-              ),
           ],
-        );
-      },
+        ),
+        const fmap.RichAttributionWidget(
+          attributions: [
+            fmap.TextSourceAttribution('OpenStreetMap contributors'),
+          ],
+        ),
+      ],
     );
   }
 
-  IconData _storeIcon(String type) {
-    if (type.contains('ยาน')) return Icons.directions_car_rounded;
-    if (type.contains('มือถือ')) return Icons.phone_iphone_rounded;
-    if (type.contains('บ้าน')) return Icons.home_rounded;
-    if (type.contains('แฟชั่น')) return Icons.checkroom_rounded;
-    return Icons.storefront_rounded;
+  void _selectStore(StoreViewModel store) {
+    setState(() {
+      _selected = store;
+      _selectedProduct = null;
+    });
+    if (store.latitude != null && store.longitude != null) {
+      _mapController.move(latlng.LatLng(store.latitude!, store.longitude!), 16);
+    }
   }
 
-  Widget _selectedStoreCard(MockStore store) => Material(
+  void _selectProduct(ProductViewModel product) {
+    setState(() {
+      _selectedProduct = product;
+      _selected = null;
+    });
+    _mapController.move(
+      latlng.LatLng(product.latitude!, product.longitude!),
+      16,
+    );
+  }
+
+  Future<void> _navigateToStore(StoreViewModel store) async {
+    final latitude = store.latitude;
+    final longitude = store.longitude;
+    if (latitude == null || longitude == null) {
+      if (mounted) showInfo(context, 'ร้านนี้ไม่มีข้อมูลตำแหน่ง');
+      return;
+    }
+    final destination = '$latitude,$longitude';
+    final uri = storeNavigationUri(latitude, longitude);
+    try {
+      if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+        throw StateError('maps_launch_failed');
+      }
+    } catch (error, stackTrace) {
+      debugPrint(
+        'Open navigation failed: $error destination=$destination\n$stackTrace',
+      );
+      if (mounted) showInfo(context, 'ไม่สามารถเปิดแอปแผนที่ได้');
+    }
+  }
+
+  Widget _selectedProductCard(ProductViewModel product) => Material(
+    color: Colors.white,
+    elevation: 5,
+    borderRadius: BorderRadius.circular(18),
+    child: InkWell(
+      borderRadius: BorderRadius.circular(18),
+      onTap: () => Navigator.pushNamed(
+        context,
+        SuikaiRoutes.productDetail,
+        arguments: product.id,
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(11),
+              child: persistentImage(
+                product.image,
+                width: 68,
+                height: 68,
+                fit: BoxFit.cover,
+                errorBuilder: (_, _, _) => const SizedBox(
+                  width: 68,
+                  height: 68,
+                  child: Icon(Icons.image_not_supported_outlined),
+                ),
+              ),
+            ),
+            const SizedBox(width: 11),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    product.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  Text(
+                    product.price,
+                    style: const TextStyle(
+                      color: AppTheme.orange,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  _statusChip(context, product.status),
+                ],
+              ),
+            ),
+            const Icon(Icons.chevron_right_rounded),
+          ],
+        ),
+      ),
+    ),
+  );
+
+  Widget _selectedStoreCard(StoreViewModel store) => Material(
     color: Colors.white,
     elevation: 5,
     borderRadius: BorderRadius.circular(18),
@@ -5605,43 +6444,52 @@ class _MapPageState extends State<MapPage> {
                 },
                 icon: const Icon(Icons.phone_outlined, color: AppTheme.orange),
               ),
-              IconButton(
-                onPressed: _requestLocation,
-                icon: const Icon(
-                  Icons.navigation_outlined,
-                  color: AppTheme.orange,
+            ],
+          ),
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton(
+                  onPressed: () => Navigator.pushNamed(
+                    context,
+                    SuikaiRoutes.storeDetail,
+                    arguments: store.id,
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppTheme.orange,
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size.fromHeight(48),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                  child: const LocalizedText(
+                    'ดูร้าน',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: store.latitude == null || store.longitude == null
+                      ? () => showInfo(context, 'ร้านนี้ไม่มีข้อมูลตำแหน่ง')
+                      : () => _navigateToStore(store),
+                  icon: const Icon(Icons.navigation_rounded),
+                  label: const LocalizedText('นำทาง'),
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size.fromHeight(48),
+                  ),
                 ),
               ),
             ],
-          ),
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton(
-              onPressed: () => Navigator.pushNamed(
-                context,
-                SuikaiRoutes.storeDetail,
-                arguments: store.id,
-              ),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppTheme.orange,
-                foregroundColor: Colors.white,
-                minimumSize: const Size.fromHeight(48),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10),
-                ),
-              ),
-              child: const LocalizedText(
-                'ดูรายละเอียดร้าน',
-                style: TextStyle(fontWeight: FontWeight.w800),
-              ),
-            ),
           ),
         ],
       ),
     ),
   );
 
-  String _distanceLabel(MockStore store) {
+  String _distanceLabel(StoreViewModel store) {
     final position = _currentPosition;
     if (position == null || store.latitude == null || store.longitude == null) {
       return store.distance;
@@ -5659,10 +6507,13 @@ class _MapPageState extends State<MapPage> {
   }
 
   Widget _filterSheet() {
-    final categories = <(String, IconData)>[
-      const ('all', Icons.grid_view_rounded),
-      for (final category in SuikaiService.categoryRecords('store'))
-        (category.id, _storeCategoryIcon(category.id)),
+    final categories = <(String, String, IconData)>[
+      const ('all', 'all', Icons.grid_view_rounded),
+      for (final category in [
+        ...SuikaiService.categoryRecords('store', activeOnly: true),
+        ...SuikaiService.categoryRecords('listing', activeOnly: true),
+      ])
+        (category.id, category.type, _categoryIcon(category.id)),
     ];
     const distances = ['10 เมตร', '25 เมตร', '50 เมตร', '100 เมตร'];
 
@@ -5717,7 +6568,11 @@ class _MapPageState extends State<MapPage> {
                       children: categories.map((item) {
                         final active = _category == item.$1;
                         return InkWell(
-                          onTap: () => setState(() => _category = item.$1),
+                          onTap: () => setState(() {
+                            _category = item.$1;
+                            _selected = null;
+                            _selectedProduct = null;
+                          }),
                           borderRadius: BorderRadius.circular(10),
                           child: Container(
                             decoration: BoxDecoration(
@@ -5734,7 +6589,7 @@ class _MapPageState extends State<MapPage> {
                             child: Column(
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
-                                Icon(item.$2, size: 20, color: AppTheme.orange),
+                                Icon(item.$3, size: 20, color: AppTheme.orange),
                                 const SizedBox(height: 5),
                                 Text(
                                   item.$1 == 'all'
@@ -5743,7 +6598,7 @@ class _MapPageState extends State<MapPage> {
                                         ).source('ทั้งหมด')
                                       : _categoryLabel(
                                           context,
-                                          'store',
+                                          item.$2,
                                           item.$1,
                                         ),
                                   textAlign: TextAlign.center,
@@ -5792,6 +6647,7 @@ class _MapPageState extends State<MapPage> {
                               _distance = '25 เมตร';
                               _filterApplied = false;
                               _selected = null;
+                              _selectedProduct = null;
                             }),
                             style: OutlinedButton.styleFrom(
                               foregroundColor: Colors.black87,
@@ -5806,6 +6662,7 @@ class _MapPageState extends State<MapPage> {
                             onPressed: () => setState(() {
                               _showFilter = false;
                               _selected = null;
+                              _selectedProduct = null;
                               _filterApplied = true;
                             }),
                             style: ElevatedButton.styleFrom(
@@ -5985,9 +6842,9 @@ class _ProfilePageState extends State<ProfilePage> {
   String? _selectedStoreId;
   UserProfile? _profile;
   final Map<String, ProductStatus> _statusEdits = {
-    for (final p in MockRepo.managedProducts) p.id: p.status,
+    for (final p in MarketplaceCache.managedProducts) p.id: p.status,
   };
-  List<MockStore> _myStores = [];
+  List<StoreViewModel> _myStores = [];
 
   @override
   void initState() {
@@ -6001,40 +6858,22 @@ class _ProfilePageState extends State<ProfilePage> {
     if (mounted) setState(() => _profile = profile);
   }
 
-  Future<void> _confirmLogout() async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const LocalizedText('ออกจากระบบ'),
-        content: const LocalizedText('ต้องการออกจากระบบใช่หรือไม่'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: const LocalizedText('ยกเลิก'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(dialogContext, true),
-            child: const LocalizedText('ออกจากระบบ'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true) return;
-    await SuikaiService.logout();
-    if (!mounted) return;
-    Navigator.pushNamedAndRemoveUntil(context, SuikaiRoutes.home, (_) => false);
-  }
-
   Future<void> _loadMyStores() async {
     try {
       final rows = await SuikaiService.fetchMyStores();
       final stores = rows
           .map(
-            (item) => MockStore(
+            (item) => StoreViewModel(
               id: item['id'].toString(),
               name: item['name']?.toString() ?? '',
               type: item['category']?.toString() ?? '',
               city: item['city']?.toString() ?? '',
+              cityId: item['city_id']?.toString(),
+              cityRecord: item['cities'] is Map
+                  ? CityRecord.fromJson(
+                      Map<String, dynamic>.from(item['cities'] as Map),
+                    )
+                  : null,
               distance: '',
               logo: item['logo_url']?.toString() ?? '',
               description: item['description']?.toString() ?? '',
@@ -6043,6 +6882,7 @@ class _ProfilePageState extends State<ProfilePage> {
               hours:
                   '${item['opening_time'] ?? ''}-${item['closing_time'] ?? ''}',
               approved: item['status'] == 'approved',
+              status: item['status']?.toString() ?? 'pending',
               ownerId: item['owner_id']?.toString(),
               coverUrl: item['cover_url']?.toString(),
               email: item['email']?.toString(),
@@ -6053,7 +6893,7 @@ class _ProfilePageState extends State<ProfilePage> {
         setState(() {
           _myStores = stores;
           _selectedStoreId ??= stores.firstOrNull?.id;
-          MockRepo.cacheStores(stores);
+          MarketplaceCache.cacheStores(stores);
         });
     } catch (_) {}
   }
@@ -6062,8 +6902,8 @@ class _ProfilePageState extends State<ProfilePage> {
   Widget build(BuildContext context) {
     final currentUserId = SuikaiService.currentUserId;
     final all = currentUserId == null
-        ? <MockProduct>[]
-        : MockRepo.products
+        ? <ProductViewModel>[]
+        : MarketplaceCache.products
               .where((product) => product.ownerId == currentUserId)
               .toList();
     final generalItems = all.where((p) => !p.isStoreProduct).toList();
@@ -6337,7 +7177,11 @@ class _ProfilePageState extends State<ProfilePage> {
                             const Text(' • '),
                             Flexible(
                               child: LocalizedText(
-                                store.approved ? 'อนุมัติแล้ว' : 'รอการอนุมัติ',
+                                store.effectiveStatus == 'approved'
+                                    ? 'อนุมัติแล้ว'
+                                    : store.effectiveStatus == 'rejected'
+                                    ? 'ไม่ผ่านการอนุมัติ'
+                                    : 'รอการอนุมัติ',
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                               ),
@@ -6484,7 +7328,7 @@ class _ProfilePageState extends State<ProfilePage> {
                                       ? 'out_of_stock'
                                       : value.name,
                                 );
-                                MockRepo.setStatus(item.id, value);
+                                MarketplaceCache.setStatus(item.id, value);
                                 if (mounted) {
                                   setState(() => _statusEdits[item.id] = value);
                                 }
@@ -6498,18 +7342,6 @@ class _ProfilePageState extends State<ProfilePage> {
                       ),
                     ),
                   ),
-                if (SuikaiService.isLoggedIn) ...[
-                  const SizedBox(height: 16),
-                  OutlinedButton.icon(
-                    onPressed: _confirmLogout,
-                    icon: const Icon(Icons.logout_rounded),
-                    label: const LocalizedText('ออกจากระบบ'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: const Color(0xFFB3261E),
-                      minimumSize: const Size.fromHeight(50),
-                    ),
-                  ),
-                ],
               ],
             ),
           ),
@@ -6689,9 +7521,20 @@ class _NotificationsPageState extends State<NotificationsPage> {
 
 class _SearchPageState extends State<SearchPage> {
   final _searchController = TextEditingController();
+  final _minimumPrice = TextEditingController();
+  final _maximumPrice = TextEditingController();
   String _category = 'all';
-  String _city = 'ทั้งหมด';
-  int _maxPrice = 100000000;
+  String _city = 'all';
+  String _currency = 'MMK';
+  FxSnapshot? _fx;
+
+  @override
+  void initState() {
+    super.initState();
+    FxService().latest().then((value) {
+      if (mounted) setState(() => _fx = value);
+    });
+  }
 
   @override
   void didChangeDependencies() {
@@ -6706,6 +7549,8 @@ class _SearchPageState extends State<SearchPage> {
   @override
   void dispose() {
     _searchController.dispose();
+    _minimumPrice.dispose();
+    _maximumPrice.dispose();
     super.dispose();
   }
 
@@ -6715,15 +7560,24 @@ class _SearchPageState extends State<SearchPage> {
       'all',
       ...SuikaiService.categoryRecords('listing').map((value) => value.id),
     ];
-    final cities = <String>{
-      'ทั้งหมด',
-      ...MockRepo.products.map((p) => p.city),
-    }.toList();
+    final cities = <String, String>{
+      'all': AppLocalizations.of(context).source('ทั้งหมด'),
+    };
+    for (final product in MarketplaceCache.products) {
+      final key = product.city.trim();
+      if (key.isNotEmpty) cities[key] = productCityLabel(context, product);
+    }
     final query = _searchController.text.toLowerCase().trim();
 
-    final results = MockRepo.feedProducts.where((product) {
-      final p =
-          int.tryParse(product.price.replaceAll(RegExp(r'[^0-9]'), '')) ?? 0;
+    final results = MarketplaceCache.feedProducts.where((product) {
+      final price = _fx == null
+          ? product.priceValue.toDouble()
+          : FxService().convert(
+              product.priceValue.toDouble(),
+              product.currencyCode,
+              _currency,
+              _fx!,
+            );
       final matchesQuery =
           query.isEmpty ||
           product.title.toLowerCase().contains(query) ||
@@ -6732,8 +7586,14 @@ class _SearchPageState extends State<SearchPage> {
           _category == 'all' ||
           SuikaiService.categoryIdForValue('listing', product.category) ==
               _category;
-      final matchesCity = _city == 'ทั้งหมด' || product.city == _city;
-      final matchesPrice = p <= _maxPrice;
+      final productCityKey = product.city.trim();
+      final matchesCity = _city == 'all' || productCityKey == _city;
+      final minimum = parsePriceValue(_minimumPrice.text);
+      final maximum = parsePriceValue(_maximumPrice.text);
+      final matchesPrice =
+          (minimum == null || maximum == null || minimum <= maximum) &&
+          (minimum == null || price >= minimum) &&
+          (maximum == null || price <= maximum);
       return matchesQuery && matchesCategory && matchesCity && matchesPrice;
     }).toList();
 
@@ -6780,34 +7640,12 @@ class _SearchPageState extends State<SearchPage> {
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-            child: Row(
-              children: [
-                const Flexible(
-                  child: LocalizedText(
-                    'ราคาไม่เกิน',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                Expanded(
-                  child: Slider(
-                    value: _maxPrice.toDouble(),
-                    min: 1000,
-                    max: 100000000,
-                    divisions: 50,
-                    label: _maxPrice.toString(),
-                    onChanged: (value) =>
-                        setState(() => _maxPrice = value.toInt()),
-                  ),
-                ),
-                Flexible(
-                  child: LocalizedText(
-                    _maxPrice >= 100000000 ? '100 ล้าน+' : '฿$_maxPrice',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-              ],
+            child: _NumericPriceRange(
+              minimum: _minimumPrice,
+              maximum: _maximumPrice,
+              currency: _currency,
+              onCurrencyChanged: (value) => setState(() => _currency = value),
+              onChanged: () => setState(() {}),
             ),
           ),
           Expanded(
@@ -6861,12 +7699,25 @@ class _SearchPageState extends State<SearchPage> {
             .map(
               (category) => DropdownMenuItem(
                 value: category,
-                child: Text(
-                  category == 'all'
-                      ? AppLocalizations.of(context).source('ทั้งหมด')
-                      : _categoryLabel(context, 'listing', category),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                child: Row(
+                  children: [
+                    Icon(
+                      category == 'all'
+                          ? Icons.grid_view_rounded
+                          : _categoryIcon(category),
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        category == 'all'
+                            ? AppLocalizations.of(context).source('ทั้งหมด')
+                            : _categoryLabel(context, 'listing', category),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
                 ),
               ),
             )
@@ -6874,26 +7725,27 @@ class _SearchPageState extends State<SearchPage> {
         onChanged: (value) => setState(() => _category = value ?? _category),
       );
 
-  Widget _cityField(List<String> cities) => DropdownButtonFormField<String>(
-    initialValue: _city,
-    isExpanded: true,
-    decoration: InputDecoration(
-      labelText: AppLocalizations.of(context).source('เมือง'),
-    ),
-    items: cities
-        .map(
-          (city) => DropdownMenuItem(
-            value: city,
-            child: LocalizedText(
-              city,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-        )
-        .toList(),
-    onChanged: (value) => setState(() => _city = value ?? _city),
-  );
+  Widget _cityField(Map<String, String> cities) =>
+      DropdownButtonFormField<String>(
+        initialValue: _city,
+        isExpanded: true,
+        decoration: InputDecoration(
+          labelText: AppLocalizations.of(context).source('เมือง'),
+        ),
+        items: cities.entries
+            .map(
+              (city) => DropdownMenuItem(
+                value: city.key,
+                child: Text(
+                  city.value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            )
+            .toList(),
+        onChanged: (value) => setState(() => _city = value ?? _city),
+      );
 }
 
 class ProductDetailPage extends StatefulWidget {
@@ -6907,36 +7759,38 @@ class ProductDetailPage extends StatefulWidget {
 
 class _ProductDetailPageState extends State<ProductDetailPage> {
   int _imageIndex = 0;
-  bool _sharing = false;
 
   @override
   void initState() {
     super.initState();
     InteractionStore.trackView(widget.productId);
+    MarketplaceCache.productsRevision.addListener(_refreshWhenProductLoads);
   }
 
-  Future<void> _shareProduct(MockProduct product) async {
-    final source = primaryProductImage(product);
-    if (source == null) {
-      showInfo(context, 'ไม่มีรูปสำหรับแชร์');
-      return;
-    }
-    setState(() => _sharing = true);
-    try {
-      final opened = await SuikaiService.shareProductImage(
-        imageSource: source,
-        title: product.title,
-        price: product.price,
-      );
-      if (!opened && mounted) showInfo(context, 'ไม่มีรูปสำหรับแชร์');
-    } catch (_) {
-      if (mounted) showInfo(context, 'เปิดการแชร์ไม่สำเร็จ');
-    } finally {
-      if (mounted) setState(() => _sharing = false);
+  @override
+  void dispose() {
+    MarketplaceCache.productsRevision.removeListener(_refreshWhenProductLoads);
+    super.dispose();
+  }
+
+  void _refreshWhenProductLoads() {
+    if (mounted && MarketplaceCache.productById(widget.productId) != null) {
+      setState(() {});
     }
   }
 
-  Future<void> _edit(MockProduct product) async {
+  Future<void> _copyProductLink(ProductViewModel product) async {
+    final link = Uri.base
+        .replace(
+          path: Uri.base.path.isEmpty ? '/' : Uri.base.path,
+          queryParameters: {'product': product.id},
+        )
+        .toString();
+    await Clipboard.setData(ClipboardData(text: link));
+    if (mounted) showInfo(context, 'คัดลอกลิงก์สินค้าแล้ว');
+  }
+
+  Future<void> _edit(ProductViewModel product) async {
     final title = TextEditingController(text: product.title);
     final price = TextEditingController(text: product.priceValue.toString());
     final description = TextEditingController(text: product.description);
@@ -7073,12 +7927,18 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
                   showInfo(context, 'กรุณากรอกชื่อและราคาให้ถูกต้อง');
                   return;
                 }
+                final cityName = normalizeText(city.text);
+                if (cityName.isEmpty) {
+                  showInfo(context, 'กรุณาเลือกเมือง');
+                  return;
+                }
                 try {
                   await SuikaiService.updateListing(
                     listingId: product.id,
                     title: title.text.trim(),
                     description: description.text.trim(),
-                    city: city.text.trim(),
+                    city: cityName,
+                    cityId: product.cityId,
                     phone: normalizePhone(phone.text),
                     viber: normalizePhone(viber.text),
                     price: amount,
@@ -7111,7 +7971,7 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
 
   @override
   Widget build(BuildContext context) {
-    final product = MockRepo.productById(widget.productId);
+    final product = MarketplaceCache.productById(widget.productId);
     if (product == null) {
       return const _MissingPage(title: 'ไม่พบสินค้า');
     }
@@ -7121,15 +7981,8 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
         actions: [
           IconButton(
             tooltip: AppLocalizations.of(context).source('แชร์สินค้า'),
-            onPressed: !_sharing && primaryProductImage(product) != null
-                ? () => _shareProduct(product)
-                : null,
-            icon: _sharing
-                ? const SizedBox.square(
-                    dimension: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.share_outlined),
+            onPressed: () => _copyProductLink(product),
+            icon: const Icon(Icons.link_rounded),
           ),
           if (product.ownerId != null &&
               product.ownerId == SuikaiService.currentUserId) ...[
@@ -7150,7 +8003,7 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
               tooltip: AppLocalizations.of(context).source('ลบประกาศ'),
               onPressed: () async {
                 await SuikaiService.deleteListing(product.id);
-                MockRepo.removeProduct(product.id);
+                MarketplaceCache.removeProduct(product.id);
                 if (context.mounted) Navigator.pop(context);
               },
               icon: const Icon(Icons.delete_outline_rounded),
@@ -7168,13 +8021,27 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
                 PageView.builder(
                   itemCount: product.imageUrls.length,
                   onPageChanged: (index) => setState(() => _imageIndex = index),
-                  itemBuilder: (context, index) => ColoredBox(
-                    color: const Color(0xFFF5F5F5),
-                    child: persistentImage(
-                      product.imageUrls[index],
-                      fit: BoxFit.contain,
-                      errorBuilder: (_, _, _) => const Center(
-                        child: Icon(Icons.broken_image_outlined),
+                  itemBuilder: (context, index) => GestureDetector(
+                    key: ValueKey('product-image-${product.imageUrls[index]}'),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => _FullscreenImageViewer(
+                          images: product.imageUrls,
+                          initialIndex: index,
+                        ),
+                      ),
+                    ),
+                    child: ColoredBox(
+                      color: const Color(0xFFF5F5F5),
+                      child: persistentImage(
+                        product.imageUrls[index],
+                        key: ValueKey(
+                          'detail-image-${product.imageUrls[index]}',
+                        ),
+                        fit: BoxFit.contain,
+                        errorBuilder: (_, _, _) => const Center(
+                          child: Icon(Icons.broken_image_outlined),
+                        ),
                       ),
                     ),
                   ),
@@ -7233,7 +8100,24 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
           const SizedBox(height: 8),
           LocalizedText(product.description),
           const SizedBox(height: 10),
-          LocalizedText('เมือง: ${product.city}'),
+          Builder(
+            builder: (context) {
+              final cityName = productCityLabel(context, product);
+              return Row(
+                children: [
+                  const LocalizedText('เมือง'),
+                  const Text(': '),
+                  Expanded(
+                    child: Text(
+                      cityName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
           const SizedBox(height: 4),
           LocalizedText(
             'Like ${product.likeCount} • View ${product.viewCount}',
@@ -7290,6 +8174,115 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
       ),
     );
   }
+}
+
+class _FullscreenImageViewer extends StatefulWidget {
+  final List<String> images;
+  final int initialIndex;
+  const _FullscreenImageViewer({
+    required this.images,
+    required this.initialIndex,
+  });
+
+  @override
+  State<_FullscreenImageViewer> createState() => _FullscreenImageViewerState();
+}
+
+class _FullscreenImageViewerState extends State<_FullscreenImageViewer> {
+  late final PageController _controller;
+  late int _index;
+
+  @override
+  void initState() {
+    super.initState();
+    _index = widget.initialIndex;
+    _controller = PageController(initialPage: _index);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: Colors.black,
+    body: SafeArea(
+      child: Stack(
+        children: [
+          PageView.builder(
+            controller: _controller,
+            itemCount: widget.images.length,
+            onPageChanged: (value) => setState(() => _index = value),
+            itemBuilder: (_, index) => _ZoomableProductImage(
+              key: ValueKey(widget.images[index]),
+              source: widget.images[index],
+            ),
+          ),
+          Positioned(
+            left: 8,
+            top: 8,
+            child: IconButton.filledTonal(
+              key: const ValueKey('close-fullscreen-image'),
+              onPressed: () => Navigator.pop(context),
+              icon: const Icon(Icons.close_rounded),
+            ),
+          ),
+          Positioned(
+            right: 16,
+            top: 18,
+            child: Text(
+              '${_index + 1}/${widget.images.length}',
+              style: const TextStyle(color: Colors.white),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _ZoomableProductImage extends StatefulWidget {
+  final String source;
+  const _ZoomableProductImage({super.key, required this.source});
+
+  @override
+  State<_ZoomableProductImage> createState() => _ZoomableProductImageState();
+}
+
+class _ZoomableProductImageState extends State<_ZoomableProductImage> {
+  final TransformationController _transformation = TransformationController();
+
+  @override
+  void dispose() {
+    _transformation.dispose();
+    super.dispose();
+  }
+
+  void _doubleTap() {
+    _transformation.value = _transformation.value.isIdentity()
+        ? (Matrix4.identity()..scale(2.5))
+        : Matrix4.identity();
+  }
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+    onDoubleTap: _doubleTap,
+    child: InteractiveViewer(
+      transformationController: _transformation,
+      minScale: 1,
+      maxScale: 5,
+      child: Center(
+        child: persistentImage(
+          widget.source,
+          fit: BoxFit.contain,
+          errorBuilder: (_, _, _) =>
+              const Icon(Icons.broken_image_outlined, color: Colors.white),
+        ),
+      ),
+    ),
+  );
 }
 
 class ReportPage extends StatefulWidget {
@@ -7417,19 +8410,19 @@ class _OpenShopPageState extends State<OpenShopPage> {
   final _phone = TextEditingController();
   final _viber = TextEditingController();
   final _email = TextEditingController();
-  final _locationDetail = TextEditingController();
+  final _city = TextEditingController();
   String _shopType = '';
   String _hours = 'เปิดทุกวัน';
   bool _accepted = false;
   bool _submitting = false;
   SelectedImage? _logoImage;
   SelectedImage? _coverImage;
-  Position? _storePosition;
+  latlng.LatLng? _storePosition;
 
   static const _steps = [
     'ข้อมูลร้านค้า',
     'ข้อมูลติดต่อ',
-    'ที่อยู่ร้านค้า',
+    'ตำแหน่งร้านค้า',
     'ยืนยันการเปิดร้าน',
   ];
 
@@ -7446,14 +8439,7 @@ class _OpenShopPageState extends State<OpenShopPage> {
 
   @override
   void dispose() {
-    for (final c in [
-      _name,
-      _description,
-      _phone,
-      _viber,
-      _email,
-      _locationDetail,
-    ]) {
+    for (final c in [_name, _description, _phone, _viber, _email, _city]) {
       c.dispose();
     }
     super.dispose();
@@ -7490,7 +8476,12 @@ class _OpenShopPageState extends State<OpenShopPage> {
       }
     }
     if (_step == 2) {
-      if (!_formKey.currentState!.validate()) {
+      if (normalizeText(_city.text).isEmpty) {
+        showInfo(context, 'กรุณากรอกชื่อเมือง');
+        return;
+      }
+      if (_storePosition == null) {
+        showInfo(context, 'กรุณาเลือกตำแหน่งร้านค้าบนแผนที่');
         return;
       }
     }
@@ -7503,7 +8494,14 @@ class _OpenShopPageState extends State<OpenShopPage> {
     try {
       final position = await SuikaiService.getCurrentPosition();
       if (!mounted) return;
-      setState(() => _storePosition = position);
+      if (position != null) {
+        setState(
+          () => _storePosition = latlng.LatLng(
+            position.latitude,
+            position.longitude,
+          ),
+        );
+      }
       showInfo(
         context,
         position == null
@@ -7554,7 +8552,7 @@ class _OpenShopPageState extends State<OpenShopPage> {
         centerTitle: true,
         actions: [
           TextButton(
-            onPressed: () => showInfo(context, 'บันทึกฉบับร่างแล้ว (mock)'),
+            onPressed: () => showInfo(context, 'บันทึกฉบับร่างแล้ว'),
             child: const LocalizedText(
               'บันทึกฉบับร่าง',
               style: TextStyle(
@@ -7852,86 +8850,35 @@ class _OpenShopPageState extends State<OpenShopPage> {
     children: [
       _card([
         _sectionTitle(
-          'ที่อยู่ร้านค้า',
-          subtitle:
-              'ระบุที่อยู่ของร้านค้า เพื่อให้ลูกค้าค้นหาร้านค้าของคุณได้ง่ายขึ้น',
+          'ตำแหน่งร้านค้า',
+          subtitle: 'เลือกพิกัดด้วย GPS หรือแตะปักหมุดบนแผนที่',
         ),
+        LocationPickerMap(
+          value: _storePosition,
+          onChanged: (point) => setState(() => _storePosition = point),
+          currentLocation: () async {
+            final position = await SuikaiService.getCurrentPosition();
+            return position == null
+                ? null
+                : latlng.LatLng(position.latitude, position.longitude);
+          },
+        ),
+        const SizedBox(height: 18),
         const LocalizedText(
-          'ที่อยู่ร้านค้า *',
+          'เมือง *',
           style: TextStyle(fontWeight: FontWeight.w700),
         ),
-        const SizedBox(height: 10),
-        Container(
-          padding: const EdgeInsets.all(15),
-          decoration: BoxDecoration(
-            border: Border.all(color: const Color(0xFFE4E4E4)),
-            borderRadius: BorderRadius.circular(12),
+        const SizedBox(height: 8),
+        TextFormField(
+          controller: _city,
+          decoration: InputDecoration(
+            hintText: AppLocalizations.of(context).source('กรอกชื่อเมือง'),
           ),
-          child: const Row(
-            children: [
-              Icon(Icons.location_on_outlined, color: AppTheme.orange),
-              SizedBox(width: 10),
-              Expanded(
-                child: LocalizedText(
-                  'บ้านน้ำจ๋าง, เมืองน้ำจ๋าง, รัฐฉาน\nใกล้ ตลาดสดน้ำจ๋าง',
-                ),
-              ),
-              LocalizedText(
-                'แก้ไข',
-                style: TextStyle(
-                  color: AppTheme.orange,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ],
-          ),
+          validator: (value) => normalizeText(value).isEmpty
+              ? AppLocalizations.of(context).source('กรุณากรอกชื่อเมือง')
+              : null,
         ),
         const SizedBox(height: 18),
-        Container(
-          height: 300,
-          decoration: BoxDecoration(
-            color: const Color(0xFFF2F4F5),
-            borderRadius: BorderRadius.circular(14),
-          ),
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              const Positioned.fill(
-                child: CustomPaint(painter: _MiniMapPainter()),
-              ),
-              Container(
-                width: 62,
-                height: 62,
-                decoration: BoxDecoration(
-                  color: AppTheme.orange.withValues(alpha: .14),
-                  shape: BoxShape.circle,
-                ),
-                child: const Icon(
-                  Icons.location_on,
-                  color: AppTheme.orange,
-                  size: 48,
-                ),
-              ),
-              Positioned(
-                right: 14,
-                bottom: 14,
-                child: FloatingActionButton.small(
-                  heroTag: 'shopGps',
-                  backgroundColor: Colors.white,
-                  onPressed: _captureStoreLocation,
-                  child: const Icon(Icons.my_location, color: Colors.black),
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 18),
-        _field(
-          'รายละเอียดเพิ่มเติม',
-          _locationDetail,
-          hint: 'เช่น ใกล้ปั๊มน้ำมัน, ติดถนนใหญ่, อยู่ในหมู่บ้าน...',
-          maxLines: 4,
-        ),
         const _InfoBox(
           icon: Icons.info_outline_rounded,
           text:
@@ -7982,10 +8929,14 @@ class _OpenShopPageState extends State<OpenShopPage> {
         const SizedBox(height: 14),
         _SummaryBox(
           icon: Icons.location_on_outlined,
-          title: 'ที่อยู่ร้านค้า',
-          lines: const [
-            'บ้านน้ำจ๋าง, เมืองน้ำจ๋าง, รัฐฉาน',
-            'ใกล้ ตลาดสดน้ำจ๋าง',
+          title: 'ตำแหน่งร้านค้า',
+          lines: [
+            normalizeText(_city.text).isEmpty
+                ? AppLocalizations.of(context).source('ไม่ระบุเมือง')
+                : normalizeText(_city.text),
+            _storePosition == null
+                ? 'ยังไม่ได้เลือกพิกัด'
+                : '${_storePosition!.latitude.toStringAsFixed(6)}, ${_storePosition!.longitude.toStringAsFixed(6)}',
           ],
           onEdit: () => setState(() => _step = 2),
         ),
@@ -8029,13 +8980,19 @@ class _OpenShopPageState extends State<OpenShopPage> {
                     showInfo(context, 'กรุณาเพิ่มรูปโลโก้ร้านค้า');
                     return;
                   }
+                  final cityName = normalizeText(_city.text);
+                  if (cityName.isEmpty) {
+                    showInfo(context, 'กรุณากรอกชื่อเมือง');
+                    return;
+                  }
                   setState(() => _submitting = true);
                   try {
                     await SuikaiService.createStore(
                       name: normalizeText(_name.text),
                       description: normalizeText(_description.text),
                       category: _shopType,
-                      city: 'เมืองนาง',
+                      city: cityName,
+                      cityId: null,
                       phone: phone,
                       viber: normalizePhone(_viber.text),
                       hours: _hours == 'เปิดทุกวัน'
@@ -8417,7 +9374,7 @@ class _MiniMapPainter extends CustomPainter {
 }
 
 class ProductCard extends StatelessWidget {
-  final MockProduct product;
+  final ProductViewModel product;
 
   const ProductCard({super.key, required this.product});
 
@@ -8546,8 +9503,8 @@ class ProductCard extends StatelessWidget {
                         ),
                         const SizedBox(width: 3),
                         Expanded(
-                          child: LocalizedText(
-                            product.location,
+                          child: Text(
+                            productCityLabel(context, product),
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
                               fontSize: 9.5,

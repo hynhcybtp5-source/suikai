@@ -2,13 +2,18 @@ import 'models.dart';
 
 abstract interface class AuthRepository {
   String? get currentUserId;
+  Future<void> restore();
   Future<UserProfile> register({
     required String name,
     required String phone,
     required String email,
     required String password,
+    required String city,
   });
   Future<UserProfile> login(String email, String password);
+  Future<void> loginWithTelegram();
+  Future<void> completeTelegramWebLogin();
+  Future<void> syncCurrentProfile();
   Future<void> logout();
 }
 
@@ -34,6 +39,7 @@ abstract interface class StoreRepository {
 abstract interface class StoreRequestRepository {
   Future<void> submitEdit(StoreEditRequestRecord value);
   Future<void> submitPromotion(PromotionRequestRecord value);
+  Future<void> resubmitRejected(String storeId);
 }
 
 abstract interface class CategoryRepository {
@@ -63,6 +69,22 @@ abstract interface class NotificationRepository {
   Future<int> unreadCount();
 }
 
+abstract interface class ShortVideoRepository {
+  Future<List<ShortVideoRecord>> active();
+  Future<List<ShortVideoRecord>> all();
+  Future<void> create(ShortVideoRecord value);
+  Future<void> update(ShortVideoRecord value);
+  Future<void> delete(String id);
+}
+
+abstract interface class AdvertisementRepository {
+  Future<List<AdvertisementRecord>> active();
+  Future<List<AdvertisementRecord>> all();
+  Future<void> create(AdvertisementRecord value);
+  Future<void> update(AdvertisementRecord value);
+  Future<void> delete(String id);
+}
+
 abstract interface class StorageService {
   Future<String> persistImage(
     String sourcePath,
@@ -78,10 +100,13 @@ abstract interface class AdminRepository {
   Future<bool> login(String email, String password);
   Future<void> logout();
   Future<Map<String, int>> summary();
-  Future<List<Map<String, dynamic>>> users();
-  Future<List<Map<String, dynamic>>> listings();
-  Future<List<Map<String, dynamic>>> stores();
-  Future<List<Map<String, dynamic>>> reports();
+  Future<List<Map<String, dynamic>>> users({int page = 0, int pageSize = 50});
+  Future<List<Map<String, dynamic>>> listings({
+    int page = 0,
+    int pageSize = 50,
+  });
+  Future<List<Map<String, dynamic>>> stores({int page = 0, int pageSize = 50});
+  Future<List<Map<String, dynamic>>> reports({int page = 0, int pageSize = 50});
   Future<void> setUserStatus(String id, String status);
   Future<void> deleteUser(String id);
   Future<void> setListingStatus(String id, String status);
@@ -91,6 +116,8 @@ abstract interface class AdminRepository {
   Future<void> reviewReport(String id, bool reviewed);
   Future<List<Map<String, dynamic>>> storeEditRequests();
   Future<List<Map<String, dynamic>>> promotionRequests();
+  Future<List<Map<String, dynamic>>> adminNotifications();
+  Future<void> markAdminNotificationRead(String id);
   Future<void> reviewStoreEditRequest(String id, bool approved);
   Future<void> reviewPromotionRequest(String id, bool approved);
   Future<void> setStorePromoted(String id, bool promoted);

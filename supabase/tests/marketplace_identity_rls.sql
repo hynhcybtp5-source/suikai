@@ -10,12 +10,39 @@ values
     '00000000-0000-4000-8000-000000000103',
     'admin@staging.test',
     '{"name":"Staging Admin","role":"admin","status":"suspended"}'::jsonb
+  ),
+  (
+    '00000000-0000-4000-8000-000000000104',
+    'telegram@staging.test',
+    '{"sub":"777777","name":"Telegram User","role":"admin"}'::jsonb
   );
+
+update auth.users
+set identities = jsonb_build_array(
+  jsonb_build_object(
+    'provider',
+    'custom:telegram',
+    'identity_data',
+    jsonb_build_object(
+      'iss',
+      'https://oauth.telegram.org',
+      'sub',
+      '777777',
+      'given_name',
+      'Telegram',
+      'family_name',
+      'User',
+      'preferred_username',
+      'telegram_user'
+    )
+  )
+)
+where id = '00000000-0000-4000-8000-000000000104';
 
 do $$
 begin
   if (select count(*) from public.profiles
-      where id::text like '00000000-0000-4000-8000-00000000010%') <> 3 then
+      where id::text like '00000000-0000-4000-8000-00000000010%') <> 4 then
     raise exception 'Auth trigger did not create all profiles';
   end if;
 
@@ -24,12 +51,53 @@ begin
     raise exception 'Auth metadata changed protected profile status';
   end if;
 
+  if (select telegram_id from public.profiles
+      where id = '00000000-0000-4000-8000-000000000104') <> '777777' then
+    raise exception 'Telegram ID was not copied from Auth identity data';
+  end if;
+
   if exists (
     select 1 from public.admin_roles
     where user_id = '00000000-0000-4000-8000-000000000103'
   ) then
     raise exception 'Auth metadata created an admin role';
   end if;
+
+  if exists (
+    select 1 from public.admin_roles
+    where user_id = '00000000-0000-4000-8000-000000000104'
+  ) then
+    raise exception 'Telegram metadata created an admin role';
+  end if;
+end;
+$$;
+
+do $$
+begin
+  begin
+    insert into auth.users (id, email, raw_user_meta_data, identities)
+    values (
+      '00000000-0000-4000-8000-000000000105',
+      'telegram-duplicate@staging.test',
+      '{"sub":"777777"}'::jsonb,
+      jsonb_build_array(
+        jsonb_build_object(
+          'provider',
+          'custom:telegram',
+          'identity_data',
+          jsonb_build_object(
+            'iss',
+            'https://oauth.telegram.org',
+            'sub',
+            '777777'
+          )
+        )
+      )
+    );
+    raise exception 'Duplicate Telegram ID was allowed';
+  exception when unique_violation then
+    null;
+  end;
 end;
 $$;
 
@@ -152,7 +220,7 @@ begin
     raise exception 'Active admin check failed';
   end if;
 
-  if (select count(*) from public.profiles) <> 3 then
+  if (select count(*) from public.profiles) <> 4 then
     raise exception 'Admin cannot read profiles';
   end if;
 

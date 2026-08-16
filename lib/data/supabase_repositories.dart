@@ -1,7 +1,13 @@
+import 'dart:convert';
+import 'dart:math';
+
+import 'package:crypto/crypto.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'models.dart';
 import 'repositories.dart';
@@ -19,7 +25,13 @@ class SupabaseBackend {
 
   static Future<void> initialize() async {
     if (!enabled) return;
-    await Supabase.initialize(url: url, publishableKey: clientKey);
+    await Supabase.initialize(
+      url: url,
+      publishableKey: clientKey,
+      authOptions: const FlutterAuthClientOptions(
+        authFlowType: AuthFlowType.pkce,
+      ),
+    );
   }
 
   static SupabaseClient get client => Supabase.instance.client;
@@ -27,7 +39,6 @@ class SupabaseBackend {
 
 Map<String, dynamic> _json(dynamic value) =>
     Map<String, dynamic>.from(value as Map);
-
 String _mediaUrl(SupabaseClient client, Map<String, dynamic> media) => client
     .storage
     .from('${media['bucket']}')
@@ -80,13 +91,27 @@ Future<void> _deleteMediaIfOrphan(
 }
 
 class SupabaseAuthRepository implements AuthRepository {
+  static const _telegramAuthorizationUrl = 'https://oauth.telegram.org/auth';
+  static const _telegramCallbackUri =
+      'https://zzfxxpmsggobimixffjn.supabase.co/functions/v1/telegram-callback';
+  static const _telegramClientId = String.fromEnvironment('TELEGRAM_CLIENT_ID');
+  static const _telegramStatePreference = 'telegram_oauth_state';
+  static const _telegramVerifierPreference = 'telegram_oauth_code_verifier';
+
   final SupabaseClient client;
   SupabaseAuthRepository(this.client);
 
   @override
   String? get currentUserId => client.auth.currentUser?.id;
 
-  Future<void> restore() async {}
+  Future<void> restore() async {
+    try {
+      await client.auth.getSession();
+    } on AuthException catch (error, stackTrace) {
+      debugPrint('Supabase auth restore failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    }
+  }
 
   @override
   Future<UserProfile> register({
@@ -94,19 +119,22 @@ class SupabaseAuthRepository implements AuthRepository {
     required String phone,
     required String email,
     required String password,
+    required String city,
   }) async {
     final response = await client.auth.signUp(
       email: email.trim().toLowerCase(),
       password: password,
-      data: {'name': name.trim(), 'phone': phone.trim()},
+      data: {'name': name.trim(), 'phone': phone.trim(), 'city': city.trim()},
     );
     final user = response.user;
     if (user == null) throw StateError('signup_failed');
+    await syncCurrentProfile();
     return UserProfile(
       id: user.id,
       name: name.trim(),
       phone: phone.trim(),
       email: user.email ?? email.trim().toLowerCase(),
+      city: city.trim(),
       createdAt: DateTime.tryParse(user.createdAt) ?? DateTime.now(),
     );
   }
@@ -119,6 +147,7 @@ class SupabaseAuthRepository implements AuthRepository {
     );
     final user = response.user;
     if (user == null) throw StateError('invalid_credentials');
+    await syncCurrentProfile();
     final row = await client
         .from('profiles')
         .select()
@@ -132,7 +161,126 @@ class SupabaseAuthRepository implements AuthRepository {
   }
 
   @override
+  Future<void> loginWithTelegram() async {
+    if (_telegramClientId.isEmpty) {
+      throw StateError('telegram_client_id_not_configured');
+    }
+
+    final preferences = await SharedPreferences.getInstance();
+    final state = '${kIsWeb ? 'web' : 'mobile'}.${_randomUrlSafeValue(32)}';
+    final verifier = _randomUrlSafeValue(64);
+    final challenge = base64Url
+        .encode(sha256.convert(utf8.encode(verifier)).bytes)
+        .replaceAll('=', '');
+
+    await preferences.setString(_telegramStatePreference, state);
+    await preferences.setString(_telegramVerifierPreference, verifier);
+
+    final authorizationUri = Uri.parse(_telegramAuthorizationUrl).replace(
+      queryParameters: {
+        'response_type': 'code',
+        'client_id': _telegramClientId,
+        'redirect_uri': _telegramCallbackUri,
+        'scope': 'openid',
+        'state': state,
+        'code_challenge': challenge,
+        'code_challenge_method': 'S256',
+      },
+    );
+
+    final launched = await launchUrl(
+      authorizationUri,
+      mode: LaunchMode.externalApplication,
+      webOnlyWindowName: '_self',
+    );
+    if (!launched) throw StateError('telegram_authorization_not_opened');
+  }
+
+  @override
+  Future<void> completeTelegramWebLogin() async {
+    if (!kIsWeb) return;
+    await completeTelegramLogin(Uri.base);
+  }
+
+  Future<void> completeTelegramLogin(Uri callbackUri) async {
+    final code = callbackUri.queryParameters['code'];
+    final callbackError = callbackUri.queryParameters['error'];
+    if ((code == null || code.isEmpty) &&
+        (callbackError == null || callbackError.isEmpty)) {
+      return;
+    }
+
+    final preferences = await SharedPreferences.getInstance();
+    final receivedState = callbackUri.queryParameters['state'];
+    final expectedState = preferences.getString(_telegramStatePreference);
+    final verifier = preferences.getString(_telegramVerifierPreference);
+
+    await preferences.remove(_telegramStatePreference);
+    await preferences.remove(_telegramVerifierPreference);
+
+    if (expectedState == null ||
+        verifier == null ||
+        receivedState == null ||
+        !_constantTimeEquals(expectedState, receivedState)) {
+      throw StateError('telegram_oauth_state_mismatch');
+    }
+    if (callbackError != null && callbackError.isNotEmpty) {
+      throw StateError(
+        callbackUri.queryParameters['error_description'] ?? callbackError,
+      );
+    }
+    if (code == null || code.isEmpty) {
+      throw StateError('telegram_authorization_code_missing');
+    }
+
+    final response = await client.functions.invoke(
+      'telegram-auth',
+      body: {
+        'code': code,
+        'code_verifier': verifier,
+        'redirect_uri': _telegramCallbackUri,
+      },
+    );
+    final payload = _json(response.data);
+    final tokenHash = payload['token_hash']?.toString();
+    if (tokenHash == null || tokenHash.isEmpty) {
+      throw StateError('telegram_token_hash_missing');
+    }
+
+    await client.auth.verifyOTP(type: OtpType.email, tokenHash: tokenHash);
+    await syncCurrentProfile();
+  }
+
+  @override
+  Future<void> syncCurrentProfile() async {
+    if (currentUserId == null) return;
+    try {
+      await client.rpc('sync_current_profile_from_auth');
+    } on PostgrestException catch (error) {
+      // Remote production has the standard auth-user profile trigger but not
+      // the optional Telegram profile-sync RPC migration. The profile was
+      // already created when Auth generated the magic link, so retain login.
+      if (error.code != 'PGRST202' && error.code != '42883') rethrow;
+    }
+  }
+
+  @override
   Future<void> logout() => client.auth.signOut();
+}
+
+String _randomUrlSafeValue(int byteCount) {
+  final random = Random.secure();
+  final bytes = List<int>.generate(byteCount, (_) => random.nextInt(256));
+  return base64Url.encode(bytes).replaceAll('=', '');
+}
+
+bool _constantTimeEquals(String left, String right) {
+  if (left.length != right.length) return false;
+  var difference = 0;
+  for (var index = 0; index < left.length; index++) {
+    difference |= left.codeUnitAt(index) ^ right.codeUnitAt(index);
+  }
+  return difference == 0;
 }
 
 UserProfile _profileFromRow(Map<String, dynamic> row, {User? user}) =>
@@ -142,6 +290,8 @@ UserProfile _profileFromRow(Map<String, dynamic> row, {User? user}) =>
       phone: '${row['phone'] ?? ''}',
       email: '${row['email'] ?? user?.email ?? ''}',
       avatar: '${user?.userMetadata?['avatar_url'] ?? ''}',
+      city: '${row['city'] ?? ''}',
+      cityId: row['city_id']?.toString(),
       createdAt: DateTime.tryParse('${row['created_at']}') ?? DateTime.now(),
     );
 
@@ -175,6 +325,8 @@ class SupabaseProfileRepository implements ProfileRepository {
       phone: profile.phone,
       email: profile.email,
       avatar: '${data['avatar']}',
+      city: profile.city,
+      cityId: profile.cityId,
       createdAt: profile.createdAt,
     );
   }
@@ -196,6 +348,8 @@ class SupabaseProfileRepository implements ProfileRepository {
           'phone': profile.phone,
           'email': profile.email,
           'avatar_media_id': newMediaId,
+          'city_id': profile.cityId,
+          'city': profile.city.trim(),
         })
         .eq('id', profile.id);
     if (profile.avatar.isNotEmpty) {
@@ -234,6 +388,7 @@ class SupabaseCategoryRepository implements CategoryRepository {
     'name_shn': value.nameShn,
     'name_en': value.nameEn,
     'name_my': value.nameMy,
+    'icon_key': value.iconKey,
     'is_active': value.isActive,
     'sort_order': value.sortOrder,
   };
@@ -268,9 +423,39 @@ class SupabaseCategoryRepository implements CategoryRepository {
 
 class SupabaseListingRepository implements ListingRepository {
   final SupabaseClient client;
+  bool _canResolveCityCoordinates = true;
   SupabaseListingRepository(this.client);
 
   Future<ListingRecord> _record(Map<String, dynamic> row) async {
+    if (_canResolveCityCoordinates &&
+        row['cities'] == null &&
+        row['city_id'] == null &&
+        row['latitude'] != null &&
+        row['longitude'] != null) {
+      try {
+        final resolved = await client.rpc(
+          'resolve_city_for_coordinates',
+          params: {
+            'p_latitude': row['latitude'],
+            'p_longitude': row['longitude'],
+          },
+        );
+        if (resolved is Map && resolved.isNotEmpty) {
+          row = {
+            ...row,
+            'city_id': resolved['id'],
+            'cities': Map<String, dynamic>.from(resolved),
+          };
+        }
+      } on PostgrestException catch (error) {
+        // The additive city-coordinate migration may not be deployed yet.
+        // Keep the real city text from this listing; never substitute mock data.
+        debugPrint('City coordinate resolution unavailable: $error');
+        if (error.code == 'PGRST202' || error.code == '42703') {
+          _canResolveCityCoordinates = false;
+        }
+      }
+    }
     final imageRows =
         (row['listing_images'] as List? ?? const []).map(_json).toList()..sort(
           (a, b) => ((a['sort_order'] as num?)?.toInt() ?? 0).compareTo(
@@ -285,10 +470,24 @@ class SupabaseListingRepository implements ListingRepository {
       'get_listing_view_count',
       params: {'p_listing_id': row['id']},
     );
+    final imageUrls = <String>[];
+    for (final image in imageRows) {
+      var url = '${image['image_url'] ?? ''}'.trim();
+      final media = image['media_assets'];
+      if (media is Map) {
+        final mediaRow = _json(media);
+        final bucket = '${mediaRow['bucket'] ?? ''}'.trim();
+        final path = '${mediaRow['object_path'] ?? ''}'.trim();
+        if (bucket.isNotEmpty && path.isNotEmpty) {
+          url = client.storage.from(bucket).getPublicUrl(path);
+        }
+      }
+      if (url.isNotEmpty && !imageUrls.contains(url)) imageUrls.add(url);
+    }
     return ListingRecord.fromJson({
       ...row,
       'category': row['category_id'] ?? row['category'] ?? '',
-      'images': imageRows.map((image) => '${image['image_url']}').toList(),
+      'images': imageUrls,
       'likes': (likes as num?)?.toInt() ?? 0,
       'views': (views as num?)?.toInt() ?? 0,
     });
@@ -296,9 +495,20 @@ class SupabaseListingRepository implements ListingRepository {
 
   @override
   Future<List<ListingRecord>> all() async {
+    if (client.auth.currentUser == null) {
+      final response = await client.rpc('get_public_listings');
+      final rows = (response as List? ?? const [])
+          .map((row) => _json(row))
+          .toList();
+      return Future.wait(rows.map(_record));
+    }
     final rows = await client
         .from('listings')
-        .select('*, listing_images(image_url, media_id, sort_order)')
+        .select(
+          '*, listing_images(id,image_url,media_id,sort_order,'
+          'media_assets(bucket,object_path)), '
+          'cities(id,name,name_th,name_shn,name_en,name_my,is_active)',
+        )
         .order('created_at', ascending: false);
     return Future.wait(rows.map((row) => _record(_json(row))));
   }
@@ -313,7 +523,9 @@ class SupabaseListingRepository implements ListingRepository {
     'category_id': value.category,
     'price': value.price,
     'currency': value.currency,
-    'city': value.city,
+    'city': value.city.trim(),
+    if (value.cityId != null && value.cityId!.trim().isNotEmpty)
+      'city_id': value.cityId,
     'phone': value.phone,
     'viber_phone': value.viber,
     'status': value.status,
@@ -355,13 +567,69 @@ class SupabaseListingRepository implements ListingRepository {
 
   @override
   Future<ListingRecord> create(ListingRecord value) async {
-    await client.from('listings').insert(_payload(value));
-    await _replaceImages(value);
-    return value;
+    try {
+      final authUserId = client.auth.currentUser?.id;
+      if (authUserId == null || authUserId != value.ownerId) {
+        throw StateError('listing_owner_auth_mismatch');
+      }
+      if (value.city.trim().isEmpty) throw StateError('listing_city_required');
+      if (value.storeId != null) {
+        final store = await client
+            .from('stores')
+            .select('id,owner_id,status,lifecycle_status,is_hidden,deleted_at')
+            .eq('id', value.storeId!)
+            .maybeSingle();
+        if (store == null ||
+            store['owner_id'] != authUserId ||
+            store['status'] != 'approved' ||
+            store['lifecycle_status'] != 'active' ||
+            store['is_hidden'] == true ||
+            store['deleted_at'] != null) {
+          throw StateError('store_not_approved_or_not_owned');
+        }
+      }
+      final row = await client
+          .from('listings')
+          .insert(_payload(value))
+          .select()
+          .single();
+      await _replaceImages(value);
+      return ListingRecord.fromJson({
+        ..._json(row),
+        'category': row['category_id'] ?? row['category'] ?? value.category,
+        'images': value.images,
+      });
+    } catch (error, stackTrace) {
+      debugPrint(
+        'Supabase listing insert failed: $error\n'
+        'owner_id=${value.ownerId} store_id=${value.storeId} '
+        'listing_type=${value.storeId == null ? 'general' : 'store'} '
+        'category_id=${value.category}\n$stackTrace',
+      );
+      rethrow;
+    }
   }
 
   @override
   Future<void> update(ListingRecord value) async {
+    if (value.city.trim().isEmpty) throw StateError('listing_city_required');
+    if (value.storeId != null) {
+      final userId = client.auth.currentUser?.id;
+      final store = await client
+          .from('stores')
+          .select('owner_id,status,lifecycle_status,is_hidden,deleted_at')
+          .eq('id', value.storeId!)
+          .maybeSingle();
+      if (userId == null ||
+          store == null ||
+          store['owner_id'] != userId ||
+          store['status'] != 'approved' ||
+          store['lifecycle_status'] != 'active' ||
+          store['is_hidden'] == true ||
+          store['deleted_at'] != null) {
+        throw StateError('store_not_approved_or_not_owned');
+      }
+    }
     final payload = _payload(value)
       ..remove('id')
       ..remove('owner_id');
@@ -388,7 +656,14 @@ class SupabaseStoreRepository implements StoreRepository {
 
   @override
   Future<List<StoreRecord>> all() async {
-    final rows = await client.from('stores').select().order('created_at');
+    final rows = client.auth.currentUser == null
+        ? (await client.rpc('get_public_stores') as List? ?? const [])
+        : await client
+              .from('stores')
+              .select(
+                '*,cities(id,name,name_th,name_shn,name_en,name_my,is_active)',
+              )
+              .order('created_at');
     return rows.map((row) {
       final data = _json(row);
       return StoreRecord.fromJson({
@@ -415,7 +690,8 @@ class SupabaseStoreRepository implements StoreRepository {
       'phone': value.phone,
       'viber_phone': value.viber,
       'email': value.email,
-      'city': value.city,
+      'city': value.city.trim(),
+      'city_id': value.cityId,
       'location': value.location,
       'latitude': value.latitude,
       'longitude': value.longitude,
@@ -429,6 +705,7 @@ class SupabaseStoreRepository implements StoreRepository {
 
   @override
   Future<StoreRecord> create(StoreRecord value) async {
+    if (value.city.trim().isEmpty) throw StateError('store_city_required');
     await client.from('stores').insert(await _payload(value));
     return value;
   }
@@ -439,7 +716,7 @@ class SupabaseStoreRepository implements StoreRepository {
 
   @override
   Future<void> delete(String id, String ownerId) async =>
-      throw StateError('admin_required');
+      client.rpc('owner_delete_unapproved_store', params: {'p_store_id': id});
 }
 
 class SupabaseStoreRequestRepository implements StoreRequestRepository {
@@ -470,6 +747,12 @@ class SupabaseStoreRequestRepository implements StoreRequestRepository {
   @override
   Future<void> submitPromotion(PromotionRequestRecord value) =>
       client.from('promotion_requests').insert(value.toJson());
+
+  @override
+  Future<void> resubmitRejected(String storeId) => client.rpc(
+    'owner_resubmit_rejected_store',
+    params: {'p_store_id': storeId},
+  );
 }
 
 class SupabaseLikeRepository implements LikeRepository {
@@ -556,6 +839,126 @@ class SupabaseNotificationRepository implements NotificationRepository {
       (await all()).where((value) => !value.isRead).length;
 }
 
+class SupabaseShortVideoRepository implements ShortVideoRepository {
+  final SupabaseClient client;
+  SupabaseShortVideoRepository(this.client);
+
+  List<ShortVideoRecord> _records(List<dynamic> rows) =>
+      rows.map((row) => ShortVideoRecord.fromJson(_json(row))).toList();
+
+  Future<T> _timed<T>(String name, Future<T> Function() query) async {
+    final stopwatch = Stopwatch()..start();
+    debugPrint('Supabase $name: start');
+    try {
+      return await query();
+    } finally {
+      debugPrint('Supabase $name: end ${stopwatch.elapsedMilliseconds}ms');
+    }
+  }
+
+  @override
+  Future<List<ShortVideoRecord>> active() async => _records(
+    await client
+        .from('tiktok_videos')
+        .select()
+        .eq('is_active', true)
+        .order('sort_order')
+        .order('created_at'),
+  );
+
+  @override
+  Future<List<ShortVideoRecord>> all() async => _records(
+    await _timed(
+      'tiktok_videos.page_1',
+      () => client
+          .from('tiktok_videos')
+          .select(
+            'id,tiktok_url,title,sort_order,is_active,created_by,created_at,updated_at',
+          )
+          .order('sort_order')
+          .order('created_at')
+          .range(0, 99),
+    ),
+  );
+
+  Map<String, dynamic> _payload(ShortVideoRecord value) => {
+    'id': value.id,
+    'tiktok_url': value.tiktokUrl,
+    'title': value.title.trim().isEmpty ? null : value.title.trim(),
+    'sort_order': value.sortOrder,
+    'is_active': value.isActive,
+    'created_by': value.createdBy ?? client.auth.currentUser?.id,
+  };
+
+  @override
+  Future<void> create(ShortVideoRecord value) =>
+      client.from('tiktok_videos').insert(_payload(value));
+
+  @override
+  Future<void> update(ShortVideoRecord value) => client
+      .from('tiktok_videos')
+      .update(_payload(value)..remove('id'))
+      .eq('id', value.id);
+
+  @override
+  Future<void> delete(String id) =>
+      client.from('tiktok_videos').delete().eq('id', id);
+}
+
+class SupabaseAdvertisementRepository implements AdvertisementRepository {
+  final SupabaseClient client;
+  SupabaseAdvertisementRepository(this.client);
+
+  Map<String, dynamic> _payload(AdvertisementRecord value) => {
+    'id': value.id,
+    'title': value.title,
+    'image_url': value.imageUrl,
+    'target_type': value.targetType,
+    'target_id': value.targetId,
+    'external_url': value.externalUrl,
+    'target_url': value.externalUrl,
+    'start_at': value.startAt?.toUtc().toIso8601String(),
+    'end_at': value.endAt?.toUtc().toIso8601String(),
+    'display_order': value.displayOrder,
+    'sort_order': value.displayOrder,
+    'is_active': value.isActive,
+    'active': value.isActive,
+  };
+
+  @override
+  Future<List<AdvertisementRecord>> active() async {
+    final rows = await client
+        .from('banners')
+        .select()
+        .eq('is_active', true)
+        .order('display_order');
+    return rows
+        .map((row) => AdvertisementRecord.fromJson(_json(row)))
+        .where((value) => value.isCurrentlyVisible)
+        .toList();
+  }
+
+  @override
+  Future<List<AdvertisementRecord>> all() async {
+    final rows = await client.from('banners').select().order('display_order');
+    return rows.map((row) => AdvertisementRecord.fromJson(_json(row))).toList();
+  }
+
+  @override
+  Future<void> create(AdvertisementRecord value) =>
+      client.from('banners').insert(_payload(value));
+
+  @override
+  Future<void> update(AdvertisementRecord value) => client
+      .from('banners')
+      .update(_payload(value)..remove('id'))
+      .eq('id', value.id);
+
+  @override
+  Future<void> delete(String id) =>
+      client.from('banners').delete().eq('id', id);
+}
+
 class SupabaseStorageService implements StorageService {
   final SupabaseClient client;
   SupabaseStorageService(this.client);
@@ -613,6 +1016,18 @@ class SupabaseAdminRepository implements AdminRepository {
     if (!_authenticated) throw StateError('admin_required');
   }
 
+  Future<T> _timed<T>(String name, Future<T> Function() query) async {
+    final stopwatch = Stopwatch()..start();
+    debugPrint('Supabase admin $name: start');
+    try {
+      return await query();
+    } finally {
+      debugPrint(
+        'Supabase admin $name: end ${stopwatch.elapsedMilliseconds}ms',
+      );
+    }
+  }
+
   @override
   Future<bool> login(String email, String password) async {
     await client.auth.signInWithPassword(
@@ -631,43 +1046,128 @@ class SupabaseAdminRepository implements AdminRepository {
   }
 
   @override
-  Future<List<Map<String, dynamic>>> users() async {
+  Future<List<Map<String, dynamic>>> users({
+    int page = 0,
+    int pageSize = 50,
+  }) async {
     _guard();
-    return (await client.from('profiles').select().order('created_at'))
-        .map(_json)
+    final rows = (await _timed(
+      'profiles.page_1',
+      () => client
+          .from('profiles')
+          .select('id,name,phone,email,avatar_media_id,status,created_at')
+          .order('created_at', ascending: false)
+          .range(page * pageSize, (page + 1) * pageSize - 1),
+    )).map(_json).toList();
+    final mediaIds = rows
+        .map((row) => row['avatar_media_id']?.toString())
+        .whereType<String>()
+        .where((id) => id.isNotEmpty)
+        .toSet()
         .toList();
+    if (mediaIds.isEmpty) return rows;
+    final mediaRows = await client
+        .from('media_assets')
+        .select('id,bucket,object_path')
+        .inFilter('id', mediaIds);
+    final avatarUrls = <String, String>{};
+    for (final item in mediaRows) {
+      final media = _json(item);
+      final bucket = '${media['bucket'] ?? ''}';
+      final path = '${media['object_path'] ?? ''}';
+      if (bucket.isNotEmpty && path.isNotEmpty) {
+        avatarUrls['${media['id']}'] = client.storage
+            .from(bucket)
+            .getPublicUrl(path);
+      }
+    }
+    for (final row in rows) {
+      row['avatar_url'] = avatarUrls['${row['avatar_media_id']}'] ?? '';
+    }
+    return rows;
   }
 
   @override
-  Future<List<Map<String, dynamic>>> listings() async {
+  Future<List<Map<String, dynamic>>> listings({
+    int page = 0,
+    int pageSize = 50,
+  }) async {
     _guard();
-    final rows = await client
-        .from('listings')
-        .select('*, listing_images(image_url, sort_order)')
-        .order('created_at', ascending: false);
+    final rows = await _timed(
+      'listings.page_1',
+      () => client
+          .from('listings')
+          .select(
+            'id,owner_id,store_id,title,description,category,category_id,'
+            'price,currency,city,status,created_at,latitude,longitude,'
+            'is_location_visible,listing_images(id,image_url,media_id,sort_order,'
+            'media_assets(bucket,object_path))',
+          )
+          .order('created_at', ascending: false)
+          .range(page * pageSize, (page + 1) * pageSize - 1),
+    );
     return rows.map((row) {
       final value = _json(row);
-      value['images'] = (value['listing_images'] as List? ?? const [])
-          .map((image) => '${_json(image)['image_url']}')
+      final images =
+          (value['listing_images'] as List? ?? const []).map(_json).toList()
+            ..sort(
+              (a, b) => ((a['sort_order'] as num?)?.toInt() ?? 0).compareTo(
+                (b['sort_order'] as num?)?.toInt() ?? 0,
+              ),
+            );
+      value['images'] = images
+          .map((image) {
+            final media = image['media_assets'];
+            if (media is Map) {
+              final mediaRow = _json(media);
+              final bucket = '${mediaRow['bucket'] ?? ''}';
+              final path = '${mediaRow['object_path'] ?? ''}';
+              if (bucket.isNotEmpty && path.isNotEmpty) {
+                return client.storage.from(bucket).getPublicUrl(path);
+              }
+            }
+            return '${image['image_url'] ?? ''}';
+          })
+          .where((url) => url.isNotEmpty)
           .toList();
       return value;
     }).toList();
   }
 
   @override
-  Future<List<Map<String, dynamic>>> stores() async {
+  Future<List<Map<String, dynamic>>> stores({
+    int page = 0,
+    int pageSize = 50,
+  }) async {
     _guard();
-    return (await client.from('stores').select().order('created_at'))
-        .map(_json)
-        .toList();
+    return (await _timed(
+      'stores.page_1',
+      () => client
+          .from('stores')
+          .select(
+            'id,owner_id,name,description,logo_url,category,category_id,'
+            'phone,viber_phone,city,status,is_promoted,created_at,'
+            'latitude,longitude',
+          )
+          .order('created_at', ascending: false)
+          .range(page * pageSize, (page + 1) * pageSize - 1),
+    )).map(_json).toList();
   }
 
   @override
-  Future<List<Map<String, dynamic>>> reports() async {
+  Future<List<Map<String, dynamic>>> reports({
+    int page = 0,
+    int pageSize = 50,
+  }) async {
     _guard();
-    return (await client.from('reports').select().order('created_at')).map((
-      row,
-    ) {
+    return (await _timed(
+      'reports.page_1',
+      () => client
+          .from('reports')
+          .select('id,listing_id,store_id,reason,workflow_status,created_at')
+          .order('created_at', ascending: false)
+          .range(page * pageSize, (page + 1) * pageSize - 1),
+    )).map((row) {
       final value = _json(row);
       value['target_id'] = value['listing_id'] ?? value['store_id'];
       value['type'] = value['listing_id'] == null ? 'store' : 'listing';
@@ -679,39 +1179,92 @@ class SupabaseAdminRepository implements AdminRepository {
 
   @override
   Future<Map<String, int>> summary() async {
-    final allUsers = await users();
-    final allListings = await listings();
+    _guard();
+    final values = await Future.wait<int>([
+      _timed(
+        'summary.profiles',
+        () => client.from('profiles').count(CountOption.exact),
+      ),
+      _timed(
+        'summary.general_listings',
+        () => client
+            .from('listings')
+            .count(CountOption.exact)
+            .eq('listing_type', 'general'),
+      ),
+      _timed(
+        'summary.store_products',
+        () => client
+            .from('listings')
+            .count(CountOption.exact)
+            .eq('listing_type', 'store'),
+      ),
+      _timed(
+        'summary.stores',
+        () => client.from('stores').count(CountOption.exact),
+      ),
+      _timed(
+        'summary.reports',
+        () => client.from('reports').count(CountOption.exact),
+      ),
+    ]);
     return {
-      'users': allUsers.length,
-      'listings': allListings.where((row) => row['store_id'] == null).length,
-      'stores': (await stores()).length,
-      'store_products': allListings
-          .where((row) => row['store_id'] != null)
-          .length,
-      'reports': (await reports()).length,
+      'users': values[0],
+      'listings': values[1],
+      'store_products': values[2],
+      'stores': values[3],
+      'reports': values[4],
     };
   }
 
   @override
   Future<List<Map<String, dynamic>>> storeEditRequests() async {
     _guard();
-    return (await client
-            .from('store_edit_requests')
-            .select()
-            .order('created_at'))
-        .map(_json)
-        .toList();
+    return (await _timed(
+      'store_edit_requests.page_1',
+      () => client
+          .from('store_edit_requests')
+          .select(
+            'id,store_id,owner_id,before_snapshot,proposed_changes,status,created_at',
+          )
+          .order('created_at', ascending: false)
+          .range(0, 99),
+    )).map(_json).toList();
   }
 
   @override
   Future<List<Map<String, dynamic>>> promotionRequests() async {
     _guard();
-    return (await client
-            .from('promotion_requests')
-            .select()
-            .order('created_at'))
-        .map(_json)
-        .toList();
+    return (await _timed(
+      'promotion_requests.page_1',
+      () => client
+          .from('promotion_requests')
+          .select('id,store_id,owner_id,status,created_at')
+          .order('created_at', ascending: false)
+          .range(0, 99),
+    )).map(_json).toList();
+  }
+
+  @override
+  Future<List<Map<String, dynamic>>> adminNotifications() async {
+    _guard();
+    return (await _timed(
+      'admin_notifications.page_1',
+      () => client
+          .from('admin_notifications')
+          .select('id,type,shop_id,listing_id,title,message,is_read,created_at')
+          .order('created_at', ascending: false)
+          .range(0, 99),
+    )).map(_json).toList();
+  }
+
+  @override
+  Future<void> markAdminNotificationRead(String id) async {
+    _guard();
+    await client
+        .from('admin_notifications')
+        .update({'is_read': true})
+        .eq('id', id);
   }
 
   @override

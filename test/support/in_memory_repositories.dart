@@ -2,18 +2,47 @@ import 'package:crypto/crypto.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
-import 'models.dart';
-import 'repositories.dart';
-import 'store_categories.dart';
-import 'local_storage_service_io.dart'
-    if (dart.library.html) 'local_storage_service_web.dart';
+import 'package:suikai/data/models.dart';
+import 'package:suikai/data/repositories.dart';
+import 'package:suikai/data/store_categories.dart';
 
 Map<String, dynamic> _map(dynamic value) =>
     Map<String, dynamic>.from(value as Map);
 
-StorageService createLocalStorageService() => LocalStorageService();
+class InMemoryStorageService implements StorageService {
+  @override
+  Future<String> persistImage(
+    String sourcePath,
+    String extension, {
+    String? bucket,
+    String? objectPrefix,
+  }) async => sourcePath;
+}
 
-class LocalDatabase {
+class InMemoryAdvertisementRepository implements AdvertisementRepository {
+  final List<AdvertisementRecord> values = [];
+
+  @override
+  Future<List<AdvertisementRecord>> active() async =>
+      values.where((value) => value.isCurrentlyVisible).toList()
+        ..sort((a, b) => a.displayOrder.compareTo(b.displayOrder));
+  @override
+  Future<List<AdvertisementRecord>> all() async =>
+      [...values]..sort((a, b) => a.displayOrder.compareTo(b.displayOrder));
+  @override
+  Future<void> create(AdvertisementRecord value) async => values.add(value);
+  @override
+  Future<void> update(AdvertisementRecord value) async {
+    values.removeWhere((item) => item.id == value.id);
+    values.add(value);
+  }
+
+  @override
+  Future<void> delete(String id) async =>
+      values.removeWhere((item) => item.id == id);
+}
+
+class TestDatabase {
   static late Box<dynamic> users,
       listings,
       stores,
@@ -21,7 +50,9 @@ class LocalDatabase {
       reports,
       storeEditRequests,
       promotionRequests,
-      categories;
+      categories,
+      shortVideos,
+      adminNotifications;
   static Box<dynamic>? notifications;
   static Future<void> initialize() async {
     await Hive.initFlutter('suikai_local');
@@ -34,17 +65,19 @@ class LocalDatabase {
     promotionRequests = await Hive.openBox('promotion_requests_v1');
     categories = await Hive.openBox('categories_v1');
     notifications = await Hive.openBox('notifications_v1');
+    shortVideos = await Hive.openBox('short_videos_v1');
+    adminNotifications = await Hive.openBox('admin_notifications_v1');
   }
 }
 
-class LocalAuthRepository implements AuthRepository {
+class InMemoryAuthRepository implements AuthRepository {
   static const _session = 'local_session_user_id';
   String? _current;
   @override
   String? get currentUserId {
     final id = _current;
     if (id == null) return null;
-    final row = LocalDatabase.users.get(id);
+    final row = TestDatabase.users.get(id);
     if (row == null || _map(row)['status'] == 'suspended') return null;
     return id;
   }
@@ -52,7 +85,7 @@ class LocalAuthRepository implements AuthRepository {
   Future<void> restore() async {
     final prefs = await SharedPreferences.getInstance();
     _current = prefs.getString(_session);
-    final row = _current == null ? null : LocalDatabase.users.get(_current);
+    final row = _current == null ? null : TestDatabase.users.get(_current);
     if (row == null || _map(row)['status'] == 'suspended') {
       _current = null;
       await prefs.remove(_session);
@@ -67,18 +100,20 @@ class LocalAuthRepository implements AuthRepository {
     required String phone,
     required String email,
     required String password,
+    required String city,
   }) async {
     final normalized = email.trim().toLowerCase();
-    if (LocalDatabase.users.values.any((v) => _map(v)['email'] == normalized))
+    if (TestDatabase.users.values.any((v) => _map(v)['email'] == normalized))
       throw StateError('email_exists');
     final p = UserProfile(
       id: const Uuid().v4(),
       name: name.trim(),
       phone: phone.trim(),
       email: normalized,
+      city: city.trim(),
       createdAt: DateTime.now(),
     );
-    await LocalDatabase.users.put(p.id, {
+    await TestDatabase.users.put(p.id, {
       ...p.toJson(),
       'password_hash': _hash(password),
     });
@@ -88,7 +123,7 @@ class LocalAuthRepository implements AuthRepository {
   @override
   Future<UserProfile> login(String email, String password) async {
     final normalized = email.trim().toLowerCase();
-    final row = LocalDatabase.users.values
+    final row = TestDatabase.users.values
         .cast<dynamic>()
         .map(_map)
         .where(
@@ -108,81 +143,134 @@ class LocalAuthRepository implements AuthRepository {
     _current = null;
     await (await SharedPreferences.getInstance()).remove(_session);
   }
+  @override
+Future<void> loginWithTelegram() async {}
+
+@override
+Future<void> completeTelegramWebLogin() async {}
+
+@override
+Future<void> syncCurrentProfile() async {}
 }
 
-class LocalProfileRepository implements ProfileRepository {
+class InMemoryProfileRepository implements ProfileRepository {
   @override
   Future<UserProfile?> get(String id) async {
-    final v = LocalDatabase.users.get(id);
+    final v = TestDatabase.users.get(id);
     return v == null ? null : UserProfile.fromJson(_map(v));
   }
 
   @override
   Future<void> save(UserProfile p) async {
-    final old = _map(LocalDatabase.users.get(p.id));
-    await LocalDatabase.users.put(p.id, {...old, ...p.toJson()});
+    final old = _map(TestDatabase.users.get(p.id));
+    await TestDatabase.users.put(p.id, {...old, ...p.toJson()});
   }
 }
 
-class LocalListingRepository implements ListingRepository {
+class InMemoryListingRepository implements ListingRepository {
   @override
   Future<List<ListingRecord>> all() async =>
-      LocalDatabase.listings.values
+      TestDatabase.listings.values
           .map((v) => ListingRecord.fromJson(_map(v)))
           .toList()
         ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
   @override
   Future<ListingRecord> create(ListingRecord v) async {
-    await LocalDatabase.listings.put(v.id, v.toJson());
+    if (v.city.trim().isEmpty) throw StateError('listing_city_required');
+    await TestDatabase.listings.put(v.id, v.toJson());
+    final notificationId = 'new_listing:${v.id}';
+    await TestDatabase.adminNotifications.put(notificationId, {
+      'id': notificationId,
+      'type': v.storeId == null ? 'general_listing' : 'store_product',
+      'listing_id': v.id,
+      'title': v.storeId == null ? 'ประกาศใหม่' : 'สินค้าใหม่ในร้าน',
+      'message': v.title,
+      'is_read': false,
+      'created_at': v.createdAt.toIso8601String(),
+    });
     return v;
   }
 
   @override
   Future<void> update(ListingRecord v) async {
-    final old = LocalDatabase.listings.get(v.id);
+    final old = TestDatabase.listings.get(v.id);
     if (old == null || _map(old)['owner_id'] != v.ownerId)
       throw StateError('forbidden');
-    await LocalDatabase.listings.put(v.id, v.toJson());
+    await TestDatabase.listings.put(v.id, v.toJson());
   }
 
   @override
   Future<void> delete(String id, String ownerId) async {
-    final old = LocalDatabase.listings.get(id);
+    final old = TestDatabase.listings.get(id);
     if (old != null && _map(old)['owner_id'] == ownerId)
-      await LocalDatabase.listings.delete(id);
+      await TestDatabase.listings.delete(id);
   }
 }
 
-class LocalStoreRepository implements StoreRepository {
+class InMemoryStoreRepository implements StoreRepository {
   @override
-  Future<List<StoreRecord>> all() async => LocalDatabase.stores.values
+  Future<List<StoreRecord>> all() async => TestDatabase.stores.values
       .map((v) => StoreRecord.fromJson(_map(v)))
       .toList();
   @override
   Future<StoreRecord> create(StoreRecord v) async {
-    await LocalDatabase.stores.put(v.id, v.toJson());
-    return v;
+    final pending = StoreRecord(
+      id: v.id,
+      ownerId: v.ownerId,
+      name: v.name,
+      logo: v.logo,
+      cover: v.cover,
+      description: v.description,
+      category: v.category,
+      phone: v.phone,
+      viber: v.viber,
+      city: v.city,
+      location: v.location,
+      openingHours: v.openingHours,
+      status: 'pending',
+      email: v.email,
+      latitude: v.latitude,
+      longitude: v.longitude,
+      createdAt: v.createdAt,
+    );
+    await TestDatabase.stores.put(pending.id, pending.toJson());
+    final notificationId = 'shop_application:${pending.id}';
+    if (!TestDatabase.adminNotifications.containsKey(notificationId)) {
+      await TestDatabase.adminNotifications.put(notificationId, {
+        'id': notificationId,
+        'type': 'shop_application',
+        'shop_id': pending.id,
+        'title': 'คำขอเปิดร้านใหม่',
+        'message': 'ร้าน ${pending.name} ส่งคำขอเปิดร้าน',
+        'is_read': false,
+        'created_at': pending.createdAt.toIso8601String(),
+      });
+    }
+    return pending;
   }
 
   @override
   Future<void> update(StoreRecord v) async {
-    final old = LocalDatabase.stores.get(v.id);
+    final old = TestDatabase.stores.get(v.id);
     if (old == null || _map(old)['owner_id'] != v.ownerId)
       throw StateError('forbidden');
-    await LocalDatabase.stores.put(v.id, v.toJson());
+    await TestDatabase.stores.put(v.id, {
+      ...v.toJson(),
+      'status': _map(old)['status'],
+    });
   }
 
   @override
   Future<void> delete(String id, String ownerId) async {
-    final old = LocalDatabase.stores.get(id);
+    final old = TestDatabase.stores.get(id);
     if (old != null && _map(old)['owner_id'] == ownerId)
-      await LocalDatabase.stores.delete(id);
+      await TestDatabase.stores.delete(id);
   }
 }
 
-class LocalStoreRequestRepository implements StoreRequestRepository {
+class InMemoryStoreRequestRepository implements StoreRequestRepository {
   void _verifyOwner(String storeId, String ownerId) {
-    final row = LocalDatabase.stores.get(storeId);
+    final row = TestDatabase.stores.get(storeId);
     if (row == null || _map(row)['owner_id'] != ownerId) {
       throw StateError('forbidden');
     }
@@ -191,25 +279,32 @@ class LocalStoreRequestRepository implements StoreRequestRepository {
   @override
   Future<void> submitEdit(StoreEditRequestRecord value) async {
     _verifyOwner(value.storeId, value.ownerId);
-    await LocalDatabase.storeEditRequests.put(value.id, value.toJson());
+    await TestDatabase.storeEditRequests.put(value.id, value.toJson());
   }
 
   @override
   Future<void> submitPromotion(PromotionRequestRecord value) async {
     _verifyOwner(value.storeId, value.ownerId);
-    final pending = LocalDatabase.promotionRequests.values
+    final pending = TestDatabase.promotionRequests.values
         .map(_map)
         .any((e) => e['store_id'] == value.storeId && e['status'] == 'pending');
     if (pending) throw StateError('request_pending');
-    await LocalDatabase.promotionRequests.put(value.id, value.toJson());
+    await TestDatabase.promotionRequests.put(value.id, value.toJson());
+  }
+
+  @override
+  Future<void> resubmitRejected(String storeId) async {
+    final row = TestDatabase.stores.get(storeId);
+    if (row == null) throw StateError('not_found');
+    await TestDatabase.stores.put(storeId, _map(row)..['status'] = 'pending');
   }
 }
 
-class LocalCategoryRepository implements CategoryRepository {
+class InMemoryCategoryRepository implements CategoryRepository {
   Future<void> seedDefaults() async {
     for (final category in initialCategoryRecords) {
-      if (!LocalDatabase.categories.containsKey(category.id)) {
-        await LocalDatabase.categories.put(category.id, category.toJson());
+      if (!TestDatabase.categories.containsKey(category.id)) {
+        await TestDatabase.categories.put(category.id, category.toJson());
       }
     }
   }
@@ -217,29 +312,29 @@ class LocalCategoryRepository implements CategoryRepository {
   Future<void> migrateLegacyReferences() async {
     final storeCategories = await getByType('store');
     final listingCategories = await getByType('listing');
-    for (final key in LocalDatabase.stores.keys) {
-      final row = _map(LocalDatabase.stores.get(key));
+    for (final key in TestDatabase.stores.keys) {
+      final row = _map(TestDatabase.stores.get(key));
       final current = '${row['category'] ?? ''}';
       final match = storeCategories
           .where((c) => c.matches(current))
           .firstOrNull;
       if (match != null && current != match.id) {
-        await LocalDatabase.stores.put(key, {...row, 'category': match.id});
+        await TestDatabase.stores.put(key, {...row, 'category': match.id});
       }
     }
-    for (final key in LocalDatabase.listings.keys) {
-      final row = _map(LocalDatabase.listings.get(key));
+    for (final key in TestDatabase.listings.keys) {
+      final row = _map(TestDatabase.listings.get(key));
       if (row['store_id'] != null) continue;
       final current = '${row['category'] ?? ''}';
       final match = listingCategories
           .where((c) => c.matches(current))
           .firstOrNull;
       if (match != null && current != match.id) {
-        await LocalDatabase.listings.put(key, {...row, 'category': match.id});
+        await TestDatabase.listings.put(key, {...row, 'category': match.id});
       }
     }
-    for (final key in LocalDatabase.storeEditRequests.keys) {
-      final row = _map(LocalDatabase.storeEditRequests.get(key));
+    for (final key in TestDatabase.storeEditRequests.keys) {
+      final row = _map(TestDatabase.storeEditRequests.get(key));
       final proposed = Map<String, dynamic>.from(
         row['proposed_changes'] as Map? ?? const {},
       );
@@ -248,7 +343,7 @@ class LocalCategoryRepository implements CategoryRepository {
           .where((c) => c.matches(current))
           .firstOrNull;
       if (match != null && current != match.id) {
-        await LocalDatabase.storeEditRequests.put(key, {
+        await TestDatabase.storeEditRequests.put(key, {
           ...row,
           'proposed_changes': {...proposed, 'category': match.id},
         });
@@ -261,7 +356,7 @@ class LocalCategoryRepository implements CategoryRepository {
     String type, {
     bool activeOnly = false,
   }) async =>
-      LocalDatabase.categories.values
+      TestDatabase.categories.values
           .map((value) => CategoryRecord.fromJson(_map(value)))
           .where(
             (category) =>
@@ -272,34 +367,34 @@ class LocalCategoryRepository implements CategoryRepository {
 
   @override
   Future<void> add(CategoryRecord value) async {
-    if (LocalDatabase.categories.containsKey(value.id)) {
+    if (TestDatabase.categories.containsKey(value.id)) {
       throw StateError('category_exists');
     }
-    await LocalDatabase.categories.put(value.id, value.toJson());
+    await TestDatabase.categories.put(value.id, value.toJson());
   }
 
   @override
   Future<void> update(CategoryRecord value) async {
-    if (!LocalDatabase.categories.containsKey(value.id)) {
+    if (!TestDatabase.categories.containsKey(value.id)) {
       throw StateError('category_not_found');
     }
-    await LocalDatabase.categories.put(value.id, value.toJson());
+    await TestDatabase.categories.put(value.id, value.toJson());
   }
 
   @override
   Future<void> setActive(String id, bool active) async {
-    final raw = LocalDatabase.categories.get(id);
+    final raw = TestDatabase.categories.get(id);
     if (raw == null) throw StateError('category_not_found');
-    await LocalDatabase.categories.put(id, {..._map(raw), 'is_active': active});
+    await TestDatabase.categories.put(id, {..._map(raw), 'is_active': active});
   }
 
   @override
   Future<void> reorder(String type, List<String> orderedIds) async {
     for (var index = 0; index < orderedIds.length; index++) {
       final id = orderedIds[index];
-      final raw = LocalDatabase.categories.get(id);
+      final raw = TestDatabase.categories.get(id);
       if (raw == null || _map(raw)['type'] != type) continue;
-      await LocalDatabase.categories.put(id, {
+      await TestDatabase.categories.put(id, {
         ..._map(raw),
         'sort_order': index,
       });
@@ -307,10 +402,10 @@ class LocalCategoryRepository implements CategoryRepository {
   }
 }
 
-class LocalLikeRepository implements LikeRepository {
+class InMemoryLikeRepository implements LikeRepository {
   String _key(String kind, String item, String device) => '$kind:$device:$item';
   @override
-  Future<Set<String>> likedIds(String device) async => LocalDatabase
+  Future<Set<String>> likedIds(String device) async => TestDatabase
       .interactions
       .keys
       .whereType<String>()
@@ -320,30 +415,30 @@ class LocalLikeRepository implements LikeRepository {
   @override
   Future<bool> like(String id, String device) async {
     final k = _key('like', id, device);
-    if (LocalDatabase.interactions.containsKey(k)) return false;
-    await LocalDatabase.interactions.put(k, DateTime.now().toIso8601String());
+    if (TestDatabase.interactions.containsKey(k)) return false;
+    await TestDatabase.interactions.put(k, DateTime.now().toIso8601String());
     return true;
   }
 
   @override
   Future<bool> view(String id, String device) async {
     final k = _key('view', id, device);
-    if (LocalDatabase.interactions.containsKey(k)) return false;
-    await LocalDatabase.interactions.put(k, DateTime.now().toIso8601String());
+    if (TestDatabase.interactions.containsKey(k)) return false;
+    await TestDatabase.interactions.put(k, DateTime.now().toIso8601String());
     return true;
   }
 }
 
-class LocalReportRepository implements ReportRepository {
+class InMemoryReportRepository implements ReportRepository {
   @override
   Future<void> create(ReportRecord r) =>
-      LocalDatabase.reports.put(r.id, r.toJson());
+      TestDatabase.reports.put(r.id, r.toJson());
 }
 
-class LocalNotificationRepository implements NotificationRepository {
+class InMemoryNotificationRepository implements NotificationRepository {
   @override
   Future<List<NotificationRecord>> all() async {
-    final box = LocalDatabase.notifications;
+    final box = TestDatabase.notifications;
     if (box == null) return const [];
     return box.values
         .map((value) => NotificationRecord.fromJson(_map(value)))
@@ -353,7 +448,7 @@ class LocalNotificationRepository implements NotificationRepository {
 
   @override
   Future<void> markRead(String id) async {
-    final box = LocalDatabase.notifications;
+    final box = TestDatabase.notifications;
     final raw = box?.get(id);
     if (raw == null) return;
     await box!.put(id, {
@@ -368,7 +463,34 @@ class LocalNotificationRepository implements NotificationRepository {
       (await all()).where((value) => !value.isRead).length;
 }
 
-class LocalAdminRepository implements AdminRepository {
+class InMemoryShortVideoRepository implements ShortVideoRepository {
+  List<ShortVideoRecord> _rows() =>
+      TestDatabase.shortVideos.values
+          .map(_map)
+          .map(ShortVideoRecord.fromJson)
+          .toList()
+        ..sort((a, b) => a.sortOrder.compareTo(b.sortOrder));
+
+  @override
+  Future<List<ShortVideoRecord>> active() async =>
+      _rows().where((value) => value.isActive).toList();
+
+  @override
+  Future<List<ShortVideoRecord>> all() async => _rows();
+
+  @override
+  Future<void> create(ShortVideoRecord value) =>
+      TestDatabase.shortVideos.put(value.id, value.toJson());
+
+  @override
+  Future<void> update(ShortVideoRecord value) =>
+      TestDatabase.shortVideos.put(value.id, value.toJson());
+
+  @override
+  Future<void> delete(String id) => TestDatabase.shortVideos.delete(id);
+}
+
+class InMemoryAdminRepository implements AdminRepository {
   static const _sessionKey = 'local_admin_session';
   static const _adminEmail = 'admin@suikai.local';
   static final _adminHash = sha256.convert('admin1234'.codeUnits).toString();
@@ -406,64 +528,94 @@ class LocalAdminRepository implements AdminRepository {
   @override
   Future<Map<String, int>> summary() async {
     _guard();
-    final rows = await listings();
+    final rows = TestDatabase.listings.values.map(_map).toList();
     return {
-      'users': LocalDatabase.users.length,
+      'users': TestDatabase.users.length,
       'listings': rows.where((e) => e['store_id'] == null).length,
-      'stores': LocalDatabase.stores.length,
+      'stores': TestDatabase.stores.length,
       'store_products': rows.where((e) => e['store_id'] != null).length,
-      'reports': LocalDatabase.reports.length,
+      'reports': TestDatabase.reports.length,
     };
   }
 
   @override
-  Future<List<Map<String, dynamic>>> users() async {
+  Future<List<Map<String, dynamic>>> users({
+    int page = 0,
+    int pageSize = 50,
+  }) async {
     _guard();
-    return LocalDatabase.users.values.map(_map).map((e) {
-      final safe = Map<String, dynamic>.from(e)..remove('password_hash');
-      safe['status'] ??= 'active';
-      return safe;
-    }).toList();
+    return TestDatabase.users.values
+        .map(_map)
+        .map((e) {
+          final safe = Map<String, dynamic>.from(e)..remove('password_hash');
+          safe['status'] ??= 'active';
+          return safe;
+        })
+        .skip(page * pageSize)
+        .take(pageSize)
+        .toList();
   }
 
   @override
-  Future<List<Map<String, dynamic>>> listings() async {
+  Future<List<Map<String, dynamic>>> listings({
+    int page = 0,
+    int pageSize = 50,
+  }) async {
     _guard();
-    return LocalDatabase.listings.values.map(_map).toList();
+    return TestDatabase.listings.values
+        .map(_map)
+        .skip(page * pageSize)
+        .take(pageSize)
+        .toList();
   }
 
   @override
-  Future<List<Map<String, dynamic>>> stores() async {
+  Future<List<Map<String, dynamic>>> stores({
+    int page = 0,
+    int pageSize = 50,
+  }) async {
     _guard();
-    return LocalDatabase.stores.values.map(_map).toList();
+    return TestDatabase.stores.values
+        .map(_map)
+        .skip(page * pageSize)
+        .take(pageSize)
+        .toList();
   }
 
   @override
-  Future<List<Map<String, dynamic>>> reports() async {
+  Future<List<Map<String, dynamic>>> reports({
+    int page = 0,
+    int pageSize = 50,
+  }) async {
     _guard();
-    return LocalDatabase.reports.values.map(_map).map((e) {
-      e['reviewed'] ??= false;
-      return e;
-    }).toList();
+    return TestDatabase.reports.values
+        .map(_map)
+        .map((e) {
+          e['reviewed'] ??= false;
+          return e;
+        })
+        .skip(page * pageSize)
+        .take(pageSize)
+        .toList();
   }
 
   @override
   Future<void> setUserStatus(String id, String status) async {
     _guard();
-    final row = LocalDatabase.users.get(id);
+    final row = TestDatabase.users.get(id);
     if (row != null)
-      await LocalDatabase.users.put(id, {..._map(row), 'status': status});
+      await TestDatabase.users.put(id, {..._map(row), 'status': status});
   }
 
   @override
   Future<void> deleteUser(String id) async {
     _guard();
-    final ownedStores = LocalDatabase.stores.values
+    final ownedStores = TestDatabase.stores.values
         .map(_map)
         .where((e) => e['owner_id'] == id)
         .map((e) => '${e['id']}')
         .toSet();
-    final listingKeys = LocalDatabase.listings.values
+    final listingKeys = TestDatabase.listings.values
         .map(_map)
         .where(
           (e) =>
@@ -471,17 +623,17 @@ class LocalAdminRepository implements AdminRepository {
         )
         .map((e) => '${e['id']}')
         .toList();
-    await LocalDatabase.listings.deleteAll(listingKeys);
-    await LocalDatabase.stores.deleteAll(ownedStores);
-    await LocalDatabase.users.delete(id);
+    await TestDatabase.listings.deleteAll(listingKeys);
+    await TestDatabase.stores.deleteAll(ownedStores);
+    await TestDatabase.users.delete(id);
   }
 
   @override
   Future<void> setListingStatus(String id, String status) async {
     _guard();
-    final row = LocalDatabase.listings.get(id);
+    final row = TestDatabase.listings.get(id);
     if (row != null)
-      await LocalDatabase.listings.put(id, {
+      await TestDatabase.listings.put(id, {
         ..._map(row),
         'status': status,
         'updated_at': DateTime.now().toIso8601String(),
@@ -491,35 +643,38 @@ class LocalAdminRepository implements AdminRepository {
   @override
   Future<void> deleteListing(String id) async {
     _guard();
-    await LocalDatabase.listings.delete(id);
+    await TestDatabase.listings.delete(id);
   }
 
   @override
   Future<void> setStoreStatus(String id, String status) async {
     _guard();
-    final row = LocalDatabase.stores.get(id);
-    if (row != null)
-      await LocalDatabase.stores.put(id, {..._map(row), 'status': status});
+    final row = TestDatabase.stores.get(id);
+    final next = status == 'active' ? 'approved' : status;
+    if (row != null &&
+        const {'pending', 'approved', 'rejected', 'suspended'}.contains(next)) {
+      await TestDatabase.stores.put(id, {..._map(row), 'status': next});
+    }
   }
 
   @override
   Future<void> deleteStore(String id) async {
     _guard();
-    final products = LocalDatabase.listings.values
+    final products = TestDatabase.listings.values
         .map(_map)
         .where((e) => '${e['store_id']}' == id)
         .map((e) => '${e['id']}')
         .toList();
-    await LocalDatabase.listings.deleteAll(products);
-    await LocalDatabase.stores.delete(id);
+    await TestDatabase.listings.deleteAll(products);
+    await TestDatabase.stores.delete(id);
   }
 
   @override
   Future<void> reviewReport(String id, bool reviewed) async {
     _guard();
-    final row = LocalDatabase.reports.get(id);
+    final row = TestDatabase.reports.get(id);
     if (row != null)
-      await LocalDatabase.reports.put(id, {
+      await TestDatabase.reports.put(id, {
         ..._map(row),
         'reviewed': reviewed,
         'reviewed_at': reviewed ? DateTime.now().toIso8601String() : null,
@@ -529,31 +684,50 @@ class LocalAdminRepository implements AdminRepository {
   @override
   Future<List<Map<String, dynamic>>> storeEditRequests() async {
     _guard();
-    return LocalDatabase.storeEditRequests.values.map(_map).toList();
+    return TestDatabase.storeEditRequests.values.map(_map).toList();
   }
 
   @override
   Future<List<Map<String, dynamic>>> promotionRequests() async {
     _guard();
-    return LocalDatabase.promotionRequests.values.map(_map).toList();
+    return TestDatabase.promotionRequests.values.map(_map).toList();
+  }
+
+  @override
+  Future<List<Map<String, dynamic>>> adminNotifications() async {
+    _guard();
+    return TestDatabase.adminNotifications.values.map(_map).toList()
+      ..sort((a, b) => '${b['created_at']}'.compareTo('${a['created_at']}'));
+  }
+
+  @override
+  Future<void> markAdminNotificationRead(String id) async {
+    _guard();
+    final row = TestDatabase.adminNotifications.get(id);
+    if (row != null) {
+      await TestDatabase.adminNotifications.put(id, {
+        ..._map(row),
+        'is_read': true,
+      });
+    }
   }
 
   @override
   Future<void> reviewStoreEditRequest(String id, bool approved) async {
     _guard();
-    final raw = LocalDatabase.storeEditRequests.get(id);
+    final raw = TestDatabase.storeEditRequests.get(id);
     if (raw == null) return;
     final request = _map(raw);
     if (request['status'] != 'pending') return;
     final storeId = '${request['store_id']}';
-    final storeRaw = LocalDatabase.stores.get(storeId);
+    final storeRaw = TestDatabase.stores.get(storeId);
     if (approved && storeRaw != null) {
       final proposed = Map<String, dynamic>.from(
         request['proposed_changes'] as Map,
       );
-      await LocalDatabase.stores.put(storeId, {..._map(storeRaw), ...proposed});
+      await TestDatabase.stores.put(storeId, {..._map(storeRaw), ...proposed});
     }
-    await LocalDatabase.storeEditRequests.put(id, {
+    await TestDatabase.storeEditRequests.put(id, {
       ...request,
       'status': approved ? 'approved' : 'rejected',
       'reviewed_at': DateTime.now().toIso8601String(),
@@ -563,15 +737,15 @@ class LocalAdminRepository implements AdminRepository {
   @override
   Future<void> reviewPromotionRequest(String id, bool approved) async {
     _guard();
-    final raw = LocalDatabase.promotionRequests.get(id);
+    final raw = TestDatabase.promotionRequests.get(id);
     if (raw == null) return;
     final request = _map(raw);
     if (request['status'] != 'pending') return;
     if (approved) {
       final storeId = '${request['store_id']}';
-      final storeRaw = LocalDatabase.stores.get(storeId);
+      final storeRaw = TestDatabase.stores.get(storeId);
       if (storeRaw != null) {
-        await LocalDatabase.stores.put(storeId, {
+        await TestDatabase.stores.put(storeId, {
           ..._map(storeRaw),
           'is_promoted': true,
           'promotion_start_at': request['requested_start_at'],
@@ -579,7 +753,7 @@ class LocalAdminRepository implements AdminRepository {
         });
       }
     }
-    await LocalDatabase.promotionRequests.put(id, {
+    await TestDatabase.promotionRequests.put(id, {
       ...request,
       'status': approved ? 'approved' : 'rejected',
       'reviewed_at': DateTime.now().toIso8601String(),
@@ -589,9 +763,9 @@ class LocalAdminRepository implements AdminRepository {
   @override
   Future<void> setStorePromoted(String id, bool promoted) async {
     _guard();
-    final row = LocalDatabase.stores.get(id);
+    final row = TestDatabase.stores.get(id);
     if (row != null) {
-      await LocalDatabase.stores.put(id, {
+      await TestDatabase.stores.put(id, {
         ..._map(row),
         'is_promoted': promoted,
         if (!promoted) 'promotion_end_at': null,

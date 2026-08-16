@@ -1,14 +1,14 @@
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
-import '../data/local_repositories.dart';
 import '../data/models.dart';
 import '../data/repositories.dart';
-import '../data/store_categories.dart';
 import '../data/supabase_repositories.dart';
 
 class SelectedImage {
@@ -19,68 +19,117 @@ class SelectedImage {
       file.name.contains('.') ? file.name.split('.').last.toLowerCase() : 'jpg';
 }
 
+enum LocationFailureReason {
+  insecureContext,
+  serviceDisabled,
+  permissionDenied,
+  permissionDeniedForever,
+  unavailable,
+}
+
+class LocationFailure implements Exception {
+  final LocationFailureReason reason;
+  final Object? cause;
+  const LocationFailure(this.reason, [this.cause]);
+
+  String get userMessage => switch (reason) {
+    LocationFailureReason.insecureContext =>
+      'ตำแหน่งบน Web ใช้ได้เฉพาะ HTTPS หรือ localhost',
+    LocationFailureReason.serviceDisabled =>
+      'กรุณาเปิด Location Service/GPS แล้วลองใหม่',
+    LocationFailureReason.permissionDenied =>
+      'ไม่ได้รับสิทธิ์ตำแหน่ง กรุณาอนุญาตในหน้าต่างของระบบ',
+    LocationFailureReason.permissionDeniedForever =>
+      'สิทธิ์ตำแหน่งถูกปิดถาวร กรุณาเปิดจาก Settings ของแอปหรือ Browser',
+    LocationFailureReason.unavailable =>
+      'ไม่สามารถอ่านตำแหน่งปัจจุบันได้ กรุณาลองใหม่',
+  };
+
+  @override
+  String toString() => 'LocationFailure($reason, cause: $cause)';
+}
+
 class SuikaiService {
-  static AuthRepository auth = LocalAuthRepository();
-  static ProfileRepository profiles = LocalProfileRepository();
-  static ListingRepository listings = LocalListingRepository();
-  static StoreRepository stores = LocalStoreRepository();
-  static StoreRequestRepository storeRequests = LocalStoreRequestRepository();
-  static CategoryRepository categoryRepository = LocalCategoryRepository();
-  static LikeRepository likes = LocalLikeRepository();
-  static ReportRepository reports = LocalReportRepository();
-  static NotificationRepository notifications = LocalNotificationRepository();
-  static StorageService storage = createLocalStorageService();
-  static AdminRepository admin = LocalAdminRepository();
+  static late AuthRepository auth;
+  static late ProfileRepository profiles;
+  static late ListingRepository listings;
+  static late StoreRepository stores;
+  static late StoreRequestRepository storeRequests;
+  static late CategoryRepository categoryRepository;
+  static late LikeRepository likes;
+  static late ReportRepository reports;
+  static late NotificationRepository notifications;
+  static late ShortVideoRepository shortVideos;
+  static late AdvertisementRepository advertisements;
+  static late StorageService storage;
+  static late AdminRepository admin;
   static final _picker = ImagePicker();
-  static List<CategoryRecord> _categoryCache = [...initialCategoryRecords];
+  static List<CategoryRecord> _categoryCache = [];
+  static List<CityRecord> _cityCache = [];
   static late String deviceId;
   static bool get usesSupabase => SupabaseBackend.enabled;
+  static Session? get currentSession =>
+      usesSupabase ? SupabaseBackend.client.auth.currentSession : null;
+  static bool get hasValidSession => currentSession != null;
   static String? get currentUserId => auth.currentUserId;
   static bool get isLoggedIn => currentUserId != null;
 
   static Future<bool> initialize() async {
-    await LocalDatabase.initialize();
-    if (usesSupabase) {
-      await SupabaseBackend.initialize();
-      final client = SupabaseBackend.client;
-      auth = SupabaseAuthRepository(client);
-      profiles = SupabaseProfileRepository(client);
-      listings = SupabaseListingRepository(client);
-      stores = SupabaseStoreRepository(client);
-      storeRequests = SupabaseStoreRequestRepository(client);
-      categoryRepository = SupabaseCategoryRepository(client);
-      likes = SupabaseLikeRepository(client);
-      reports = SupabaseReportRepository(client);
-      notifications = SupabaseNotificationRepository(client);
-      storage = SupabaseStorageService(client);
-      admin = SupabaseAdminRepository(client);
-      await (auth as SupabaseAuthRepository).restore();
-      await (admin as SupabaseAdminRepository).restore();
-    } else {
-      final localAuth = LocalAuthRepository();
-      final localCategories = LocalCategoryRepository();
-      final localAdmin = LocalAdminRepository();
-      auth = localAuth;
-      profiles = LocalProfileRepository();
-      listings = LocalListingRepository();
-      stores = LocalStoreRepository();
-      storeRequests = LocalStoreRequestRepository();
-      categoryRepository = localCategories;
-      likes = LocalLikeRepository();
-      reports = LocalReportRepository();
-      notifications = LocalNotificationRepository();
-      storage = createLocalStorageService();
-      admin = localAdmin;
-      await localCategories.seedDefaults();
-      await localCategories.migrateLegacyReferences();
-      await localAuth.restore();
-      await localAdmin.restore();
+    if (!usesSupabase) {
+      throw StateError(
+        'Supabase configuration is required. Provide SUPABASE_URL and '
+        'SUPABASE_PUBLISHABLE_KEY.',
+      );
     }
-    await refreshCategories();
+    await SupabaseBackend.initialize();
+    final client = SupabaseBackend.client;
+    auth = SupabaseAuthRepository(client);
+    profiles = SupabaseProfileRepository(client);
+    listings = SupabaseListingRepository(client);
+    stores = SupabaseStoreRepository(client);
+    storeRequests = SupabaseStoreRequestRepository(client);
+    categoryRepository = SupabaseCategoryRepository(client);
+    likes = SupabaseLikeRepository(client);
+    reports = SupabaseReportRepository(client);
+    notifications = SupabaseNotificationRepository(client);
+    shortVideos = SupabaseShortVideoRepository(client);
+    advertisements = SupabaseAdvertisementRepository(client);
+    storage = SupabaseStorageService(client);
+    admin = SupabaseAdminRepository(client);
+    await auth.restore();
     final prefs = await SharedPreferences.getInstance();
     deviceId = prefs.getString('local_device_id') ?? const Uuid().v4();
     await prefs.setString('local_device_id', deviceId);
     return true;
+  }
+
+  static Future<void> warmUpAfterFirstFrame() async {
+    if (auth.currentUserId != null) {
+      try {
+        await auth.syncCurrentProfile();
+      } catch (error, stackTrace) {
+        debugPrint('Startup warmup syncCurrentProfile failed: $error');
+        debugPrintStack(stackTrace: stackTrace);
+      }
+      try {
+        await (admin as SupabaseAdminRepository).restore();
+      } catch (error, stackTrace) {
+        debugPrint('Startup warmup admin restore failed: $error');
+        debugPrintStack(stackTrace: stackTrace);
+      }
+    }
+    try {
+      await refreshCategories();
+    } catch (error, stackTrace) {
+      debugPrint('Startup warmup refreshCategories failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    }
+    try {
+      await refreshCities();
+    } catch (error, stackTrace) {
+      debugPrint('Startup warmup refreshCities failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    }
   }
 
   static Future<void> refreshCategories() async {
@@ -89,6 +138,47 @@ class SuikaiService {
       ...await categoryRepository.getByType('listing'),
     ];
   }
+
+  @visibleForTesting
+  static void setCategoriesForTesting(List<CategoryRecord> categories) {
+    _categoryCache = List.of(categories);
+  }
+
+  static Future<void> refreshCities() async {
+    final rows = await SupabaseBackend.client
+        .from('cities')
+        .select('id,name,name_th,name_shn,name_en,name_my,is_active')
+        .eq('is_active', true)
+        .order('name');
+    _cityCache = rows
+        .map((row) => CityRecord.fromJson(Map<String, dynamic>.from(row)))
+        .toList();
+  }
+
+  static List<CityRecord> get activeCities => List.unmodifiable(_cityCache);
+
+  @visibleForTesting
+  static void setCitiesForTesting(List<CityRecord> cities) {
+    _cityCache = List.of(cities);
+  }
+
+  static Future<List<AdvertisementRecord>> fetchActiveAdvertisements() =>
+      advertisements.active();
+  static Future<List<AdvertisementRecord>> fetchAllAdvertisements() =>
+      advertisements.all();
+  static Future<void> saveAdvertisement(
+    AdvertisementRecord value, {
+    required bool create,
+  }) => create ? advertisements.create(value) : advertisements.update(value);
+  static Future<void> deleteAdvertisement(String id) =>
+      advertisements.delete(id);
+  static Future<String> uploadAdvertisementImage(SelectedImage image) =>
+      storage.persistImage(
+        image.file.path,
+        image.extension,
+        bucket: 'banner-images',
+        objectPrefix: 'banners/${currentUserId ?? 'admin'}',
+      );
 
   static List<CategoryRecord> categoryRecords(
     String type, {
@@ -155,15 +245,46 @@ class SuikaiService {
     required String phone,
     required String email,
     required String password,
-  }) =>
-      auth.register(name: name, phone: phone, email: email, password: password);
+    required String city,
+  }) => auth.register(
+    name: name,
+    phone: phone,
+    email: email,
+    password: password,
+    city: city.trim(),
+  );
   static Future<UserProfile> login(String email, String password) =>
       auth.login(email, password);
+  static Future<void> loginWithTelegram() => auth.loginWithTelegram();
   static Future<void> logout() => auth.logout();
   static Future<UserProfile?> currentProfile() =>
       currentUserId == null ? Future.value(null) : profiles.get(currentUserId!);
   static Future<void> updateProfile(UserProfile profile) =>
       profiles.save(profile);
+
+  static Future<List<ShortVideoRecord>> fetchActiveShortVideos() =>
+      shortVideos.active();
+
+  static Future<List<ShortVideoRecord>> fetchAllShortVideos() {
+    if (!admin.isAuthenticated) throw StateError('admin_required');
+    return shortVideos.all();
+  }
+
+  static Future<void> saveShortVideo(
+    ShortVideoRecord value, {
+    required bool create,
+  }) {
+    if (!admin.isAuthenticated) throw StateError('admin_required');
+    if (!ShortVideoRecord.isValidTikTokUrl(value.tiktokUrl)) {
+      throw const FormatException('invalid_tiktok_url');
+    }
+    return create ? shortVideos.create(value) : shortVideos.update(value);
+  }
+
+  static Future<void> deleteShortVideo(String id) {
+    if (!admin.isAuthenticated) throw StateError('admin_required');
+    return shortVideos.delete(id);
+  }
 
   static Future<bool> shareProductImage({
     required String imageSource,
@@ -220,6 +341,29 @@ class SuikaiService {
     return SelectedImage(file: picked, bytes: bytes);
   }
 
+  static Future<List<SelectedImage>> pickImages({required int maxCount}) async {
+    if (maxCount < 1) return const [];
+    final picked = await _picker.pickMultiImage(
+      imageQuality: 80,
+      limit: maxCount,
+    );
+    final selected = <SelectedImage>[];
+    for (final file in picked.take(maxCount)) {
+      final ext = file.name.contains('.')
+          ? file.name.split('.').last.toLowerCase()
+          : '';
+      if (!const {'jpg', 'jpeg', 'png', 'webp'}.contains(ext)) {
+        throw const FormatException('รองรับเฉพาะ JPG, PNG และ WebP');
+      }
+      final bytes = await file.readAsBytes();
+      if (bytes.lengthInBytes > 10 * 1024 * 1024) {
+        throw const FormatException('รูปต้องมีขนาดไม่เกิน 10MB');
+      }
+      selected.add(SelectedImage(file: file, bytes: bytes));
+    }
+    return selected;
+  }
+
   static Future<List<String>> _saveImages(
     List<SelectedImage> values, {
     String? bucket,
@@ -250,6 +394,7 @@ class SuikaiService {
     required String description,
     required String category,
     required String city,
+    String? cityId,
     required String phone,
     required String viber,
     required double price,
@@ -262,37 +407,72 @@ class SuikaiService {
     double? longitude,
     bool isLocationVisible = true,
   }) async {
+    final ownerId = _requireUser();
+    if (title.trim().isEmpty ||
+        category.trim().isEmpty ||
+        city.trim().isEmpty ||
+        price < 0) {
+      throw StateError('listing_required_fields_missing');
+    }
+    final normalizedStatus = listingType == 'general'
+        ? 'available'
+        : status == 'outOfStock'
+        ? 'out_of_stock'
+        : status;
+    const storeStatuses = {'available', 'out_of_stock', 'deleted'};
+    if (listingType == 'store' && !storeStatuses.contains(normalizedStatus)) {
+      throw StateError('invalid_store_product_status');
+    }
+    if (listingType == 'store') {
+      if (storeId == null || storeId.isEmpty) {
+        throw StateError('store_id_required');
+      }
+      final store = (await stores.all())
+          .where((value) => value.id == storeId && value.ownerId == ownerId)
+          .firstOrNull;
+      if (store == null || store.status != 'approved') {
+        throw StateError('store_not_approved');
+      }
+    }
     final now = DateTime.now();
     final id = const Uuid().v4();
     final saved = await _saveImages(
       images,
       bucket: 'listing-images',
-      objectPrefix: usesSupabase
-          ? 'listings/drafts/${_requireUser()}/$id'
-          : 'listings/$id',
+      objectPrefix: 'listings/drafts/${_requireUser()}/$id',
     );
     final value = ListingRecord(
       id: id,
-      ownerId: _requireUser(),
+      ownerId: ownerId,
       storeId: storeId,
       title: title,
       description: description,
       category: category,
       price: price,
       currency: currency,
-      city: city,
-      status: status,
+      city: city.trim(),
+      cityId: cityId,
+      status: normalizedStatus,
       images: saved,
       phone: phone,
       viber: viber,
-      latitude: isLocationVisible ? latitude : null,
-      longitude: isLocationVisible ? longitude : null,
+      latitude: latitude,
+      longitude: longitude,
       isLocationVisible: isLocationVisible,
       createdAt: now,
       updatedAt: now,
     );
-    await listings.create(value);
-    return value.toJson();
+    try {
+      final created = await listings.create(value);
+      return created.toJson();
+    } catch (error, stackTrace) {
+      debugPrint(
+        'Create listing failed: $error\n'
+        'owner_id=$ownerId store_id=$storeId listing_type=$listingType\n'
+        '$stackTrace',
+      );
+      rethrow;
+    }
   }
 
   static Future<void> updateListing({
@@ -300,6 +480,7 @@ class SuikaiService {
     required String title,
     required String description,
     required String city,
+    String? cityId,
     required String phone,
     required String viber,
     required double price,
@@ -312,9 +493,29 @@ class SuikaiService {
     double? longitude,
     bool? isLocationVisible,
   }) async {
+    if (city.trim().isEmpty) throw StateError('listing_city_required');
     final all = await listings.all();
     final old = all.where((e) => e.id == listingId).firstOrNull;
     if (old == null) throw StateError('not_found');
+    if (old.ownerId != _requireUser()) throw StateError('not_owner');
+    if (old.storeId != null) {
+      final store = (await stores.all())
+          .where(
+            (value) =>
+                value.id == old.storeId && value.ownerId == currentUserId,
+          )
+          .firstOrNull;
+      if (store == null || store.status != 'approved') {
+        throw StateError('store_not_approved');
+      }
+    }
+    final normalizedStatus = status == 'outOfStock' ? 'out_of_stock' : status;
+    final allowedStatuses = old.storeId == null
+        ? const {'available', 'reserved', 'sold'}
+        : const {'available', 'out_of_stock', 'deleted'};
+    if (!allowedStatuses.contains(normalizedStatus)) {
+      throw StateError('invalid_listing_status');
+    }
     final extra = await _saveImages(
       newImages,
       bucket: 'listing-images',
@@ -331,7 +532,9 @@ class SuikaiService {
         price: price,
         currency: currency,
         city: city,
-        status: status,
+        cityId: cityId ?? old.cityId,
+        cityRecord: old.cityRecord,
+        status: normalizedStatus,
         images: images == null
             ? [...old.images, ...extra]
             : [...images, ...extra],
@@ -341,12 +544,8 @@ class SuikaiService {
         updatedAt: DateTime.now(),
         likes: old.likes,
         views: old.views,
-        latitude: (isLocationVisible ?? old.isLocationVisible)
-            ? (latitude ?? old.latitude)
-            : null,
-        longitude: (isLocationVisible ?? old.isLocationVisible)
-            ? (longitude ?? old.longitude)
-            : null,
+        latitude: latitude ?? old.latitude,
+        longitude: longitude ?? old.longitude,
         isLocationVisible: isLocationVisible ?? old.isLocationVisible,
       ),
     );
@@ -369,6 +568,7 @@ class SuikaiService {
     required String description,
     required String category,
     required String city,
+    String? cityId,
     required String phone,
     required String viber,
     required String hours,
@@ -378,13 +578,14 @@ class SuikaiService {
     double? latitude,
     double? longitude,
   }) async {
+    if (city.trim().isEmpty) throw StateError('store_city_required');
     final id = const Uuid().v4();
     final ownerId = _requireUser();
     final logoPath = await storage.persistImage(
       logo.file.path,
       logo.extension,
       bucket: 'store-images',
-      objectPrefix: usesSupabase ? 'stores/drafts/$ownerId/$id' : 'stores/$id',
+      objectPrefix: 'stores/drafts/$ownerId/$id',
     );
     final coverPath = cover == null
         ? ''
@@ -392,9 +593,7 @@ class SuikaiService {
             cover.file.path,
             cover.extension,
             bucket: 'store-images',
-            objectPrefix: usesSupabase
-                ? 'stores/drafts/$ownerId/$id'
-                : 'stores/$id',
+            objectPrefix: 'stores/drafts/$ownerId/$id',
           );
     final value = StoreRecord(
       id: id,
@@ -406,10 +605,11 @@ class SuikaiService {
       category: category,
       phone: phone,
       viber: viber,
-      city: city,
+      city: city.trim(),
+      cityId: cityId,
       location: '$city${latitude == null ? '' : ',$latitude,$longitude'}',
       openingHours: hours,
-      status: usesSupabase ? 'pending' : 'approved',
+      status: 'pending',
       email: email ?? '',
       latitude: latitude,
       longitude: longitude,
@@ -448,6 +648,8 @@ class SuikaiService {
         phone: '${values['phone'] ?? old.phone}',
         viber: '${values['viber_phone'] ?? old.viber}',
         city: '${values['city'] ?? old.city}',
+        cityId: values['city_id']?.toString() ?? old.cityId,
+        cityRecord: old.cityRecord,
         location: '${values['location'] ?? old.location}',
         openingHours:
             values['opening_hours']?.toString() ??
@@ -499,6 +701,12 @@ class SuikaiService {
         createdAt: DateTime.now(),
       ),
     );
+    final store = (await stores.all())
+        .where((value) => value.id == storeId)
+        .firstOrNull;
+    if (store?.status == 'rejected') {
+      await storeRequests.resubmitRejected(storeId);
+    }
   }
 
   static Future<void> submitPromotionRequest(String storeId) =>
@@ -515,7 +723,13 @@ class SuikaiService {
       stores.delete(id, _requireUser());
   static Future<List<Map<String, dynamic>>> fetchStores() async =>
       (await stores.all())
-          .where((e) => e.status == 'approved')
+          .where(
+            (e) =>
+                e.status == 'approved' &&
+                e.lifecycleStatus == 'active' &&
+                !e.isHidden &&
+                e.deletedAt == null,
+          )
           .map((e) => e.toJson())
           .toList();
   static Future<List<Map<String, dynamic>>> fetchMyStores() async =>
@@ -540,6 +754,20 @@ class SuikaiService {
       )
       .map(_listingMap)
       .toList();
+  static Future<List<Map<String, dynamic>>> fetchMapListings() async =>
+      (await listings.all())
+          .where(
+            (e) =>
+                e.latitude != null &&
+                e.longitude != null &&
+                e.isLocationVisible &&
+                e.isPublished &&
+                !e.isHidden &&
+                e.deletedAt == null &&
+                (e.status == 'available' || e.status == 'reserved'),
+          )
+          .map(_listingMap)
+          .toList();
   static Map<String, dynamic> _listingMap(ListingRecord e) => {
     ...e.toJson(),
     'listing_images': [
@@ -548,27 +776,14 @@ class SuikaiService {
     'listing_stats': {'like_count': e.likes, 'view_count': e.views},
   };
   static Future<void> likeListing(String id) async {
-    if (!await likes.like(id, deviceId)) return;
-    if (usesSupabase) return;
-    await _bump(id, like: true);
+    await likes.like(id, deviceId);
   }
 
   static Future<void> trackView(String id) async {
-    if (!await likes.view(id, deviceId)) return;
-    if (usesSupabase) return;
-    await _bump(id, like: false);
+    await likes.view(id, deviceId);
   }
 
   static Future<Set<String>> fetchLikedIds() => likes.likedIds(deviceId);
-  static Future<void> _bump(String id, {required bool like}) async {
-    final old = (await listings.all()).where((e) => e.id == id).firstOrNull;
-    if (old == null) return;
-    await LocalDatabase.listings.put(id, {
-      ...old.toJson(),
-      'likes': old.likes + (like ? 1 : 0),
-      'views': old.views + (like ? 0 : 1),
-    });
-  }
 
   static Future<void> submitReport({
     required String reason,
@@ -591,19 +806,41 @@ class SuikaiService {
   static Future<void> markNotificationRead(String id) =>
       isLoggedIn ? notifications.markRead(id) : Future.value();
   static Future<Position?> getCurrentPosition({bool request = true}) async {
-    if (!await Geolocator.isLocationServiceEnabled()) return null;
-    var p = await Geolocator.checkPermission();
-    if (request && p == LocationPermission.denied) {
-      p = await Geolocator.requestPermission();
+    try {
+      if (kIsWeb &&
+          Uri.base.scheme != 'https' &&
+          Uri.base.host != 'localhost' &&
+          Uri.base.host != '127.0.0.1') {
+        throw const LocationFailure(LocationFailureReason.insecureContext);
+      }
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        throw const LocationFailure(LocationFailureReason.serviceDisabled);
+      }
+      var permission = await Geolocator.checkPermission();
+      if (request && permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.deniedForever) {
+        throw const LocationFailure(
+          LocationFailureReason.permissionDeniedForever,
+        );
+      }
+      if (permission == LocationPermission.denied) {
+        throw const LocationFailure(LocationFailureReason.permissionDenied);
+      }
+      return await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          timeLimit: Duration(seconds: 15),
+        ),
+      );
+    } on LocationFailure catch (error, stackTrace) {
+      debugPrint('Current location failed: $error\n$stackTrace');
+      rethrow;
+    } catch (error, stackTrace) {
+      debugPrint('Current location unavailable: $error\n$stackTrace');
+      throw LocationFailure(LocationFailureReason.unavailable, error);
     }
-    if (p == LocationPermission.denied || p == LocationPermission.deniedForever)
-      return null;
-    return Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.medium,
-        timeLimit: Duration(seconds: 12),
-      ),
-    );
   }
 
   static double distanceKm(

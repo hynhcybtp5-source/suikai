@@ -69,6 +69,14 @@ void main() {
           'listing',
           activeOnly: true,
         );
+        final cityRows = await client
+            .from('cities')
+            .select('id,name')
+            .eq('is_active', true)
+            .limit(1);
+        expect(cityRows, isNotEmpty);
+        final cityId = '${cityRows.first['id']}';
+        final cityName = '${cityRows.first['name']}';
         expect(storeCategories.length, 15);
         expect(listingCategories.length, 8);
         await expectLater(
@@ -128,6 +136,7 @@ void main() {
             phone: ownerProfile.phone,
             email: ownerProfile.email,
             avatar: profileImageUrl,
+            city: ownerProfile.city,
             createdAt: ownerProfile.createdAt,
           ),
         );
@@ -155,7 +164,8 @@ void main() {
             category: storeCategories.first.id,
             phone: '0900000000',
             viber: '0900000000',
-            city: 'Taunggyi',
+            city: cityName,
+            cityId: cityId,
             location: 'Staging',
             openingHours: '09:00 - 18:00',
             status: 'pending',
@@ -191,7 +201,8 @@ void main() {
           category: listingCategories.last.id,
           price: 100,
           currency: 'MMK',
-          city: 'Taunggyi',
+          city: cityName,
+          cityId: cityId,
           status: 'available',
           images: [firstListingImageUrl, secondListingImageUrl],
           phone: '0900000000',
@@ -215,7 +226,11 @@ void main() {
           password: password,
         );
         expect(await client.rpc('is_active_admin'), isTrue);
-        expect((await client.from('profiles').select()).length, 4);
+        final adminProfiles = await client.from('profiles').select('id');
+        expect(
+          adminProfiles.map((row) => '${row['id']}'),
+          containsAll(ids.values),
+        );
         await expectLater(
           client
               .from('admin_roles')

@@ -1,5 +1,11 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
 import '../../core/theme/app_theme.dart';
+import '../../data/supabase_repositories.dart';
 import '../../services/suikai_service.dart';
 import '../../data/models.dart';
 import '../../l10n/app_localizations.dart';
@@ -12,11 +18,86 @@ class LoginPage extends StatefulWidget {
   State<LoginPage> createState() => _LoginPageState();
 }
 
-class _LoginPageState extends State<LoginPage> {
+class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
   final email = TextEditingController(), password = TextEditingController();
   bool busy = false;
+  bool telegramBusy = false;
+  bool _didNavigate = false;
+  AuthChangeEvent? _lastAuthEvent;
+  bool? _lastSessionWasNull;
+  StreamSubscription<AuthState>? _authSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _authSubscription = SupabaseBackend.client.auth.onAuthStateChange.listen(
+      (data) {
+        _lastAuthEvent = data.event;
+        _lastSessionWasNull = data.session == null;
+        if (kDebugMode) {
+          debugPrint('AUTH EVENT=${data.event}');
+          debugPrint('SESSION NULL=${data.session == null}');
+          debugPrint(
+            'CURRENT SESSION NULL=${Supabase.instance.client.auth.currentSession == null}',
+          );
+        }
+        if (data.event == AuthChangeEvent.signedIn &&
+            data.session != null &&
+            mounted) {
+          unawaited(_completeLoginFromAuthCallback());
+        }
+      },
+      onError: (error, stackTrace) {
+        if (kDebugMode) {
+          debugPrint('Auth state error: $error');
+          debugPrintStack(stackTrace: stackTrace);
+        }
+      },
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+  try {
+    if (kIsWeb && Uri.base.queryParameters['code'] != null) {
+      await SuikaiService.auth.completeTelegramWebLogin();
+    }
+
+    if (SuikaiService.hasValidSession && mounted) {
+      await _completeLoginFromAuthCallback();
+    }
+  } catch (error, stackTrace) {
+    if (kDebugMode) {
+      debugPrint('Telegram callback failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    }
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            AppLocalizations.of(context).ui('telegramLoginFailed'),
+          ),
+        ),
+      );
+    }
+  }
+});
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed || !kDebugMode) return;
+    debugPrint('CALLBACK APP RESUMED');
+    debugPrint('AUTH EVENT=${_lastAuthEvent ?? 'none'}');
+    debugPrint('SESSION NULL=${_lastSessionWasNull ?? true}');
+    debugPrint(
+      'CURRENT SESSION NULL=${Supabase.instance.client.auth.currentSession == null}',
+    );
+  }
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _authSubscription?.cancel();
     email.dispose();
     password.dispose();
     super.dispose();
@@ -26,7 +107,7 @@ class _LoginPageState extends State<LoginPage> {
     setState(() => busy = true);
     try {
       await SuikaiService.login(email.text, password.text);
-      if (mounted) Navigator.pushReplacementNamed(context, widget.pendingRoute);
+      await _completeLoginFromAuthCallback();
     } catch (_) {
       if (mounted)
         ScaffoldMessenger.of(context).showSnackBar(
@@ -39,6 +120,73 @@ class _LoginPageState extends State<LoginPage> {
     } finally {
       if (mounted) setState(() => busy = false);
     }
+  }
+
+  Future<void> _loginWithTelegram() async {
+    setState(() {
+      busy = true;
+      telegramBusy = true;
+    });
+    try {
+      await SuikaiService.loginWithTelegram();
+    } catch (error, stackTrace) {
+      if (kDebugMode) {
+        debugPrint('Telegram login failed: $error');
+        debugPrintStack(stackTrace: stackTrace);
+      }
+      if (!mounted) return;
+      final message = _isCancellationError(error)
+          ? AppLocalizations.of(context).ui('telegramLoginCancelled')
+          : AppLocalizations.of(context).ui('telegramLoginFailed');
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    } finally {
+      if (mounted) {
+        setState(() {
+          busy = false;
+          telegramBusy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _completeLoginFromAuthCallback() async {
+    final session = Supabase.instance.client.auth.currentSession;
+    if (_didNavigate || !mounted || session == null) return;
+    _didNavigate = true;
+    try {
+      if (kDebugMode) {
+        debugPrint(
+          'Completing login callback: currentSessionIsNull=${session == null} lastAuthEvent=${_lastAuthEvent ?? 'none'}',
+        );
+      }
+      await SuikaiService.auth.syncCurrentProfile();
+      await SuikaiService.currentProfile();
+      if (mounted) {
+        Navigator.pushReplacementNamed(context, widget.pendingRoute);
+      }
+    } catch (error, stackTrace) {
+      _didNavigate = false;
+      if (kDebugMode) {
+        debugPrint('Profile sync after Telegram login failed: $error');
+        debugPrintStack(stackTrace: stackTrace);
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              AppLocalizations.of(context).ui('telegramProfileSyncFailed'),
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  bool _isCancellationError(Object error) {
+    final message = error.toString().toLowerCase();
+    return message.contains('cancel') ||
+        message.contains('aborted') ||
+        message.contains('closed by user');
   }
 
   void _goBack() {
@@ -80,7 +228,25 @@ class _LoginPageState extends State<LoginPage> {
           const SizedBox(height: 20),
           ElevatedButton(
             onPressed: busy ? null : login,
-            child: Text(busy ? l10n.ui('loggingIn') : l10n.ui('login')),
+            child: Text(
+              busy && !telegramBusy ? l10n.ui('loggingIn') : l10n.ui('login'),
+            ),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            onPressed: busy ? null : _loginWithTelegram,
+            icon: telegramBusy
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.send_rounded),
+            label: Text(
+              telegramBusy
+                  ? l10n.ui('openingTelegram')
+                  : l10n.ui('loginWithTelegram'),
+            ),
           ),
           TextButton(
             onPressed: () => Navigator.push(
@@ -107,16 +273,27 @@ class RegisterPage extends StatefulWidget {
 class _RegisterPageState extends State<RegisterPage> {
   final name = TextEditingController(),
       phone = TextEditingController(),
+      city = TextEditingController(),
       email = TextEditingController(),
       password = TextEditingController();
   bool busy = false;
   @override
   void dispose() {
-    for (final c in [name, phone, email, password]) c.dispose();
+    for (final c in [name, phone, city, email, password]) c.dispose();
     super.dispose();
   }
 
   Future<void> register() async {
+    if (city.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            AppLocalizations.of(context).source('กรุณากรอกชื่อเมือง'),
+          ),
+        ),
+      );
+      return;
+    }
     if (name.text.trim().isEmpty ||
         email.text.trim().isEmpty ||
         password.text.length < 6) {
@@ -136,6 +313,7 @@ class _RegisterPageState extends State<RegisterPage> {
         phone: phone.text,
         email: email.text,
         password: password.text,
+        city: city.text.trim(),
       );
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -159,6 +337,34 @@ class _RegisterPageState extends State<RegisterPage> {
     }
   }
 
+  Future<void> _loginWithTelegram() async {
+    setState(() => busy = true);
+    try {
+      await SuikaiService.loginWithTelegram();
+    } catch (error, stackTrace) {
+      if (kDebugMode) {
+        debugPrint('Telegram login failed: $error');
+        debugPrintStack(stackTrace: stackTrace);
+      }
+      if (!mounted) return;
+      final message = _isCancellationError(error)
+          ? AppLocalizations.of(context).ui('telegramLoginCancelled')
+          : AppLocalizations.of(context).ui('telegramLoginFailed');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message)),
+      );
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  bool _isCancellationError(Object error) {
+    final message = error.toString().toLowerCase();
+    return message.contains('cancel') ||
+        message.contains('aborted') ||
+        message.contains('closed by user');
+  }
+
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context);
@@ -179,6 +385,14 @@ class _RegisterPageState extends State<RegisterPage> {
           ),
           const SizedBox(height: 12),
           TextField(
+            controller: city,
+            decoration: InputDecoration(
+              labelText: l10n.source('เมือง'),
+              hintText: l10n.source('กรอกชื่อเมือง'),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
             controller: email,
             keyboardType: TextInputType.emailAddress,
             decoration: InputDecoration(labelText: l10n.ui('email')),
@@ -193,6 +407,20 @@ class _RegisterPageState extends State<RegisterPage> {
           ElevatedButton(
             onPressed: busy ? null : register,
             child: Text(busy ? l10n.ui('registering') : l10n.ui('register')),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            onPressed: busy ? null : _loginWithTelegram,
+            icon: busy
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.send_rounded),
+            label: Text(
+              busy ? l10n.ui('openingTelegram') : l10n.ui('registerWithTelegram'),
+            ),
           ),
         ],
       ),
@@ -259,6 +487,8 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
         phone: phone.text.trim(),
         email: email.text.trim(),
         avatar: avatar,
+        city: p.city,
+        cityId: p.cityId,
         createdAt: p.createdAt,
       ),
     );
@@ -328,14 +558,6 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
           ),
           const SizedBox(height: 20),
           ElevatedButton(onPressed: save, child: Text(l10n.save)),
-          OutlinedButton(
-            onPressed: () async {
-              await SuikaiService.logout();
-              if (mounted)
-                Navigator.pushNamedAndRemoveUntil(context, '/', (_) => false);
-            },
-            child: Text(l10n.ui('logout')),
-          ),
         ],
       ),
     );

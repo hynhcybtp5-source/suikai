@@ -1,5 +1,6 @@
 class UserProfile {
-  final String id, name, phone, email, avatar;
+  final String id, name, phone, email, avatar, city;
+  final String? cityId;
   final DateTime createdAt;
   const UserProfile({
     required this.id,
@@ -7,6 +8,8 @@ class UserProfile {
     required this.phone,
     required this.email,
     this.avatar = '',
+    this.city = '',
+    this.cityId,
     required this.createdAt,
   });
   Map<String, dynamic> toJson() => {
@@ -15,6 +18,8 @@ class UserProfile {
     'phone': phone,
     'email': email,
     'avatar': avatar,
+    'city': city,
+    'city_id': cityId,
     'created_at': createdAt.toIso8601String(),
   };
   factory UserProfile.fromJson(Map<String, dynamic> j) => UserProfile(
@@ -23,12 +28,14 @@ class UserProfile {
     phone: '${j['phone'] ?? ''}',
     email: '${j['email'] ?? ''}',
     avatar: '${j['avatar'] ?? ''}',
+    city: '${j['city'] ?? ''}',
+    cityId: j['city_id']?.toString(),
     createdAt: DateTime.tryParse('${j['created_at']}') ?? DateTime.now(),
   );
 }
 
 class CategoryRecord {
-  final String id, type, nameTh, nameShn, nameEn, nameMy;
+  final String id, type, nameTh, nameShn, nameEn, nameMy, iconKey;
   final bool isActive;
   final int sortOrder;
   const CategoryRecord({
@@ -38,6 +45,7 @@ class CategoryRecord {
     required this.nameShn,
     required this.nameEn,
     required this.nameMy,
+    this.iconKey = 'category',
     this.isActive = true,
     required this.sortOrder,
   });
@@ -63,6 +71,7 @@ class CategoryRecord {
     'name_shn': nameShn,
     'name_en': nameEn,
     'name_my': nameMy,
+    'icon_key': iconKey,
     'is_active': isActive,
     'sort_order': sortOrder,
   };
@@ -74,8 +83,66 @@ class CategoryRecord {
     nameShn: '${json['name_shn'] ?? ''}',
     nameEn: '${json['name_en'] ?? ''}',
     nameMy: '${json['name_my'] ?? ''}',
+    iconKey: '${json['icon_key'] ?? ''}'.trim().isEmpty
+        ? 'category'
+        : '${json['icon_key']}'.trim(),
     isActive: json['is_active'] != false,
     sortOrder: (json['sort_order'] as num?)?.toInt() ?? 0,
+  );
+}
+
+class CityRecord {
+  final String id, name, nameTh, nameShn, nameEn, nameMy;
+  final bool isActive;
+  final double? latitude, longitude;
+
+  const CityRecord({
+    required this.id,
+    required this.name,
+    this.nameTh = '',
+    this.nameShn = '',
+    this.nameEn = '',
+    this.nameMy = '',
+    this.isActive = true,
+    this.latitude,
+    this.longitude,
+  });
+
+  String localizedName(String localeCode) {
+    final translated = switch (localeCode) {
+      'th' => nameTh,
+      'shn' => nameShn,
+      'my' => nameMy,
+      'en' => nameEn,
+      _ => '',
+    };
+    if (translated.trim().isNotEmpty) return translated.trim();
+    if (nameEn.trim().isNotEmpty) return nameEn.trim();
+    return name.trim();
+  }
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'name_th': nameTh,
+    'name_shn': nameShn,
+    'name_en': nameEn,
+    'name_my': nameMy,
+    'is_active': isActive,
+    'latitude': latitude,
+    'longitude': longitude,
+  };
+
+  factory CityRecord.fromJson(Map<String, dynamic> json) => CityRecord(
+    id: '${json['id']}',
+    name: '${json['name'] ?? ''}',
+    nameTh: '${json['name_th'] ?? ''}',
+    nameShn: '${json['name_shn'] ?? ''}',
+    nameEn: '${json['name_en'] ?? ''}',
+    nameMy: '${json['name_my'] ?? ''}',
+    isActive: json['is_active'] != false,
+    latitude: (json['latitude'] as num?)?.toDouble(),
+    longitude: (json['longitude'] as num?)?.toDouble(),
   );
 }
 
@@ -90,9 +157,12 @@ class ListingRecord {
       status,
       phone,
       viber;
-  final String? storeId;
+  final String? storeId, cityId;
+  final CityRecord? cityRecord;
   final double? latitude, longitude;
   final bool isLocationVisible;
+  final bool isPublished, isHidden;
+  final DateTime? deletedAt;
   final double price;
   final List<String> images;
   final int likes, views;
@@ -113,9 +183,14 @@ class ListingRecord {
     required this.createdAt,
     required this.updatedAt,
     this.storeId,
+    this.cityId,
+    this.cityRecord,
     this.latitude,
     this.longitude,
     this.isLocationVisible = true,
+    this.isPublished = true,
+    this.isHidden = false,
+    this.deletedAt,
     this.likes = 0,
     this.views = 0,
   });
@@ -129,6 +204,8 @@ class ListingRecord {
     'price': price,
     'currency': currency,
     'city': city,
+    'city_id': cityId,
+    if (cityRecord != null) 'cities': cityRecord!.toJson(),
     'status': status,
     'images': images,
     'phone': phone,
@@ -138,14 +215,20 @@ class ListingRecord {
     'latitude': latitude,
     'longitude': longitude,
     'is_location_visible': isLocationVisible,
+    'is_published': isPublished,
+    'is_hidden': isHidden,
+    'deleted_at': deletedAt?.toIso8601String(),
     'created_at': createdAt.toIso8601String(),
     'updated_at': updatedAt.toIso8601String(),
-    'is_published': true,
   };
   factory ListingRecord.fromJson(Map<String, dynamic> j) => ListingRecord(
     id: '${j['id']}',
     ownerId: '${j['owner_id'] ?? ''}',
     storeId: j['store_id']?.toString(),
+    cityId: j['city_id']?.toString(),
+    cityRecord: j['cities'] is Map
+        ? CityRecord.fromJson(Map<String, dynamic>.from(j['cities'] as Map))
+        : null,
     title: '${j['title'] ?? ''}',
     description: '${j['description'] ?? ''}',
     category: '${j['category'] ?? ''}',
@@ -161,6 +244,9 @@ class ListingRecord {
     latitude: (j['latitude'] as num?)?.toDouble(),
     longitude: (j['longitude'] as num?)?.toDouble(),
     isLocationVisible: j['is_location_visible'] != false,
+    isPublished: j['is_published'] == true,
+    isHidden: j['is_hidden'] == true,
+    deletedAt: DateTime.tryParse('${j['deleted_at']}'),
     createdAt: DateTime.tryParse('${j['created_at']}') ?? DateTime.now(),
     updatedAt: DateTime.tryParse('${j['updated_at']}') ?? DateTime.now(),
   );
@@ -181,9 +267,14 @@ class StoreRecord {
       openingHours,
       status;
   final String email;
+  final String? cityId;
+  final CityRecord? cityRecord;
   final double? latitude, longitude;
   final DateTime createdAt;
   final bool isPromoted;
+  final String lifecycleStatus;
+  final bool isHidden;
+  final DateTime? deletedAt;
   final DateTime? promotionStartAt, promotionEndAt;
   const StoreRecord({
     required this.id,
@@ -200,10 +291,15 @@ class StoreRecord {
     required this.openingHours,
     required this.status,
     this.email = '',
+    this.cityId,
+    this.cityRecord,
     this.latitude,
     this.longitude,
     required this.createdAt,
     this.isPromoted = false,
+    this.lifecycleStatus = 'active',
+    this.isHidden = false,
+    this.deletedAt,
     this.promotionStartAt,
     this.promotionEndAt,
   });
@@ -218,6 +314,8 @@ class StoreRecord {
     'phone': phone,
     'viber_phone': viber,
     'city': city,
+    'city_id': cityId,
+    if (cityRecord != null) 'cities': cityRecord!.toJson(),
     'location': location,
     'opening_hours': openingHours,
     'opening_time': openingHours.split('-').first.trim(),
@@ -228,6 +326,9 @@ class StoreRecord {
     'longitude': longitude,
     'created_at': createdAt.toIso8601String(),
     'is_promoted': isPromoted,
+    'lifecycle_status': lifecycleStatus,
+    'is_hidden': isHidden,
+    'deleted_at': deletedAt?.toIso8601String(),
     'promotion_start_at': promotionStartAt?.toIso8601String(),
     'promotion_end_at': promotionEndAt?.toIso8601String(),
   };
@@ -242,6 +343,10 @@ class StoreRecord {
     phone: '${j['phone'] ?? ''}',
     viber: '${j['viber_phone'] ?? ''}',
     city: '${j['city'] ?? ''}',
+    cityId: j['city_id']?.toString(),
+    cityRecord: j['cities'] is Map
+        ? CityRecord.fromJson(Map<String, dynamic>.from(j['cities'] as Map))
+        : null,
     location: '${j['location'] ?? ''}',
     openingHours:
         '${j['opening_hours'] ?? '${j['opening_time'] ?? ''}-${j['closing_time'] ?? ''}'}',
@@ -251,6 +356,9 @@ class StoreRecord {
     longitude: (j['longitude'] as num?)?.toDouble(),
     createdAt: DateTime.tryParse('${j['created_at']}') ?? DateTime.now(),
     isPromoted: j['is_promoted'] == true,
+    lifecycleStatus: '${j['lifecycle_status'] ?? ''}',
+    isHidden: j['is_hidden'] == true,
+    deletedAt: DateTime.tryParse('${j['deleted_at']}'),
     promotionStartAt: DateTime.tryParse('${j['promotion_start_at']}'),
     promotionEndAt: DateTime.tryParse('${j['promotion_end_at']}'),
   );
@@ -358,5 +466,119 @@ class NotificationRecord {
     'is_read': isRead,
     'created_at': createdAt.toIso8601String(),
     'read_at': readAt?.toIso8601String(),
+  };
+}
+
+class AdvertisementRecord {
+  final String id, title, imageUrl, targetType;
+  final String? targetId, externalUrl;
+  final DateTime? startAt, endAt;
+  final int displayOrder;
+  final bool isActive;
+  final DateTime createdAt, updatedAt;
+
+  const AdvertisementRecord({
+    required this.id,
+    required this.title,
+    required this.imageUrl,
+    required this.targetType,
+    this.targetId,
+    this.externalUrl,
+    this.startAt,
+    this.endAt,
+    this.displayOrder = 0,
+    this.isActive = true,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  bool get isCurrentlyVisible {
+    final now = DateTime.now().toUtc();
+    return isActive &&
+        (startAt == null || !now.isBefore(startAt!.toUtc())) &&
+        (endAt == null || !now.isAfter(endAt!.toUtc()));
+  }
+
+  factory AdvertisementRecord.fromJson(Map<String, dynamic> json) =>
+      AdvertisementRecord(
+        id: '${json['id']}',
+        title: '${json['title'] ?? ''}',
+        imageUrl: '${json['image_url'] ?? ''}',
+        targetType: '${json['target_type'] ?? 'external'}',
+        targetId: json['target_id']?.toString(),
+        externalUrl: (json['external_url'] ?? json['target_url'])?.toString(),
+        startAt: DateTime.tryParse('${json['start_at']}'),
+        endAt: DateTime.tryParse('${json['end_at']}'),
+        displayOrder:
+            (json['display_order'] as num?)?.toInt() ??
+            (json['sort_order'] as num?)?.toInt() ??
+            0,
+        isActive: json['is_active'] ?? json['active'] ?? true,
+        createdAt: DateTime.tryParse('${json['created_at']}') ?? DateTime.now(),
+        updatedAt: DateTime.tryParse('${json['updated_at']}') ?? DateTime.now(),
+      );
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'title': title,
+    'image_url': imageUrl,
+    'target_type': targetType,
+    'target_id': targetId,
+    'external_url': externalUrl,
+    'start_at': startAt?.toUtc().toIso8601String(),
+    'end_at': endAt?.toUtc().toIso8601String(),
+    'display_order': displayOrder,
+    'is_active': isActive,
+    'created_at': createdAt.toUtc().toIso8601String(),
+    'updated_at': updatedAt.toUtc().toIso8601String(),
+  };
+}
+
+class ShortVideoRecord {
+  final String id, tiktokUrl, title;
+  final int sortOrder;
+  final bool isActive;
+  final String? createdBy;
+  final DateTime createdAt, updatedAt;
+
+  const ShortVideoRecord({
+    required this.id,
+    required this.tiktokUrl,
+    this.title = '',
+    this.sortOrder = 0,
+    this.isActive = true,
+    this.createdBy,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  static bool isValidTikTokUrl(String value) {
+    final uri = Uri.tryParse(value.trim());
+    final host = uri?.host.toLowerCase() ?? '';
+    return uri?.scheme == 'https' &&
+        (host == 'tiktok.com' || host.endsWith('.tiktok.com'));
+  }
+
+  factory ShortVideoRecord.fromJson(Map<String, dynamic> json) =>
+      ShortVideoRecord(
+        id: '${json['id']}',
+        tiktokUrl: '${json['tiktok_url'] ?? ''}',
+        title: '${json['title'] ?? ''}',
+        sortOrder: (json['sort_order'] as num?)?.toInt() ?? 0,
+        isActive: json['is_active'] == true,
+        createdBy: json['created_by']?.toString(),
+        createdAt: DateTime.tryParse('${json['created_at']}') ?? DateTime.now(),
+        updatedAt: DateTime.tryParse('${json['updated_at']}') ?? DateTime.now(),
+      );
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'tiktok_url': tiktokUrl,
+    'title': title,
+    'sort_order': sortOrder,
+    'is_active': isActive,
+    'created_by': createdBy,
+    'created_at': createdAt.toIso8601String(),
+    'updated_at': updatedAt.toIso8601String(),
   };
 }

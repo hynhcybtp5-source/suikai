@@ -1,0 +1,384 @@
+import "@supabase/functions-js/edge-runtime.d.ts";
+import { withSupabase } from "@supabase/server";
+
+type TelegramTokenResponse = {
+  access_token?: string;
+  token_type?: string;
+  expires_in?: number;
+  id_token?: string;
+  error?: string;
+  error_description?: string;
+};
+
+type JwtHeader = {
+  alg?: string;
+  kid?: string;
+};
+
+type TelegramClaims = {
+  iss?: string;
+  aud?: string | number | string[];
+  sub?: string;
+  exp?: number;
+  iat?: number;
+  id?: number | string;
+  name?: string;
+  preferred_username?: string;
+  picture?: string;
+  phone_number?: string;
+};
+
+function jsonResponse(body: unknown, status = 200) {
+  return Response.json(body, {
+    status,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+    },
+  });
+}
+
+function base64UrlToBytes(value: string): Uint8Array {
+  const padded = value
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .padEnd(Math.ceil(value.length / 4) * 4, "=");
+
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+
+  return bytes;
+}
+
+function decodeJwtPart<T>(value: string): T {
+  const bytes = base64UrlToBytes(value);
+  return JSON.parse(new TextDecoder().decode(bytes)) as T;
+}
+
+async function verifyTelegramIdToken(
+  idToken: string,
+  expectedClientId: string,
+): Promise<TelegramClaims> {
+  const parts = idToken.split(".");
+
+  if (parts.length !== 3) {
+    throw new Error("Invalid Telegram ID token");
+  }
+
+  const header = decodeJwtPart<JwtHeader>(parts[0]);
+  const claims = decodeJwtPart<TelegramClaims>(parts[1]);
+
+  if (header.alg !== "RS256") {
+    throw new Error(`Unsupported Telegram signing algorithm: ${header.alg}`);
+  }
+
+  if (!header.kid) {
+    throw new Error("Telegram ID token has no kid");
+  }
+
+  const jwksResponse = await fetch(
+    "https://oauth.telegram.org/.well-known/jwks.json",
+  );
+
+  if (!jwksResponse.ok) {
+    throw new Error(`Unable to fetch Telegram JWKS: ${jwksResponse.status}`);
+  }
+
+  const jwks = await jwksResponse.json();
+
+  // สำคัญ: เลือกเฉพาะ RSA key ที่ต้องใช้
+  // ไม่ parse ES256K/secp256k1 ซึ่งเป็นจุดที่ Supabase Auth เดิมล้ม
+  const rsaKey = jwks.keys?.find(
+    (key: Record<string, unknown>) =>
+      key.kty === "RSA" &&
+      key.alg === "RS256" &&
+      key.kid === header.kid,
+  );
+
+  if (!rsaKey) {
+    throw new Error("Telegram RS256 signing key not found");
+  }
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "jwk",
+    rsaKey,
+    {
+      name: "RSASSA-PKCS1-v1_5",
+      hash: "SHA-256",
+    },
+    false,
+    ["verify"],
+  );
+
+  const verified = await crypto.subtle.verify(
+    "RSASSA-PKCS1-v1_5",
+    cryptoKey,
+    base64UrlToBytes(parts[2]),
+    new TextEncoder().encode(`${parts[0]}.${parts[1]}`),
+  );
+
+  if (!verified) {
+    throw new Error("Telegram ID token signature is invalid");
+  }
+
+  if (claims.iss !== "https://oauth.telegram.org") {
+    throw new Error("Invalid Telegram issuer");
+  }
+
+  const audiences = Array.isArray(claims.aud)
+    ? claims.aud.map(String)
+    : [String(claims.aud ?? "")];
+
+  if (!audiences.includes(expectedClientId)) {
+    throw new Error("Invalid Telegram audience");
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+
+  if (!claims.exp || claims.exp <= now) {
+    throw new Error("Telegram ID token expired");
+  }
+
+  if (!claims.sub) {
+    throw new Error("Telegram ID token has no sub");
+  }
+
+  return claims;
+}
+
+export default {
+  fetch: withSupabase(
+    { auth: ["publishable", "secret"] },
+    async (req, ctx) => {
+      if (req.method === "OPTIONS") {
+        return new Response("ok", {
+          headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers":
+              "authorization, x-client-info, apikey, content-type",
+          },
+        });
+      }
+
+      if (req.method !== "POST") {
+        return jsonResponse({ error: "Method not allowed" }, 405);
+      }
+
+      try {
+        const clientId = Deno.env.get("TELEGRAM_CLIENT_ID");
+        const clientSecret = Deno.env.get("TELEGRAM_CLIENT_SECRET");
+
+        if (!clientId || !clientSecret) {
+          throw new Error("Telegram server secrets are not configured");
+        }
+
+        const body = await req.json();
+
+        const code = String(body.code ?? "");
+        const codeVerifier = String(body.code_verifier ?? "");
+        const redirectUri = String(body.redirect_uri ?? "");
+
+        if (!code || !codeVerifier || !redirectUri) {
+          return jsonResponse(
+            {
+              error:
+                "code, code_verifier and redirect_uri are required",
+            },
+            400,
+          );
+        }
+
+        const tokenBody = new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: redirectUri,
+          client_id: clientId,
+          client_secret: clientSecret,
+          code_verifier: codeVerifier,
+        });
+
+        const tokenResponse = await fetch(
+          "https://oauth.telegram.org/token",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: tokenBody,
+          },
+        );
+
+        const tokenData =
+          (await tokenResponse.json()) as TelegramTokenResponse;
+
+        if (!tokenResponse.ok || !tokenData.id_token) {
+          console.error("Telegram token exchange failed", {
+            status: tokenResponse.status,
+            error: tokenData.error,
+            description: tokenData.error_description,
+          });
+
+          return jsonResponse(
+            {
+              error: "telegram_token_exchange_failed",
+              message:
+                tokenData.error_description ??
+                tokenData.error ??
+                "Telegram did not return an ID token",
+            },
+            401,
+          );
+        }
+
+        const claims = await verifyTelegramIdToken(
+          tokenData.id_token,
+          clientId,
+        );
+
+        const telegramId = String(claims.sub);
+        const syntheticEmail =
+          `telegram_${telegramId}@auth.suikai.invalid`;
+
+        const metadata = {
+          provider: "telegram",
+          telegram_id: telegramId,
+          sub: telegramId,
+          name: claims.name ?? null,
+          preferred_username:
+            claims.preferred_username ?? null,
+          avatar_url: claims.picture ?? null,
+          picture: claims.picture ?? null,
+          phone_number: claims.phone_number ?? null,
+          iss: claims.iss,
+        };
+
+        // เช็กก่อนว่า Telegram ID นี้เคยมี profile แล้วหรือยัง
+        const { data: existingProfile, error: profileLookupError } =
+          await ctx.supabaseAdmin
+            .from("profiles")
+            .select("id, telegram_id")
+            .eq("telegram_id", telegramId)
+            .maybeSingle();
+
+        if (profileLookupError) {
+          throw profileLookupError;
+        }
+
+        let authEmail = syntheticEmail;
+
+        if (existingProfile?.id) {
+          const { data: existingAuth, error: authLookupError } =
+            await ctx.supabaseAdmin.auth.admin.getUserById(
+              existingProfile.id,
+            );
+
+          if (authLookupError) {
+            throw authLookupError;
+          }
+
+          if (existingAuth.user?.email) {
+            authEmail = existingAuth.user.email;
+          } else {
+            const { error: updateError } =
+              await ctx.supabaseAdmin.auth.admin.updateUserById(
+                existingProfile.id,
+                {
+                  email: syntheticEmail,
+                  email_confirm: true,
+                  user_metadata: metadata,
+                },
+              );
+
+            if (updateError) {
+              throw updateError;
+            }
+          }
+        } else {
+          const { data: created, error: createError } =
+            await ctx.supabaseAdmin.auth.admin.createUser({
+              email: syntheticEmail,
+              email_confirm: true,
+              user_metadata: metadata,
+            });
+
+          if (createError) {
+            // อาจเคยสร้าง auth user แล้ว แต่ profile ยังไม่มี
+            // ลอง generate magic link ด้วย deterministic email ต่อ
+            if (
+              !String(createError.message)
+                .toLowerCase()
+                .includes("already")
+            ) {
+              throw createError;
+            }
+          }
+
+          if (created?.user?.id) {
+            await ctx.supabaseAdmin
+              .from("profiles")
+              .upsert(
+                {
+                  id: created.user.id,
+                  name: claims.name ?? null,
+                  phone: claims.phone_number ?? null,
+                  email: null,
+                  telegram_id: telegramId,
+                },
+                { onConflict: "id" },
+              );
+          }
+        }
+
+        const { data: linkData, error: linkError } =
+          await ctx.supabaseAdmin.auth.admin.generateLink({
+            type: "magiclink",
+            email: authEmail,
+            options: {
+              data: metadata,
+            },
+          });
+
+        if (linkError) {
+          throw linkError;
+        }
+
+        const tokenHash =
+          linkData?.properties?.hashed_token;
+
+        if (!tokenHash) {
+          throw new Error(
+            "Supabase did not return a magic-link token hash",
+          );
+        }
+
+        return jsonResponse({
+          ok: true,
+          token_hash: tokenHash,
+          telegram: {
+            id: telegramId,
+            name: claims.name ?? null,
+            username: claims.preferred_username ?? null,
+            picture: claims.picture ?? null,
+          },
+        });
+      } catch (error) {
+        console.error("telegram-auth failed", error);
+
+        return jsonResponse(
+          {
+            error: "telegram_auth_failed",
+            message:
+              error instanceof Error
+                ? error.message
+                : String(error),
+          },
+          500,
+        );
+      }
+    },
+  ),
+};

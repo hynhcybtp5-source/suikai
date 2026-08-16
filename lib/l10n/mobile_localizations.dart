@@ -12,6 +12,42 @@ extension MobileLocalizations on AppLocalizations {
         'အကောင့်ဝင်နေသည်...',
         'တိုၵ်ႉၶဝ်ႈဢၶွင်ႉ...',
       ],
+      'loginWithTelegram': [
+        'เข้าสู่ระบบด้วย Telegram',
+        'Continue with Telegram',
+        'Telegram ဖြင့် အကောင့်ဝင်ရန်',
+        'ၶဝ်ႈဢၶွင်ႉၸွမ်း Telegram',
+      ],
+      'registerWithTelegram': [
+        'สมัครด้วย Telegram',
+        'Sign up with Telegram',
+        'Telegram ဖြင့် สมัครရန်',
+        'သၢင်ႈဢၶွင်ႉၸွမ်း Telegram',
+      ],
+      'openingTelegram': [
+        'กำลังเปิด Telegram...',
+        'Opening Telegram...',
+        'Telegram ကို ဖွင့်နေသည်...',
+        'တိုၵ်ႉပိုတ်ႇ Telegram...',
+      ],
+      'telegramLoginCancelled': [
+        'ยกเลิกการเข้าสู่ระบบด้วย Telegram',
+        'Telegram sign-in was cancelled',
+        'Telegram အကောင့်ဝင်မှုကို ပယ်ဖျက်ခဲ့သည်',
+        'ယဵတ်းလိူၵ်ႈၶဝ်ႈဢၶွင်ႉ Telegram',
+      ],
+      'telegramLoginFailed': [
+        'ไม่สามารถเข้าสู่ระบบด้วย Telegram ได้ กรุณาลองใหม่',
+        'Could not sign in with Telegram. Please try again.',
+        'Telegram ဖြင့် အကောင့်မဝင်နိုင်ပါ။ ထပ်စမ်းကြည့်ပါ။',
+        'ၶဝ်ႈဢၶွင်ႉၸွမ်း Telegram ဢမ်ႇလႆႈ၊ လွင်ႈထပ်ၵမ်း',
+      ],
+      'telegramProfileSyncFailed': [
+        'เข้าสู่ระบบแล้ว แต่โหลดโปรไฟล์ไม่สำเร็จ กรุณาลองใหม่',
+        'Signed in, but the profile could not be loaded. Please try again.',
+        'အကောင့်ဝင်ပြီးသော်လည်း ပရိုဖိုင်မတင်နိုင်ပါ။ ထပ်စမ်းကြည့်ပါ။',
+        'ၶဝ်ႈဢၶွင်ႉယဝ်ႉ တႄႇလူတ်ႇပရူဝ်ႇၾၢႆႇဢမ်ႇလႆႈ၊ လွင်ႈထပ်ၵမ်း',
+      ],
       'register': ['สมัครสมาชิก', 'Register', 'အကောင့်ဖွင့်ရန်', 'သၢင်ႈဢၶွင်ႉ'],
       'registering': [
         'กำลังสมัคร...',
@@ -100,6 +136,23 @@ extension MobileLocalizations on AppLocalizations {
     };
     if (core != null) return core;
     const translations = <String, List<String>>{
+      'ไม่ระบุเมือง': [
+        'City not specified',
+        'မြို့ မသတ်မှတ်ထားပါ',
+        'ဢမ်ႇလၢတ်ႈဝဵင်း',
+      ],
+      'เลือกเมือง': ['Select city', 'မြို့ရွေးပါ', 'လိူၵ်ႈဝဵင်း'],
+      'กรุณาเลือกเมือง': [
+        'Please select a city',
+        'ကျေးဇူးပြု၍ မြို့ရွေးပါ',
+        'ၶႅၼ်းတေႃႈလိူၵ်ႈဝဵင်း',
+      ],
+      'กรอกชื่อเมือง': ['Enter city name', 'မြို့အမည်ရေးပါ', 'သႂ်ႇၸိုဝ်ႈဝဵင်း'],
+      'กรุณากรอกชื่อเมือง': [
+        'Please enter a city name',
+        'ကျေးဇူးပြု၍ မြို့အမည်ရေးပါ',
+        'ၶႅၼ်းတေႃႈသႂ်ႇၸိုဝ်ႈဝဵင်း',
+      ],
       'พื้นที่โฆษณา': ['Advertisement', 'ကြော်ငြာနေရာ', 'ပိုၼ်ႉတီႈၵႂၢမ်းၶၢဝ်ႇ'],
       'เพิ่มรูป': ['Add images', 'ပုံထည့်ရန်', 'ထႅမ်ႁၢင်ႈ'],
       'สินค้าของร้าน': ['Store products', 'ဆိုင်ပစ္စည်းများ', 'ၶူဝ်းၼႂ်းလၢၼ်ႉ'],
@@ -110,6 +163,30 @@ extension MobileLocalizations on AppLocalizations {
         'လႅၵ်ႈလၢႆႈၽႃႇသႃႇ',
       ],
       'การแจ้งเตือน': ['Notifications', 'အသိပေးချက်များ', 'ၶေႃႈပၼ်ၾၢင်ႉ'],
+      'ตั้งค่า': ['Settings', 'ဆက်တင်များ', 'ၵၢၼ်တင်ႈ'],
+      'วิดีโอสั้น': ['Short videos', 'ဗီဒီယိုတိုများ', 'ဝီးတီးဢူဝ်းပွတ်း'],
+      'ยังไม่มีวิดีโอสั้น': [
+        'No short videos yet',
+        'ဗီဒီယိုတို မရှိသေးပါ',
+        'ပႆႇမီးဝီးတီးဢူဝ်းပွတ်း',
+      ],
+      'ไม่สามารถเล่นวิดีโอนี้ได้': [
+        'This video cannot be played',
+        'ဤဗီဒီယိုကို ဖွင့်၍မရပါ',
+        'ပိုတ်ႇဝီးတီးဢူဝ်းၼႆႉဢမ်ႇလႆႈ',
+      ],
+      'เปิดใน TikTok': [
+        'Open in TikTok',
+        'TikTok တွင်ဖွင့်ရန်',
+        'ပိုတ်ႇၼႂ်း TikTok',
+      ],
+      'ไม่สามารถเปิด TikTok ได้': [
+        'Cannot open TikTok',
+        'TikTok ကို ဖွင့်၍မရပါ',
+        'ပိုတ်ႇ TikTok ဢမ်ႇလႆႈ',
+      ],
+      'เปิดเสียง': ['Turn sound on', 'အသံဖွင့်ရန်', 'ပိုတ်ႇသဵင်'],
+      'ปิดเสียง': ['Mute', 'အသံပိတ်ရန်', 'ပိၵ်ႉသဵင်'],
       'ยังไม่มีการแจ้งเตือนใหม่': [
         'No new notifications',
         'အသိပေးချက်အသစ် မရှိသေးပါ',
@@ -581,6 +658,7 @@ extension MobileLocalizations on AppLocalizations {
       ],
       'ยกเลิก': ['Cancel', 'မလုပ်တော့ပါ', 'ယႃႉ'],
       'ออกจากระบบ': ['Log out', 'အကောင့်ထွက်ရန်', 'ဢွၵ်ႇဢၶွင်ႉ'],
+      'เข้าสู่ระบบ': ['Log in', 'အကောင့်ဝင်ရန်', 'ၶဝ်ႈဢၶွင်ႉ'],
       'ต้องการออกจากระบบใช่หรือไม่': [
         'Do you want to log out?',
         'အကောင့်မှ ထွက်လိုပါသလား',
@@ -800,6 +878,13 @@ extension MobileLocalizations on AppLocalizations {
       'ค้นหาสินค้า': ['Search products', 'ပစ္စည်းရှာရန်', 'သွၵ်ႈႁႃၶူဝ်း'],
       'เมือง': ['City', 'မြို့', 'ဝဵင်း'],
       'ราคาไม่เกิน': ['Maximum price', 'အမြင့်ဆုံးဈေး', 'ၶၼ်သုင်သုတ်း'],
+      'ราคาต่ำสุด': ['Minimum price', 'အနည်းဆုံးဈေး', 'ၶၼ်တႅမ်ႇသုတ်း'],
+      'ราคาสูงสุด': ['Maximum price', 'အများဆုံးဈေး', 'ၶၼ်သုင်သုတ်း'],
+      'ราคาต่ำสุดต้องไม่เกินราคาสูงสุด': [
+        'Minimum price must not exceed maximum price',
+        'အနည်းဆုံးဈေးသည် အများဆုံးဈေးထက် မကျော်ရပါ',
+        'ၶၼ်တႅမ်ႇသုတ်း တေလႆႈဢမ်ႇပူၼ်ႉ ၶၼ်သုင်သုတ်း',
+      ],
       'แก้ไขสินค้า': ['Edit product', 'ပစ္စည်းပြင်ရန်', 'မႄးၶူဝ်း'],
       'ชื่อสินค้า': ['Product name', 'ပစ္စည်းအမည်', 'ၸိုဝ်ႈၶူဝ်း'],
       'ราคา': ['Price', 'ဈေးနှုန်း', 'ၶၼ်'],

@@ -6,11 +6,86 @@ import 'package:suikai/features/admin/admin_dashboard.dart';
 import 'package:suikai/l10n/app_localizations.dart';
 import 'package:suikai/main.dart';
 import 'package:suikai/core/locale_controller.dart';
+import 'package:suikai/data/models.dart';
+import 'package:suikai/services/suikai_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'support/in_memory_repositories.dart';
 
 void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({'selected_locale': 'th'});
+    SuikaiService.auth = InMemoryAuthRepository();
+    SuikaiService.admin = InMemoryAdminRepository();
+    SuikaiService.advertisements = InMemoryAdvertisementRepository();
+    SuikaiService.setCategoriesForTesting(const [
+      CategoryRecord(
+        id: 'listing_mobile',
+        type: 'listing',
+        nameTh: 'มือถือ',
+        nameShn: 'မိုဝ်းထိုဝ်',
+        nameEn: 'Mobile',
+        nameMy: 'မိုဘိုင်း',
+        sortOrder: 0,
+      ),
+    ]);
+    MarketplaceCache.stores
+      ..clear()
+      ..add(
+        const StoreViewModel(
+          id: 'test-store',
+          name: 'Test Store',
+          type: 'store_mobile',
+          city: 'เมืองนาง',
+          distance: '1 กม.',
+          logo: '',
+          description: 'Store for widget tests',
+          phone: '0912345678',
+          viber: '0912345678',
+          hours: '09:00-18:00',
+          approved: true,
+          ownerId: 'test-owner',
+        ),
+      );
+    MarketplaceCache.products
+      ..clear()
+      ..addAll([
+        const ProductViewModel(
+          id: 'test-general',
+          title: 'General product',
+          priceValue: 100,
+          description: 'General listing',
+          category: 'listing_mobile',
+          city: 'เมืองนาง',
+          location: 'เมืองนาง',
+          time: 'now',
+          image: '/general.jpg',
+          phone: '0912345678',
+          viber: '0912345678',
+          likeCount: 0,
+          viewCount: 0,
+          status: ProductStatus.reserved,
+          images: ['/general.jpg'],
+        ),
+        const ProductViewModel(
+          id: 'test-store-product',
+          title: 'Store product',
+          priceValue: 200,
+          description: 'Store listing',
+          category: 'listing_mobile',
+          city: 'เมืองนาง',
+          location: 'เมืองนาง',
+          time: 'now',
+          image: '',
+          phone: '0912345678',
+          viber: '0912345678',
+          likeCount: 0,
+          viewCount: 0,
+          status: ProductStatus.available,
+          storeId: 'test-store',
+          ownerId: 'test-owner',
+          images: ['/image.jpg'],
+        ),
+      ]);
   });
 
   testWidgets('Home page renders Suikai UI', (WidgetTester tester) async {
@@ -33,20 +108,133 @@ void main() {
     expect(validatePhone('09 9999 9999'), isNull);
     expect(validateEmail('user@example.com'), isNull);
     expect(validateEmail('bad-email'), isNotNull);
+    expect(validateRequiredCity('   '), 'กรุณากรอกชื่อเมือง');
+    expect(validateRequiredCity('  User City  '), isNull);
+  });
+
+  testWidgets('complete basic listing data advances without GPS or city id', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        locale: Locale('th'),
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
+        home: PostPage(startGeneral: true),
+      ),
+    );
+    await tester.pump();
+
+    final categoryField = tester.widget<DropdownButtonFormField<String>>(
+      find.byType(DropdownButtonFormField<String>).first,
+    );
+    categoryField.onChanged?.call('listing_mobile');
+    await tester.pump();
+    await tester.enterText(
+      find.widgetWithText(TextFormField, 'ใส่ชื่อสินค้าที่ต้องการขาย'),
+      'Regression product',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextFormField, 'ระบุราคา'),
+      '100',
+    );
+    await tester.drag(find.byType(ListView).first, const Offset(0, -1200));
+    await tester.pump();
+    tester
+        .widget<ElevatedButton>(
+          find.descendant(
+            of: find.byKey(const ValueKey('general-basic-next')),
+            matching: find.byType(ElevatedButton),
+          ),
+        )
+        .onPressed!
+        .call();
+    await tester.pump();
+
+    expect(find.text('รูปภาพสินค้า'), findsOneWidget);
+  });
+
+  testWidgets('missing category shows an error on the visible basic step', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        locale: Locale('th'),
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
+        home: PostPage(startGeneral: true),
+      ),
+    );
+    await tester.pump();
+    await tester.enterText(
+      find.widgetWithText(TextFormField, 'ใส่ชื่อสินค้าที่ต้องการขาย'),
+      'Regression product',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextFormField, 'ระบุราคา'),
+      '100',
+    );
+    await tester.drag(find.byType(ListView).first, const Offset(0, -1200));
+    await tester.pump();
+    tester
+        .widget<ElevatedButton>(
+          find.descendant(
+            of: find.byKey(const ValueKey('general-basic-next')),
+            matching: find.byType(ElevatedButton),
+          ),
+        )
+        .onPressed!
+        .call();
+    await tester.pumpAndSettle();
+
+    expect(find.text('กรุณาเลือกหมวดหมู่สินค้า'), findsOneWidget);
+    expect(find.text('ข้อมูลพื้นฐาน'), findsOneWidget);
+  });
+
+  test('map category filter uses exact Supabase category ids', () {
+    expect(mapCategoryMatches('store_food', 'all'), isTrue);
+    expect(mapCategoryMatches('store_food', 'store_food'), isTrue);
+    expect(mapCategoryMatches('store_food', 'store_cafe'), isFalse);
+    expect(mapCategoryMatches('listing_it', 'store_food'), isFalse);
+  });
+
+  test('store navigation URL keeps the exact destination coordinates', () {
+    final uri = storeNavigationUri(20.8907, 97.1815);
+    expect(uri.host, 'www.google.com');
+    expect(uri.queryParameters['api'], '1');
+    expect(uri.queryParameters['destination'], '20.8907,97.1815');
+  });
+
+  test('short video accepts only HTTPS TikTok URLs', () {
+    expect(
+      ShortVideoRecord.isValidTikTokUrl(
+        'https://www.tiktok.com/@suikai/video/1234567890',
+      ),
+      isTrue,
+    );
+    expect(
+      ShortVideoRecord.isValidTikTokUrl('https://vm.tiktok.com/abc123/'),
+      isTrue,
+    );
+    expect(
+      ShortVideoRecord.isValidTikTokUrl('https://example.com/video/123'),
+      isFalse,
+    );
+    expect(ShortVideoRecord.isValidTikTokUrl('javascript:alert(1)'), isFalse);
   });
 
   test('product sharing always selects that product primary image', () {
-    final general = MockRepo.products.firstWhere(
+    final general = MarketplaceCache.products.firstWhere(
       (product) => !product.isStoreProduct,
     );
-    final store = MockRepo.products.firstWhere(
+    final store = MarketplaceCache.products.firstWhere(
       (product) => product.isStoreProduct,
     );
     expect(primaryProductImage(general), general.imageUrls.first);
     expect(primaryProductImage(store), store.imageUrls.first);
     expect(
       primaryProductImage(
-        const MockProduct(
+        const ProductViewModel(
           id: 'no-image',
           title: 'No image',
           priceValue: 0,
@@ -68,17 +256,17 @@ void main() {
   });
 
   test('sold general listing remains managed but leaves public feed', () {
-    final product = MockRepo.products.firstWhere(
+    final product = MarketplaceCache.products.firstWhere(
       (value) => !value.isStoreProduct && value.status != ProductStatus.sold,
     );
     final originalStatus = product.status;
-    MockRepo.setStatus(product.id, ProductStatus.sold);
-    expect(MockRepo.productById(product.id), isNotNull);
+    MarketplaceCache.setStatus(product.id, ProductStatus.sold);
+    expect(MarketplaceCache.productById(product.id), isNotNull);
     expect(
-      MockRepo.feedProducts.any((value) => value.id == product.id),
+      MarketplaceCache.feedProducts.any((value) => value.id == product.id),
       isFalse,
     );
-    MockRepo.setStatus(product.id, originalStatus);
+    MarketplaceCache.setStatus(product.id, originalStatus);
   });
 
   testWidgets('Admin route is protected by separate login', (tester) async {
@@ -185,7 +373,7 @@ void main() {
   testWidgets('Listing card uses status color without status text', (
     tester,
   ) async {
-    final product = MockRepo.products.firstWhere(
+    final product = MarketplaceCache.products.firstWhere(
       (item) => item.status == ProductStatus.reserved,
     );
     await tester.pumpWidget(
@@ -278,7 +466,7 @@ void main() {
   testWidgets('Store product edit form pre-fills existing record and images', (
     tester,
   ) async {
-    final product = MockRepo.products.firstWhere(
+    final product = MarketplaceCache.products.firstWhere(
       (value) => value.isStoreProduct,
     );
     await tester.pumpWidget(
@@ -322,7 +510,7 @@ void main() {
   testWidgets('General listing uses the same pre-filled edit form', (
     tester,
   ) async {
-    final product = MockRepo.products.firstWhere(
+    final product = MarketplaceCache.products.firstWhere(
       (value) => !value.isStoreProduct,
     );
     await tester.pumpWidget(
