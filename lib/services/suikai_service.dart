@@ -10,6 +10,7 @@ import 'package:uuid/uuid.dart';
 import '../data/models.dart';
 import '../data/repositories.dart';
 import '../data/supabase_repositories.dart';
+import 'video_post_processor.dart';
 
 class SelectedImage {
   final XFile file;
@@ -17,6 +18,11 @@ class SelectedImage {
   const SelectedImage({required this.file, required this.bytes});
   String get extension =>
       file.name.contains('.') ? file.name.split('.').last.toLowerCase() : 'jpg';
+}
+
+class SelectedVideoPost {
+  final PreparedVideoPost prepared;
+  const SelectedVideoPost(this.prepared);
 }
 
 enum LocationFailureReason {
@@ -67,6 +73,7 @@ class SuikaiService {
   static List<CategoryRecord> _categoryCache = [];
   static List<CityRecord> _cityCache = [];
   static late String deviceId;
+  static final Map<String, _SignedUrlCacheEntry> _thumbnailUrlCache = {};
   static bool get usesSupabase => SupabaseBackend.enabled;
   static Session? get currentSession =>
       usesSupabase ? SupabaseBackend.client.auth.currentSession : null;
@@ -81,25 +88,39 @@ class SuikaiService {
         'SUPABASE_PUBLISHABLE_KEY.',
       );
     }
-    await SupabaseBackend.initialize();
-    final client = SupabaseBackend.client;
-    auth = SupabaseAuthRepository(client);
-    profiles = SupabaseProfileRepository(client);
-    listings = SupabaseListingRepository(client);
-    stores = SupabaseStoreRepository(client);
-    storeRequests = SupabaseStoreRequestRepository(client);
-    categoryRepository = SupabaseCategoryRepository(client);
-    likes = SupabaseLikeRepository(client);
-    reports = SupabaseReportRepository(client);
-    notifications = SupabaseNotificationRepository(client);
-    shortVideos = SupabaseShortVideoRepository(client);
-    advertisements = SupabaseAdvertisementRepository(client);
-    storage = SupabaseStorageService(client);
-    admin = SupabaseAdminRepository(client);
-    await auth.restore();
-    final prefs = await SharedPreferences.getInstance();
-    deviceId = prefs.getString('local_device_id') ?? const Uuid().v4();
-    await prefs.setString('local_device_id', deviceId);
+    try {
+      await SupabaseBackend.initialize();
+    } catch (error, stackTrace) {
+      debugPrint('SuikaiService Supabase initialization failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      rethrow;
+    }
+    try {
+      final client = SupabaseBackend.client;
+      auth = SupabaseAuthRepository(client);
+      profiles = SupabaseProfileRepository(client);
+      listings = SupabaseListingRepository(client);
+      stores = SupabaseStoreRepository(client);
+      storeRequests = SupabaseStoreRequestRepository(client);
+      categoryRepository = SupabaseCategoryRepository(client);
+      likes = SupabaseLikeRepository(client);
+      reports = SupabaseReportRepository(client);
+      notifications = SupabaseNotificationRepository(client);
+      shortVideos = SupabaseShortVideoRepository(client);
+      advertisements = SupabaseAdvertisementRepository(client);
+      storage = SupabaseStorageService(client);
+      admin = SupabaseAdminRepository(client);
+      await auth.restore();
+      final prefs = await SharedPreferences.getInstance();
+      deviceId = prefs.getString('local_device_id') ?? const Uuid().v4();
+      await prefs.setString('local_device_id', deviceId);
+    } catch (error, stackTrace) {
+      debugPrint(
+        'SuikaiService initialization failed after Supabase setup: $error',
+      );
+      debugPrintStack(stackTrace: stackTrace);
+      rethrow;
+    }
     return true;
   }
 
@@ -259,7 +280,71 @@ class SuikaiService {
   static Future<void> logout() => auth.logout();
   static Future<UserProfile?> currentProfile() =>
       currentUserId == null ? Future.value(null) : profiles.get(currentUserId!);
-  static Future<void> updateProfile(UserProfile profile) =>
+
+  static String _normalizePhone(String? value) =>
+      (value ?? '').trim().replaceAll(RegExp(r'[^0-9+]'), '');
+
+  static List<String> incompleteGeneralPostingProfileFields(
+    UserProfile? profile,
+  ) {
+    if (profile == null) return const ['name', 'phone', 'city'];
+    return [
+      if (profile.name.trim().isEmpty) 'name',
+      if (_normalizePhone(profile.phone).isEmpty) 'phone',
+      if (profile.city.trim().isEmpty) 'city',
+    ];
+  }
+
+  static Future<UserProfile> requireCompleteGeneralPostingProfile() async {
+    final profile = await currentProfile();
+    final missing = incompleteGeneralPostingProfileFields(profile);
+    if (profile == null || missing.isNotEmpty) {
+      throw StateError(
+        'general_posting_profile_incomplete:${missing.join(',')}',
+      );
+    }
+    return profile;
+  }
+
+  static Future<CityRecord?> resolveCityForCoordinates(
+    double latitude,
+    double longitude,
+  ) async {
+    final row = await SupabaseBackend.client.rpc(
+      'resolve_city_for_coordinates',
+      params: {'p_latitude': latitude, 'p_longitude': longitude},
+    );
+    return row is Map
+        ? CityRecord.fromJson(Map<String, dynamic>.from(row))
+        : null;
+  }
+
+  static Future<String> signedThumbnailUrl(ListingVideoRecord video) async {
+    final key = video.thumbnailMediaId;
+    final cached = _thumbnailUrlCache[key];
+    final now = DateTime.now();
+    if (cached != null && cached.expiresAt.difference(now).inSeconds > 60) {
+      return cached.url;
+    }
+    final url = await storage.createSignedUrl(
+      bucket: 'listing-thumbnails',
+      objectPath: video.thumbnailPath,
+      expiresInSeconds: 10 * 60,
+    );
+    _thumbnailUrlCache[key] = _SignedUrlCacheEntry(
+      url,
+      now.add(const Duration(minutes: 10)),
+    );
+    return url;
+  }
+
+  static Future<String> signedVideoUrl(ListingVideoRecord video) =>
+      storage.createSignedUrl(
+        bucket: 'listing-videos',
+        objectPath: video.videoPath,
+        expiresInSeconds: 5 * 60,
+      );
+  static Future<UserProfile> updateProfile(UserProfile profile) =>
       profiles.save(profile);
 
   static Future<List<ShortVideoRecord>> fetchActiveShortVideos() =>
@@ -364,24 +449,21 @@ class SuikaiService {
     return selected;
   }
 
-  static Future<List<String>> _saveImages(
-    List<SelectedImage> values, {
-    String? bucket,
-    String? objectPrefix,
+  static Future<SelectedVideoPost?> pickVideoPost({
+    required ImageSource source,
   }) async {
-    final out = <String>[];
-    for (final i in values) {
-      out.add(
-        await storage.persistImage(
-          i.file.path,
-          i.extension,
-          bucket: bucket,
-          objectPrefix: objectPrefix,
-        ),
-      );
-    }
-    return out;
+    if (kIsWeb) throw UnsupportedError('video_post_not_supported_on_web');
+    final selected = await _picker.pickVideo(
+      source: source,
+      maxDuration: const Duration(seconds: 30),
+    );
+    if (selected == null) return null;
+    return SelectedVideoPost(await VideoPostProcessor.prepare(selected.path));
   }
+
+  /// Keeps custom camera capture on the same preparation path as picker videos.
+  static Future<SelectedVideoPost> prepareVideoPost(String sourcePath) async =>
+      SelectedVideoPost(await VideoPostProcessor.prepare(sourcePath));
 
   static String _requireUser() {
     final id = currentUserId;
@@ -393,7 +475,7 @@ class SuikaiService {
     required String title,
     required String description,
     required String category,
-    required String city,
+    String? city,
     String? cityId,
     required String phone,
     required String viber,
@@ -402,26 +484,26 @@ class SuikaiService {
     required String listingType,
     String? storeId,
     String status = 'available',
+    SelectedVideoPost? video,
+    @Deprecated('Listings are video-only.')
     List<SelectedImage> images = const [],
     double? latitude,
     double? longitude,
     bool isLocationVisible = true,
   }) async {
     final ownerId = _requireUser();
-    if (title.trim().isEmpty ||
-        category.trim().isEmpty ||
-        city.trim().isEmpty ||
-        price < 0) {
+    if (video == null) throw StateError('listing_video_required');
+    if (title.trim().isEmpty || category.trim().isEmpty || price < 0) {
       throw StateError('listing_required_fields_missing');
     }
-    final normalizedStatus = listingType == 'general'
-        ? 'available'
-        : status == 'outOfStock'
-        ? 'out_of_stock'
-        : status;
-    const storeStatuses = {'available', 'out_of_stock', 'deleted'};
-    if (listingType == 'store' && !storeStatuses.contains(normalizedStatus)) {
+    final normalizedStatus = status;
+    if (!const {'available', 'reserved', 'sold'}.contains(normalizedStatus)) {
       throw StateError('invalid_store_product_status');
+    }
+    var listingPhone = phone;
+    var listingViber = viber;
+    if (listingType == 'general') {
+      await requireCompleteGeneralPostingProfile();
     }
     if (listingType == 'store') {
       if (storeId == null || storeId.isEmpty) {
@@ -433,13 +515,34 @@ class SuikaiService {
       if (store == null || store.status != 'approved') {
         throw StateError('store_not_approved');
       }
+      listingPhone = _normalizePhone(store.phone);
+      listingViber = _normalizePhone(store.viber);
     }
     final now = DateTime.now();
     final id = const Uuid().v4();
-    final saved = await _saveImages(
-      images,
-      bucket: 'listing-images',
-      objectPrefix: 'listings/drafts/${_requireUser()}/$id',
+    final draftPrefix = 'listings/drafts/${_requireUser()}/$id';
+    final media = await storage.persistPrivateBinary(
+      sourcePath: video.prepared.path,
+      bucket: 'listing-videos',
+      objectPrefix: draftPrefix,
+      extension: 'mp4',
+      mimeType: 'video/mp4',
+    );
+    final thumbnail = await storage.persistPrivateBytes(
+      bytes: video.prepared.thumbnailBytes,
+      bucket: 'listing-thumbnails',
+      objectPrefix: draftPrefix,
+      extension: 'jpg',
+      mimeType: 'image/jpeg',
+    );
+    final savedVideo = ListingVideoRecord(
+      id: '',
+      videoMediaId: media.id,
+      thumbnailMediaId: thumbnail.id,
+      videoPath: media.objectPath,
+      thumbnailPath: thumbnail.objectPath,
+      durationMilliseconds: video.prepared.durationMilliseconds,
+      sizeBytes: media.sizeBytes,
     );
     final value = ListingRecord(
       id: id,
@@ -450,12 +553,12 @@ class SuikaiService {
       category: category,
       price: price,
       currency: currency,
-      city: city.trim(),
+      city: city?.trim() ?? '',
       cityId: cityId,
       status: normalizedStatus,
-      images: saved,
-      phone: phone,
-      viber: viber,
+      video: savedVideo,
+      phone: listingPhone,
+      viber: listingViber,
       latitude: latitude,
       longitude: longitude,
       isLocationVisible: isLocationVisible,
@@ -487,78 +590,103 @@ class SuikaiService {
     required String currency,
     required String status,
     String? category,
-    List<String>? images,
+    @Deprecated('Listings are video-only.') List<String>? images,
+    @Deprecated('Listings are video-only.')
     List<SelectedImage> newImages = const [],
     double? latitude,
     double? longitude,
     bool? isLocationVisible,
   }) async {
-    if (city.trim().isEmpty) throw StateError('listing_city_required');
-    final all = await listings.all();
-    final old = all.where((e) => e.id == listingId).firstOrNull;
-    if (old == null) throw StateError('not_found');
-    if (old.ownerId != _requireUser()) throw StateError('not_owner');
-    if (old.storeId != null) {
-      final store = (await stores.all())
-          .where(
-            (value) =>
-                value.id == old.storeId && value.ownerId == currentUserId,
-          )
-          .firstOrNull;
-      if (store == null || store.status != 'approved') {
-        throw StateError('store_not_approved');
+    try {
+      final all = await listings.all();
+      final old = all.where((e) => e.id == listingId).firstOrNull;
+      if (old == null) throw StateError('not_found');
+      if (old.ownerId != _requireUser()) throw StateError('not_owner');
+      if (old.storeId != null) {
+        final store = (await stores.all())
+            .where(
+              (value) =>
+                  value.id == old.storeId && value.ownerId == currentUserId,
+            )
+            .firstOrNull;
+        if (store == null || store.status != 'approved') {
+          throw StateError('store_not_approved');
+        }
       }
+      final normalizedStatus = status;
+      final allowedStatuses = const {'available', 'reserved', 'sold'};
+      if (!allowedStatuses.contains(normalizedStatus)) {
+        throw StateError('invalid_listing_status');
+      }
+      await listings.update(
+        ListingRecord(
+          id: old.id,
+          ownerId: _requireUser(),
+          storeId: old.storeId,
+          title: title,
+          description: description,
+          category: category ?? old.category,
+          price: price,
+          currency: currency,
+          city: city,
+          cityId: cityId ?? old.cityId,
+          cityRecord: old.cityRecord,
+          status: normalizedStatus,
+          video: old.video,
+          phone: phone,
+          viber: viber,
+          createdAt: old.createdAt,
+          updatedAt: DateTime.now(),
+          likes: old.likes,
+          views: old.views,
+          latitude: latitude ?? old.latitude,
+          longitude: longitude ?? old.longitude,
+          isLocationVisible: isLocationVisible ?? old.isLocationVisible,
+        ),
+      );
+    } catch (error, stackTrace) {
+      debugPrint(
+        'Listing status update failed: id=$listingId '
+        'requested=$status error=$error',
+      );
+      debugPrintStack(stackTrace: stackTrace);
+      rethrow;
     }
-    final normalizedStatus = status == 'outOfStock' ? 'out_of_stock' : status;
-    final allowedStatuses = old.storeId == null
-        ? const {'available', 'reserved', 'sold'}
-        : const {'available', 'out_of_stock', 'deleted'};
-    if (!allowedStatuses.contains(normalizedStatus)) {
-      throw StateError('invalid_listing_status');
-    }
-    final extra = await _saveImages(
-      newImages,
-      bucket: 'listing-images',
-      objectPrefix: 'listings/$listingId',
-    );
-    await listings.update(
-      ListingRecord(
-        id: old.id,
-        ownerId: _requireUser(),
-        storeId: old.storeId,
-        title: title,
-        description: description,
-        category: category ?? old.category,
-        price: price,
-        currency: currency,
-        city: city,
-        cityId: cityId ?? old.cityId,
-        cityRecord: old.cityRecord,
-        status: normalizedStatus,
-        images: images == null
-            ? [...old.images, ...extra]
-            : [...images, ...extra],
-        phone: phone,
-        viber: viber,
-        createdAt: old.createdAt,
-        updatedAt: DateTime.now(),
-        likes: old.likes,
-        views: old.views,
-        latitude: latitude ?? old.latitude,
-        longitude: longitude ?? old.longitude,
-        isLocationVisible: isLocationVisible ?? old.isLocationVisible,
-      ),
-    );
   }
 
-  static Future<List<String>> persistSelectedImages(
-    List<SelectedImage> images, {
-    String? listingId,
-  }) => _saveImages(
-    images,
-    bucket: listingId == null ? null : 'listing-images',
-    objectPrefix: listingId == null ? null : 'listings/$listingId',
-  );
+  /// Updates only a listing status. This deliberately avoids location and
+  /// full-listing validation so legacy general listings without a city remain
+  /// manageable by their owner.
+  static Future<void> updateListingStatus({
+    required String listingId,
+    required String status,
+  }) async {
+    try {
+      final old = (await listings.all())
+          .where((listing) => listing.id == listingId)
+          .firstOrNull;
+      if (old == null) throw StateError('not_found');
+      final ownerId = _requireUser();
+      if (old.ownerId != ownerId) throw StateError('not_owner');
+      final normalizedStatus = status;
+      final allowedStatuses = const {'available', 'reserved', 'sold'};
+      if (!allowedStatuses.contains(normalizedStatus)) {
+        throw StateError('invalid_listing_status');
+      }
+      await listings.updateStatus(
+        id: old.id,
+        ownerId: ownerId,
+        status: normalizedStatus,
+      );
+    } catch (error, stackTrace) {
+      debugPrint(
+        'Listing status update failed: id=$listingId '
+        'requested=$status error=$error',
+      );
+      debugPrintStack(stackTrace: stackTrace);
+      rethrow;
+    }
+  }
 
   static Future<void> deleteListing(String id) =>
       listings.delete(id, _requireUser());
@@ -722,7 +850,7 @@ class SuikaiService {
   static Future<void> deleteStore(String id) =>
       stores.delete(id, _requireUser());
   static Future<List<Map<String, dynamic>>> fetchStores() async =>
-      (await stores.all())
+      (await stores.publicStores())
           .where(
             (e) =>
                 e.status == 'approved' &&
@@ -738,13 +866,13 @@ class SuikaiService {
           .map((e) => e.toJson())
           .toList();
   static Future<List<Map<String, dynamic>>> fetchListings() async =>
-      (await listings.all())
+      (await listings.publicListings())
           .where((e) => e.status != 'deleted' && e.status != 'hidden')
           .map(_listingMap)
           .toList();
   static Future<List<Map<String, dynamic>>> fetchListingsForStore(
     String storeId,
-  ) async => (await listings.all())
+  ) async => (await listings.publicListings())
       .where(
         (e) =>
             e.storeId == storeId &&
@@ -755,7 +883,7 @@ class SuikaiService {
       .map(_listingMap)
       .toList();
   static Future<List<Map<String, dynamic>>> fetchMapListings() async =>
-      (await listings.all())
+      (await listings.publicListings())
           .where(
             (e) =>
                 e.latitude != null &&
@@ -770,9 +898,6 @@ class SuikaiService {
           .toList();
   static Map<String, dynamic> _listingMap(ListingRecord e) => {
     ...e.toJson(),
-    'listing_images': [
-      for (final p in e.images) {'image_url': p},
-    ],
     'listing_stats': {'like_count': e.likes, 'view_count': e.views},
   };
   static Future<void> likeListing(String id) async {
@@ -876,4 +1001,10 @@ class SuikaiService {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('location_intro_seen', true);
   }
+}
+
+class _SignedUrlCacheEntry {
+  final String url;
+  final DateTime expiresAt;
+  const _SignedUrlCacheEntry(this.url, this.expiresAt);
 }

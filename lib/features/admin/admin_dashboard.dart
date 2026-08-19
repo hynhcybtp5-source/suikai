@@ -58,13 +58,25 @@ class _AdminDashboardState extends State<AdminDashboard> {
 
   Future<void> login() async {
     setState(() => busy = true);
-    final ok = await SuikaiService.admin.login(email.text, password.text);
-    if (!mounted) return;
-    setState(() => busy = false);
-    if (!ok)
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('ข้อมูล Admin ไม่ถูกต้อง')));
+    try {
+      final ok = await SuikaiService.admin.login(email.text, password.text);
+      if (!mounted) return;
+      if (!ok) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('ข้อมูล Admin ไม่ถูกต้อง')),
+        );
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Admin login UI failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('เข้าสู่ระบบไม่สำเร็จ โปรดลองอีกครั้ง')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
   }
 
   @override
@@ -1393,9 +1405,6 @@ class _ListingsState extends State<_Listings> {
               'available',
               'reserved',
               'sold',
-              'out_of_stock',
-              'hidden',
-              'deleted',
             ].map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
             onChanged: (v) => setState(() => filter = v ?? 'all'),
             decoration: const InputDecoration(
@@ -1410,7 +1419,7 @@ class _ListingsState extends State<_Listings> {
             itemBuilder: (_, i) {
               final p = rows[i];
               return ListTile(
-                leading: _Thumb(images: p['images']),
+                leading: _VideoThumb(video: p['listing_video']),
                 title: Text(
                   '${p['title'] ?? ''}',
                   maxLines: 1,
@@ -1424,15 +1433,7 @@ class _ListingsState extends State<_Listings> {
                 trailing: PopupMenuButton<String>(
                   onSelected: (v) => action(p, v),
                   itemBuilder: (_) => [
-                    for (final s
-                        in widget.storeProducts
-                            ? const [
-                                'available',
-                                'out_of_stock',
-                                'deleted',
-                                'hidden',
-                              ]
-                            : const ['available', 'reserved', 'sold', 'hidden'])
+                    for (final s in const ['available', 'reserved', 'sold'])
                       PopupMenuItem(value: s, child: Text(s)),
                     const PopupMenuDivider(),
                     const PopupMenuItem(value: 'delete', child: Text('ลบ')),
@@ -1517,7 +1518,7 @@ class _ListingsState extends State<_Listings> {
           itemBuilder: (_, index) {
             final product = products[index];
             return ListTile(
-              leading: _Thumb(images: product['images']),
+              leading: _VideoThumb(video: product['listing_video']),
               title: Text('${product['title'] ?? ''}'),
               subtitle: Text(
                 '${product['currency'] ?? ''} ${product['price'] ?? ''} • ${product['status'] ?? ''}',
@@ -1550,7 +1551,7 @@ class _ListingsState extends State<_Listings> {
               SizedBox(
                 height: 180,
                 width: double.maxFinite,
-                child: _FullImage(images: p['images']),
+                child: _AdminVideoPreview(video: p['listing_video']),
               ),
               const SizedBox(height: 12),
               SelectableText(
@@ -2538,50 +2539,56 @@ class _StoreLogo extends StatelessWidget {
   }
 }
 
-class _Thumb extends StatelessWidget {
-  final dynamic images;
-  const _Thumb({required this.images});
+class _VideoThumb extends StatelessWidget {
+  final dynamic video;
+  const _VideoThumb({required this.video});
   @override
   Widget build(BuildContext context) {
-    final list = images is List ? images as List : const [];
-    final path = list.isEmpty ? '' : '${list.first ?? ''}';
+    final record = video is Map
+        ? ListingVideoRecord.fromJson(Map<String, dynamic>.from(video as Map))
+        : null;
     return ClipRRect(
       borderRadius: BorderRadius.circular(8),
       child: SizedBox(
         width: 56,
         height: 56,
-        child: path.isEmpty
+        child: record == null
             ? const ColoredBox(
                 color: AppTheme.orangeSoft,
-                child: Icon(Icons.image_outlined),
+                child: Icon(Icons.videocam_outlined),
               )
-            : Image.network(
-                path,
-                fit: BoxFit.cover,
-                errorBuilder: (_, _, _) =>
-                    const Icon(Icons.broken_image_outlined),
+            : FutureBuilder<String>(
+                future: SuikaiService.signedThumbnailUrl(record),
+                builder: (_, snapshot) => snapshot.hasData
+                    ? Image.network(snapshot.data!, fit: BoxFit.cover)
+                    : const ColoredBox(
+                        color: AppTheme.orangeSoft,
+                        child: Icon(Icons.videocam_outlined),
+                      ),
               ),
       ),
     );
   }
 }
 
-class _FullImage extends StatelessWidget {
-  final dynamic images;
-  const _FullImage({required this.images});
+class _AdminVideoPreview extends StatelessWidget {
+  final dynamic video;
+  const _AdminVideoPreview({required this.video});
   @override
   Widget build(BuildContext context) {
-    final list = images is List ? images as List : const [];
-    if (list.isEmpty)
+    final record = video is Map
+        ? ListingVideoRecord.fromJson(Map<String, dynamic>.from(video as Map))
+        : null;
+    if (record == null)
       return const ColoredBox(
         color: AppTheme.orangeSoft,
-        child: Icon(Icons.image_outlined, size: 48),
+        child: Icon(Icons.videocam_outlined, size: 48),
       );
-    final path = '${list.first}';
-    return Image.network(
-      path,
-      fit: BoxFit.contain,
-      errorBuilder: (_, _, _) => const Icon(Icons.broken_image_outlined),
+    return FutureBuilder<String>(
+      future: SuikaiService.signedThumbnailUrl(record),
+      builder: (_, snapshot) => snapshot.hasData
+          ? Image.network(snapshot.data!, fit: BoxFit.contain)
+          : const Center(child: Icon(Icons.videocam_outlined, size: 48)),
     );
   }
 }

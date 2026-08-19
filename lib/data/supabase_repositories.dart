@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:image_picker/image_picker.dart';
@@ -25,13 +26,30 @@ class SupabaseBackend {
 
   static Future<void> initialize() async {
     if (!enabled) return;
-    await Supabase.initialize(
-      url: url,
-      publishableKey: clientKey,
-      authOptions: const FlutterAuthClientOptions(
-        authFlowType: AuthFlowType.pkce,
-      ),
+    final endpoint = Uri.tryParse(url);
+    if (endpoint == null ||
+        !endpoint.hasScheme ||
+        !endpoint.hasAuthority ||
+        (endpoint.scheme != 'https' && endpoint.scheme != 'http')) {
+      throw StateError('invalid_supabase_url');
+    }
+    debugPrint(
+      'Supabase initialize: scheme=${endpoint.scheme} host=${endpoint.host}',
     );
+    try {
+      await Supabase.initialize(
+        url: url,
+        publishableKey: clientKey,
+        authOptions: const FlutterAuthClientOptions(
+          authFlowType: AuthFlowType.pkce,
+        ),
+      );
+      debugPrint('Supabase initialize: complete host=${endpoint.host}');
+    } catch (error, stackTrace) {
+      debugPrint('Supabase initialize failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      rethrow;
+    }
   }
 
   static SupabaseClient get client => Supabase.instance.client;
@@ -74,7 +92,16 @@ Future<void> _deleteMediaIfOrphan(
         .limit(1),
     client.from('stores').select('id').eq('logo_media_id', mediaId).limit(1),
     client.from('stores').select('id').eq('cover_media_id', mediaId).limit(1),
-    client.from('listing_images').select('id').eq('media_id', mediaId).limit(1),
+    client
+        .from('listing_videos')
+        .select('id')
+        .eq('video_media_id', mediaId)
+        .limit(1),
+    client
+        .from('listing_videos')
+        .select('id')
+        .eq('thumbnail_media_id', mediaId)
+        .limit(1),
   ]);
   if (references.any((rows) => rows.isNotEmpty)) return;
   final row = await client
@@ -92,8 +119,9 @@ Future<void> _deleteMediaIfOrphan(
 
 class SupabaseAuthRepository implements AuthRepository {
   static const _telegramAuthorizationUrl = 'https://oauth.telegram.org/auth';
-  static const _telegramCallbackUri =
-      'https://zzfxxpmsggobimixffjn.supabase.co/functions/v1/telegram-callback';
+  static const _telegramCallbackUri = String.fromEnvironment(
+    'TELEGRAM_CALLBACK_URL',
+  );
   static const _telegramClientId = String.fromEnvironment('TELEGRAM_CLIENT_ID');
   static const _telegramStatePreference = 'telegram_oauth_state';
   static const _telegramVerifierPreference = 'telegram_oauth_code_verifier';
@@ -162,7 +190,7 @@ class SupabaseAuthRepository implements AuthRepository {
 
   @override
   Future<void> loginWithTelegram() async {
-    if (_telegramClientId.isEmpty) {
+    if (_telegramClientId.isEmpty || _telegramCallbackUri.isEmpty) {
       throw StateError('telegram_client_id_not_configured');
     }
 
@@ -292,6 +320,7 @@ UserProfile _profileFromRow(Map<String, dynamic> row, {User? user}) =>
       avatar: '${user?.userMetadata?['avatar_url'] ?? ''}',
       city: '${row['city'] ?? ''}',
       cityId: row['city_id']?.toString(),
+      viber: '${row['viber_phone'] ?? ''}',
       createdAt: DateTime.tryParse('${row['created_at']}') ?? DateTime.now(),
     );
 
@@ -327,12 +356,13 @@ class SupabaseProfileRepository implements ProfileRepository {
       avatar: '${data['avatar']}',
       city: profile.city,
       cityId: profile.cityId,
+      viber: profile.viber,
       createdAt: profile.createdAt,
     );
   }
 
   @override
-  Future<void> save(UserProfile profile) async {
+  Future<UserProfile> save(UserProfile profile) async {
     final old = await client
         .from('profiles')
         .select('avatar_media_id')
@@ -341,7 +371,7 @@ class SupabaseProfileRepository implements ProfileRepository {
     final oldMediaId = old['avatar_media_id']?.toString();
     final media = await _mediaForUrl(client, profile.avatar);
     final newMediaId = media?['id']?.toString();
-    await client
+    final row = await client
         .from('profiles')
         .update({
           'name': profile.name,
@@ -350,8 +380,12 @@ class SupabaseProfileRepository implements ProfileRepository {
           'avatar_media_id': newMediaId,
           'city_id': profile.cityId,
           'city': profile.city.trim(),
+          'viber_phone': profile.viber.trim(),
         })
-        .eq('id', profile.id);
+        .eq('id', profile.id)
+        .select('id,name,phone,email,city,city_id,viber_phone,created_at')
+        .maybeSingle();
+    if (row == null) throw StateError('profile_update_not_applied');
     if (profile.avatar.isNotEmpty) {
       await client.auth.updateUser(
         UserAttributes(data: {'avatar_url': profile.avatar}),
@@ -360,6 +394,18 @@ class SupabaseProfileRepository implements ProfileRepository {
     if (oldMediaId != newMediaId) {
       await _deleteMediaIfOrphan(client, oldMediaId);
     }
+    final saved = _profileFromRow(_json(row), user: client.auth.currentUser);
+    return UserProfile(
+      id: saved.id,
+      name: saved.name,
+      phone: saved.phone,
+      email: saved.email,
+      avatar: profile.avatar,
+      city: saved.city,
+      cityId: saved.cityId,
+      viber: saved.viber,
+      createdAt: saved.createdAt,
+    );
   }
 }
 
@@ -426,6 +472,25 @@ class SupabaseListingRepository implements ListingRepository {
   bool _canResolveCityCoordinates = true;
   SupabaseListingRepository(this.client);
 
+  /// Listing cards remain available when an optional aggregate RPC is not
+  /// deployed or temporarily unavailable. The next refresh retries it.
+  Future<int> _listingMetric(String function, String listingId) async {
+    try {
+      final value = await client.rpc(
+        function,
+        params: {'p_listing_id': listingId},
+      );
+      return int.tryParse('$value') ?? 0;
+    } catch (error, stackTrace) {
+      debugPrint(
+        'Listing metric unavailable: function=$function listing=$listingId '
+        'error=$error',
+      );
+      debugPrintStack(stackTrace: stackTrace);
+      return 0;
+    }
+  }
+
   Future<ListingRecord> _record(Map<String, dynamic> row) async {
     if (_canResolveCityCoordinates &&
         row['cities'] == null &&
@@ -456,57 +521,42 @@ class SupabaseListingRepository implements ListingRepository {
         }
       }
     }
-    final imageRows =
-        (row['listing_images'] as List? ?? const []).map(_json).toList()..sort(
-          (a, b) => ((a['sort_order'] as num?)?.toInt() ?? 0).compareTo(
-            (b['sort_order'] as num?)?.toInt() ?? 0,
-          ),
-        );
-    final likes = await client.rpc(
+    final likes = await _listingMetric(
       'get_listing_like_count',
-      params: {'p_listing_id': row['id']},
+      '${row['id']}',
     );
-    final views = await client.rpc(
+    final views = await _listingMetric(
       'get_listing_view_count',
-      params: {'p_listing_id': row['id']},
+      '${row['id']}',
     );
-    final imageUrls = <String>[];
-    for (final image in imageRows) {
-      var url = '${image['image_url'] ?? ''}'.trim();
-      final media = image['media_assets'];
-      if (media is Map) {
-        final mediaRow = _json(media);
-        final bucket = '${mediaRow['bucket'] ?? ''}'.trim();
-        final path = '${mediaRow['object_path'] ?? ''}'.trim();
-        if (bucket.isNotEmpty && path.isNotEmpty) {
-          url = client.storage.from(bucket).getPublicUrl(path);
-        }
-      }
-      if (url.isNotEmpty && !imageUrls.contains(url)) imageUrls.add(url);
-    }
     return ListingRecord.fromJson({
       ...row,
       'category': row['category_id'] ?? row['category'] ?? '',
-      'images': imageUrls,
-      'likes': (likes as num?)?.toInt() ?? 0,
-      'views': (views as num?)?.toInt() ?? 0,
+      'listing_video': row['listing_videos'] is List
+          ? (row['listing_videos'] as List).firstOrNull
+          : (row['listing_videos'] ?? row['listing_video']),
+      'likes': likes,
+      'views': views,
     });
   }
 
   @override
+  Future<List<ListingRecord>> publicListings() async {
+    final response = await client.rpc('get_public_listings');
+    final rows = (response as List? ?? const [])
+        .map((row) => _json(row))
+        .toList();
+    return Future.wait(rows.map(_record));
+  }
+
+  @override
   Future<List<ListingRecord>> all() async {
-    if (client.auth.currentUser == null) {
-      final response = await client.rpc('get_public_listings');
-      final rows = (response as List? ?? const [])
-          .map((row) => _json(row))
-          .toList();
-      return Future.wait(rows.map(_record));
-    }
     final rows = await client
         .from('listings')
         .select(
-          '*, listing_images(id,image_url,media_id,sort_order,'
-          'media_assets(bucket,object_path)), '
+          '*, listing_videos(id,video_media_id,thumbnail_media_id,duration_milliseconds,size_bytes,'
+          'video_media_assets:media_assets!listing_videos_video_media_id_fkey(object_path),'
+          'thumbnail_media_assets:media_assets!listing_videos_thumbnail_media_id_fkey(object_path)), '
           'cities(id,name,name_th,name_shn,name_en,name_my,is_active)',
         )
         .order('created_at', ascending: false);
@@ -534,37 +584,6 @@ class SupabaseListingRepository implements ListingRepository {
     'is_location_visible': value.isLocationVisible,
   };
 
-  Future<void> _replaceImages(ListingRecord value) async {
-    final oldRows = await client
-        .from('listing_images')
-        .select('media_id')
-        .eq('listing_id', value.id);
-    final mediaIds = <String?>[];
-    for (final url in value.images) {
-      mediaIds.add((await _mediaForUrl(client, url))?['id']?.toString());
-    }
-    await client.from('listing_images').delete().eq('listing_id', value.id);
-    if (value.images.isNotEmpty) {
-      await client.from('listing_images').insert([
-        for (var index = 0; index < value.images.length; index++)
-          {
-            'listing_id': value.id,
-            'image_url': value.images[index],
-            'media_id': mediaIds[index],
-            'sort_order': index,
-            'is_primary': index == 0,
-          },
-      ]);
-    }
-    final retained = mediaIds.whereType<String>().toSet();
-    for (final row in oldRows) {
-      final oldMediaId = row['media_id']?.toString();
-      if (!retained.contains(oldMediaId)) {
-        await _deleteMediaIfOrphan(client, oldMediaId);
-      }
-    }
-  }
-
   @override
   Future<ListingRecord> create(ListingRecord value) async {
     try {
@@ -572,17 +591,18 @@ class SupabaseListingRepository implements ListingRepository {
       if (authUserId == null || authUserId != value.ownerId) {
         throw StateError('listing_owner_auth_mismatch');
       }
-      if (value.city.trim().isEmpty) throw StateError('listing_city_required');
+      if (value.storeId != null && value.city.trim().isEmpty) {
+        throw StateError('store_listing_city_required');
+      }
       if (value.storeId != null) {
         final store = await client
             .from('stores')
-            .select('id,owner_id,status,lifecycle_status,is_hidden,deleted_at')
+            .select('id,owner_id,status,is_hidden,deleted_at')
             .eq('id', value.storeId!)
             .maybeSingle();
         if (store == null ||
             store['owner_id'] != authUserId ||
             store['status'] != 'approved' ||
-            store['lifecycle_status'] != 'active' ||
             store['is_hidden'] == true ||
             store['deleted_at'] != null) {
           throw StateError('store_not_approved_or_not_owned');
@@ -593,11 +613,19 @@ class SupabaseListingRepository implements ListingRepository {
           .insert(_payload(value))
           .select()
           .single();
-      await _replaceImages(value);
+      final video = value.video;
+      if (video == null) throw StateError('listing_video_required');
+      await client.from('listing_videos').insert({
+        'listing_id': value.id,
+        'video_media_id': video.videoMediaId,
+        'thumbnail_media_id': video.thumbnailMediaId,
+        'duration_milliseconds': video.durationMilliseconds,
+        'size_bytes': video.sizeBytes,
+      });
       return ListingRecord.fromJson({
         ..._json(row),
         'category': row['category_id'] ?? row['category'] ?? value.category,
-        'images': value.images,
+        'listing_video': video.toJson(),
       });
     } catch (error, stackTrace) {
       debugPrint(
@@ -612,19 +640,20 @@ class SupabaseListingRepository implements ListingRepository {
 
   @override
   Future<void> update(ListingRecord value) async {
-    if (value.city.trim().isEmpty) throw StateError('listing_city_required');
+    if (value.storeId != null && value.city.trim().isEmpty) {
+      throw StateError('store_listing_city_required');
+    }
     if (value.storeId != null) {
       final userId = client.auth.currentUser?.id;
       final store = await client
           .from('stores')
-          .select('owner_id,status,lifecycle_status,is_hidden,deleted_at')
+          .select('owner_id,status,is_hidden,deleted_at')
           .eq('id', value.storeId!)
           .maybeSingle();
       if (userId == null ||
           store == null ||
           store['owner_id'] != userId ||
           store['status'] != 'approved' ||
-          store['lifecycle_status'] != 'active' ||
           store['is_hidden'] == true ||
           store['deleted_at'] != null) {
         throw StateError('store_not_approved_or_not_owned');
@@ -633,8 +662,42 @@ class SupabaseListingRepository implements ListingRepository {
     final payload = _payload(value)
       ..remove('id')
       ..remove('owner_id');
-    await client.from('listings').update(payload).eq('id', value.id);
-    await _replaceImages(value);
+    // A PostgREST update without `select()` can complete successfully even
+    // when RLS filters every row. Read the returned status so callers never
+    // treat an unapplied status change as a successful save.
+    final updated = await client
+        .from('listings')
+        .update(payload)
+        .eq('id', value.id)
+        .select('id,status')
+        .maybeSingle();
+    if (updated == null) throw StateError('listing_update_not_applied');
+    if ('${updated['status']}' != value.status) {
+      throw StateError('listing_status_update_mismatch');
+    }
+    debugPrint(
+      'Listing status updated: id=${value.id} status=${updated['status']}',
+    );
+  }
+
+  @override
+  Future<void> updateStatus({
+    required String id,
+    required String ownerId,
+    required String status,
+  }) async {
+    final updated = await client
+        .from('listings')
+        .update({'status': status})
+        .eq('id', id)
+        .eq('owner_id', ownerId)
+        .select('id,status')
+        .maybeSingle();
+    if (updated == null) throw StateError('listing_status_update_not_applied');
+    if ('${updated['id']}' != id || '${updated['status']}' != status) {
+      throw StateError('listing_status_update_mismatch');
+    }
+    debugPrint('Listing status updated: id=$id status=${updated['status']}');
   }
 
   @override
@@ -656,14 +719,20 @@ class SupabaseStoreRepository implements StoreRepository {
 
   @override
   Future<List<StoreRecord>> all() async {
-    final rows = client.auth.currentUser == null
-        ? (await client.rpc('get_public_stores') as List? ?? const [])
-        : await client
-              .from('stores')
-              .select(
-                '*,cities(id,name,name_th,name_shn,name_en,name_my,is_active)',
-              )
-              .order('created_at');
+    final rows = await client
+        .from('stores')
+        .select('*,cities(id,name,name_th,name_shn,name_en,name_my,is_active)')
+        .order('created_at');
+    return _records(rows);
+  }
+
+  @override
+  Future<List<StoreRecord>> publicStores() async {
+    final rows = await client.rpc('get_public_stores') as List? ?? const [];
+    return _records(rows);
+  }
+
+  List<StoreRecord> _records(List<dynamic> rows) {
     return rows.map((row) {
       final data = _json(row);
       return StoreRecord.fromJson({
@@ -698,7 +767,6 @@ class SupabaseStoreRepository implements StoreRepository {
       'opening_time': hours.isEmpty ? null : hours.first.trim(),
       'closing_time': hours.length < 2 ? null : hours.last.trim(),
       'status': 'pending',
-      'lifecycle_status': 'pending',
       'is_promoted': false,
     };
   }
@@ -804,7 +872,7 @@ class SupabaseReportRepository implements ReportRepository {
     if (report.type == 'store') 'store_id': report.targetId,
     'reason': report.reason,
     'status': 'open',
-    'workflow_status': 'pending',
+    'status': 'pending',
   });
 }
 
@@ -997,6 +1065,88 @@ class SupabaseStorageService implements StorageService {
     }
     return client.storage.from(targetBucket).getPublicUrl(path);
   }
+
+  @override
+  Future<StoredMedia> persistPrivateBinary({
+    required String sourcePath,
+    required String bucket,
+    required String objectPrefix,
+    required String extension,
+    required String mimeType,
+  }) async {
+    final bytes = await XFile(sourcePath).readAsBytes();
+    return persistPrivateBytes(
+      bytes: bytes,
+      bucket: bucket,
+      objectPrefix: objectPrefix,
+      extension: extension,
+      mimeType: mimeType,
+    );
+  }
+
+  @override
+  Future<StoredMedia> persistPrivateBytes({
+    required List<int> bytes,
+    required String bucket,
+    required String objectPrefix,
+    required String extension,
+    required String mimeType,
+  }) async {
+    final userId = client.auth.currentUser?.id;
+    if (userId == null) throw StateError('login_required');
+    final path = '$objectPrefix/${const Uuid().v4()}.$extension';
+    await client.storage
+        .from(bucket)
+        .uploadBinary(
+          path,
+          Uint8List.fromList(bytes),
+          fileOptions: FileOptions(contentType: mimeType),
+        );
+    try {
+      final row = await client
+          .from('media_assets')
+          .insert({
+            'owner_id': userId,
+            'bucket': bucket,
+            'object_path': path,
+            'mime_type': mimeType,
+            'size_bytes': bytes.length,
+          })
+          .select('id')
+          .single();
+      return StoredMedia(
+        id: '${row['id']}',
+        bucket: bucket,
+        objectPath: path,
+        sizeBytes: bytes.length,
+      );
+    } catch (_) {
+      await client.storage.from(bucket).remove([path]);
+      rethrow;
+    }
+  }
+
+  @override
+  Future<String> createSignedUrl({
+    required String bucket,
+    required String objectPath,
+    required int expiresInSeconds,
+  }) async {
+    try {
+      return await client.storage
+          .from(bucket)
+          .createSignedUrl(objectPath, expiresInSeconds);
+    } catch (error, stackTrace) {
+      // Never log the signed URL itself. Bucket/path and caller identity are
+      // enough to identify an RLS denial while keeping access tokens private.
+      debugPrint(
+        'Listing media signed URL denied: bucket=$bucket path=$objectPath '
+        'user=${client.auth.currentUser?.id ?? 'anon'} error=$error',
+      );
+      debugPrintStack(stackTrace: stackTrace);
+      rethrow;
+    }
+  }
 }
 
 class SupabaseAdminRepository implements AdminRepository {
@@ -1030,13 +1180,33 @@ class SupabaseAdminRepository implements AdminRepository {
 
   @override
   Future<bool> login(String email, String password) async {
-    await client.auth.signInWithPassword(
-      email: email.trim(),
-      password: password,
-    );
-    _authenticated = await client.rpc('is_active_admin') == true;
-    if (!_authenticated) await client.auth.signOut();
-    return _authenticated;
+    final normalizedEmail = email.trim().toLowerCase();
+    if (normalizedEmail.isEmpty || password.isEmpty) {
+      throw StateError('admin_credentials_required');
+    }
+    _authenticated = false;
+    // Never log credentials. This marker separates a synchronous client/config
+    // failure from an HTTP failure in the browser console.
+    debugPrint('Admin login: starting Auth request');
+    try {
+      final response = await client.auth.signInWithPassword(
+        email: normalizedEmail,
+        password: password,
+      );
+      if (response.session == null) throw StateError('admin_session_missing');
+      debugPrint('Admin login: Auth session established; checking admin role');
+      _authenticated = await client.rpc('is_active_admin') == true;
+      if (!_authenticated) {
+        debugPrint('Admin login: is_active_admin returned false');
+        await client.auth.signOut();
+      }
+      return _authenticated;
+    } catch (error, stackTrace) {
+      _authenticated = false;
+      debugPrint('Admin login failed before completion: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      rethrow;
+    }
   }
 
   @override
@@ -1098,38 +1268,21 @@ class SupabaseAdminRepository implements AdminRepository {
       () => client
           .from('listings')
           .select(
-            'id,owner_id,store_id,title,description,category,category_id,'
+            'id,owner_id,store_id,title,description,category_id,'
             'price,currency,city,status,created_at,latitude,longitude,'
-            'is_location_visible,listing_images(id,image_url,media_id,sort_order,'
-            'media_assets(bucket,object_path))',
+            'is_location_visible,listing_videos(id,video_media_id,thumbnail_media_id,'
+            'duration_milliseconds,size_bytes,'
+            'video_media_assets:media_assets!listing_videos_video_media_id_fkey(object_path),'
+            'thumbnail_media_assets:media_assets!listing_videos_thumbnail_media_id_fkey(object_path))',
           )
           .order('created_at', ascending: false)
           .range(page * pageSize, (page + 1) * pageSize - 1),
     );
     return rows.map((row) {
       final value = _json(row);
-      final images =
-          (value['listing_images'] as List? ?? const []).map(_json).toList()
-            ..sort(
-              (a, b) => ((a['sort_order'] as num?)?.toInt() ?? 0).compareTo(
-                (b['sort_order'] as num?)?.toInt() ?? 0,
-              ),
-            );
-      value['images'] = images
-          .map((image) {
-            final media = image['media_assets'];
-            if (media is Map) {
-              final mediaRow = _json(media);
-              final bucket = '${mediaRow['bucket'] ?? ''}';
-              final path = '${mediaRow['object_path'] ?? ''}';
-              if (bucket.isNotEmpty && path.isNotEmpty) {
-                return client.storage.from(bucket).getPublicUrl(path);
-              }
-            }
-            return '${image['image_url'] ?? ''}';
-          })
-          .where((url) => url.isNotEmpty)
-          .toList();
+      final videos = value['listing_videos'] as List? ?? const [];
+      value['listing_video'] = videos.isEmpty ? null : videos.first;
+      value.remove('listing_videos');
       return value;
     }).toList();
   }
@@ -1140,18 +1293,31 @@ class SupabaseAdminRepository implements AdminRepository {
     int pageSize = 50,
   }) async {
     _guard();
-    return (await _timed(
+    final rows = await _timed(
       'stores.page_1',
       () => client
           .from('stores')
           .select(
-            'id,owner_id,name,description,logo_url,category,category_id,'
+            'id,owner_id,name,description,logo_media_id,cover_media_id,category_id,'
             'phone,viber_phone,city,status,is_promoted,created_at,'
-            'latitude,longitude',
+            'latitude,longitude,logo_media:media_assets!stores_logo_media_id_fkey(bucket,object_path)',
           )
           .order('created_at', ascending: false)
           .range(page * pageSize, (page + 1) * pageSize - 1),
-    )).map(_json).toList();
+    );
+    return rows.map((row) {
+      final value = _json(row);
+      final media = value['logo_media'];
+      if (media is Map) {
+        final asset = _json(media);
+        final bucket = '${asset['bucket'] ?? ''}';
+        final path = '${asset['object_path'] ?? ''}';
+        if (bucket.isNotEmpty && path.isNotEmpty) {
+          value['logo_url'] = client.storage.from(bucket).getPublicUrl(path);
+        }
+      }
+      return value;
+    }).toList();
   }
 
   @override
@@ -1164,15 +1330,14 @@ class SupabaseAdminRepository implements AdminRepository {
       'reports.page_1',
       () => client
           .from('reports')
-          .select('id,listing_id,store_id,reason,workflow_status,created_at')
+          .select('id,listing_id,store_id,reason,status,created_at')
           .order('created_at', ascending: false)
           .range(page * pageSize, (page + 1) * pageSize - 1),
     )).map((row) {
       final value = _json(row);
       value['target_id'] = value['listing_id'] ?? value['store_id'];
       value['type'] = value['listing_id'] == null ? 'store' : 'listing';
-      value['reviewed'] = value['workflow_status'] != 'pending';
-      value['status'] = value['workflow_status'];
+      value['reviewed'] = value['status'] != 'pending';
       return value;
     }).toList();
   }
