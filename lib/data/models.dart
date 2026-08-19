@@ -1,5 +1,5 @@
 class UserProfile {
-  final String id, name, phone, email, avatar, city;
+  final String id, name, phone, email, avatar, city, viber;
   final String? cityId;
   final DateTime createdAt;
   const UserProfile({
@@ -9,6 +9,7 @@ class UserProfile {
     required this.email,
     this.avatar = '',
     this.city = '',
+    this.viber = '',
     this.cityId,
     required this.createdAt,
   });
@@ -20,6 +21,7 @@ class UserProfile {
     'avatar': avatar,
     'city': city,
     'city_id': cityId,
+    'viber_phone': viber,
     'created_at': createdAt.toIso8601String(),
   };
   factory UserProfile.fromJson(Map<String, dynamic> j) => UserProfile(
@@ -30,6 +32,7 @@ class UserProfile {
     avatar: '${j['avatar'] ?? ''}',
     city: '${j['city'] ?? ''}',
     cityId: j['city_id']?.toString(),
+    viber: '${j['viber_phone'] ?? ''}',
     createdAt: DateTime.tryParse('${j['created_at']}') ?? DateTime.now(),
   );
 }
@@ -164,7 +167,8 @@ class ListingRecord {
   final bool isPublished, isHidden;
   final DateTime? deletedAt;
   final double price;
-  final List<String> images;
+
+  final ListingVideoRecord? video;
   final int likes, views;
   final DateTime createdAt, updatedAt;
   const ListingRecord({
@@ -177,7 +181,7 @@ class ListingRecord {
     required this.currency,
     required this.city,
     required this.status,
-    required this.images,
+    this.video,
     required this.phone,
     required this.viber,
     required this.createdAt,
@@ -207,7 +211,7 @@ class ListingRecord {
     'city_id': cityId,
     if (cityRecord != null) 'cities': cityRecord!.toJson(),
     'status': status,
-    'images': images,
+    if (video != null) 'listing_video': video!.toJson(),
     'phone': phone,
     'viber_phone': viber,
     'likes': likes,
@@ -236,7 +240,11 @@ class ListingRecord {
     currency: '${j['currency'] ?? 'MMK'}',
     city: '${j['city'] ?? ''}',
     status: '${j['status'] ?? 'available'}',
-    images: List<String>.from(j['images'] ?? const []),
+    video: j['listing_video'] is Map
+        ? ListingVideoRecord.fromJson(
+            Map<String, dynamic>.from(j['listing_video'] as Map),
+          )
+        : throw const FormatException('listing_video_required'),
     phone: '${j['phone'] ?? ''}',
     viber: '${j['viber_phone'] ?? ''}',
     likes: (j['likes'] as num?)?.toInt() ?? 0,
@@ -249,6 +257,51 @@ class ListingRecord {
     deletedAt: DateTime.tryParse('${j['deleted_at']}'),
     createdAt: DateTime.tryParse('${j['created_at']}') ?? DateTime.now(),
     updatedAt: DateTime.tryParse('${j['updated_at']}') ?? DateTime.now(),
+  );
+}
+
+/// Metadata only; video and thumbnail bytes always remain in Object Storage.
+class ListingVideoRecord {
+  final String id;
+  final String videoMediaId;
+  final String thumbnailMediaId;
+  final String videoPath;
+  final String thumbnailPath;
+  final int durationMilliseconds;
+  final int sizeBytes;
+
+  const ListingVideoRecord({
+    required this.id,
+    required this.videoMediaId,
+    required this.thumbnailMediaId,
+    required this.videoPath,
+    required this.thumbnailPath,
+    required this.durationMilliseconds,
+    required this.sizeBytes,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'video_media_id': videoMediaId,
+    'thumbnail_media_id': thumbnailMediaId,
+    'video_path': videoPath,
+    'thumbnail_path': thumbnailPath,
+    'duration_milliseconds': durationMilliseconds,
+    'size_bytes': sizeBytes,
+  };
+
+  factory ListingVideoRecord.fromJson(
+    Map<String, dynamic> json,
+  ) => ListingVideoRecord(
+    id: '${json['id'] ?? ''}',
+    videoMediaId: '${json['video_media_id'] ?? ''}',
+    thumbnailMediaId: '${json['thumbnail_media_id'] ?? ''}',
+    videoPath:
+        '${json['video_path'] ?? json['video_media_assets']?['object_path'] ?? ''}',
+    thumbnailPath:
+        '${json['thumbnail_path'] ?? json['thumbnail_media_assets']?['object_path'] ?? ''}',
+    durationMilliseconds: (json['duration_milliseconds'] as num?)?.toInt() ?? 0,
+    sizeBytes: (json['size_bytes'] as num?)?.toInt() ?? 0,
   );
 }
 
