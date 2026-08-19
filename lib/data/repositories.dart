@@ -19,18 +19,25 @@ abstract interface class AuthRepository {
 
 abstract interface class ProfileRepository {
   Future<UserProfile?> get(String id);
-  Future<void> save(UserProfile profile);
+  Future<UserProfile> save(UserProfile profile);
 }
 
 abstract interface class ListingRepository {
   Future<List<ListingRecord>> all();
+  Future<List<ListingRecord>> publicListings();
   Future<ListingRecord> create(ListingRecord value);
   Future<void> update(ListingRecord value);
+  Future<void> updateStatus({
+    required String id,
+    required String ownerId,
+    required String status,
+  });
   Future<void> delete(String id, String ownerId);
 }
 
 abstract interface class StoreRepository {
   Future<List<StoreRecord>> all();
+  Future<List<StoreRecord>> publicStores();
   Future<StoreRecord> create(StoreRecord value);
   Future<void> update(StoreRecord value);
   Future<void> delete(String id, String ownerId);
@@ -91,6 +98,36 @@ abstract interface class StorageService {
     String extension, {
     String? bucket,
     String? objectPrefix,
+  });
+  Future<StoredMedia> persistPrivateBinary({
+    required String sourcePath,
+    required String bucket,
+    required String objectPrefix,
+    required String extension,
+    required String mimeType,
+  });
+  Future<StoredMedia> persistPrivateBytes({
+    required List<int> bytes,
+    required String bucket,
+    required String objectPrefix,
+    required String extension,
+    required String mimeType,
+  });
+  Future<String> createSignedUrl({
+    required String bucket,
+    required String objectPath,
+    required int expiresInSeconds,
+  });
+}
+
+class StoredMedia {
+  final String id, bucket, objectPath;
+  final int sizeBytes;
+  const StoredMedia({
+    required this.id,
+    required this.bucket,
+    required this.objectPath,
+    required this.sizeBytes,
   });
 }
 
