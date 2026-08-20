@@ -41,6 +41,9 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
           debugPrint(
             'CURRENT SESSION NULL=${Supabase.instance.client.auth.currentSession == null}',
           );
+          debugPrint(
+            'CURRENT USER NULL=${Supabase.instance.client.auth.currentUser == null}',
+          );
         }
         if (data.event == AuthChangeEvent.signedIn &&
             data.session != null &&
@@ -56,31 +59,31 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
       },
     );
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-  try {
-    if (kIsWeb && Uri.base.queryParameters['code'] != null) {
-      await SuikaiService.auth.completeTelegramWebLogin();
-    }
+      try {
+        if (kIsWeb && Uri.base.queryParameters['code'] != null) {
+          await SuikaiService.auth.completeTelegramWebLogin();
+        }
 
-    if (SuikaiService.hasValidSession && mounted) {
-      await _completeLoginFromAuthCallback();
-    }
-  } catch (error, stackTrace) {
-    if (kDebugMode) {
-      debugPrint('Telegram callback failed: $error');
-      debugPrintStack(stackTrace: stackTrace);
-    }
+        if (SuikaiService.hasValidSession && mounted) {
+          await _completeLoginFromAuthCallback();
+        }
+      } catch (error, stackTrace) {
+        if (kDebugMode) {
+          debugPrint('Telegram callback failed: $error');
+          debugPrintStack(stackTrace: stackTrace);
+        }
 
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            AppLocalizations.of(context).ui('telegramLoginFailed'),
-          ),
-        ),
-      );
-    }
-  }
-});
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                AppLocalizations.of(context).ui('telegramLoginFailed'),
+              ),
+            ),
+          );
+        }
+      }
+    });
   }
 
   @override
@@ -91,6 +94,9 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
     debugPrint('SESSION NULL=${_lastSessionWasNull ?? true}');
     debugPrint(
       'CURRENT SESSION NULL=${Supabase.instance.client.auth.currentSession == null}',
+    );
+    debugPrint(
+      'CURRENT USER NULL=${Supabase.instance.client.auth.currentUser == null}',
     );
   }
 
@@ -138,7 +144,9 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
       final message = _isCancellationError(error)
           ? AppLocalizations.of(context).ui('telegramLoginCancelled')
           : AppLocalizations.of(context).ui('telegramLoginFailed');
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
     } finally {
       if (mounted) {
         setState(() {
@@ -152,7 +160,11 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
   Future<void> _completeLoginFromAuthCallback() async {
     final session = Supabase.instance.client.auth.currentSession;
     if (_didNavigate || !mounted || session == null) return;
-    _didNavigate = true;
+    setState(() {
+      _didNavigate = true;
+      busy = true;
+      telegramBusy = true;
+    });
     try {
       if (kDebugMode) {
         debugPrint(
@@ -165,7 +177,13 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
         Navigator.pushReplacementNamed(context, widget.pendingRoute);
       }
     } catch (error, stackTrace) {
-      _didNavigate = false;
+      if (mounted) {
+        setState(() {
+          _didNavigate = false;
+          busy = false;
+          telegramBusy = false;
+        });
+      }
       if (kDebugMode) {
         debugPrint('Profile sync after Telegram login failed: $error');
         debugPrintStack(stackTrace: stackTrace);
@@ -350,9 +368,9 @@ class _RegisterPageState extends State<RegisterPage> {
       final message = _isCancellationError(error)
           ? AppLocalizations.of(context).ui('telegramLoginCancelled')
           : AppLocalizations.of(context).ui('telegramLoginFailed');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
     } finally {
       if (mounted) setState(() => busy = false);
     }
@@ -419,7 +437,9 @@ class _RegisterPageState extends State<RegisterPage> {
                   )
                 : const Icon(Icons.send_rounded),
             label: Text(
-              busy ? l10n.ui('openingTelegram') : l10n.ui('registerWithTelegram'),
+              busy
+                  ? l10n.ui('openingTelegram')
+                  : l10n.ui('registerWithTelegram'),
             ),
           ),
         ],
@@ -437,9 +457,13 @@ class ProfileSettingsPage extends StatefulWidget {
 class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
   final name = TextEditingController(),
       phone = TextEditingController(),
-      email = TextEditingController();
+      email = TextEditingController(),
+      viber = TextEditingController(),
+      city = TextEditingController();
   UserProfile? profile;
   String avatar = '';
+  bool _saving = false;
+  String? _saveError;
   @override
   void initState() {
     super.initState();
@@ -448,14 +472,17 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
 
   Future<void> load() async {
     final p = await SuikaiService.currentProfile();
-    if (p != null && mounted)
+    if (p != null && mounted) {
       setState(() {
         profile = p;
         name.text = p.name;
         phone.text = p.phone;
         email.text = p.email;
+        viber.text = p.viber;
+        city.text = p.city;
         avatar = p.avatar;
       });
+    }
   }
 
   @override
@@ -463,6 +490,8 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
     name.dispose();
     phone.dispose();
     email.dispose();
+    viber.dispose();
+    city.dispose();
     super.dispose();
   }
 
@@ -479,20 +508,52 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
 
   Future<void> save() async {
     final p = profile;
-    if (p == null) return;
-    await SuikaiService.updateProfile(
-      UserProfile(
-        id: p.id,
-        name: name.text.trim(),
-        phone: phone.text.trim(),
-        email: email.text.trim(),
-        avatar: avatar,
-        city: p.city,
-        cityId: p.cityId,
-        createdAt: p.createdAt,
-      ),
-    );
-    if (mounted) Navigator.pop(context);
+    if (p == null || _saving) return;
+    final cityText = city.text.trim();
+    CityRecord? matchedCity;
+    if (cityText.isNotEmpty) {
+      final normalized = cityText.toLowerCase();
+      for (final candidate in SuikaiService.activeCities) {
+        final names = [
+          candidate.name,
+          candidate.nameTh,
+          candidate.nameShn,
+          candidate.nameEn,
+          candidate.nameMy,
+        ];
+        if (names.any((name) => name.trim().toLowerCase() == normalized)) {
+          matchedCity = candidate;
+          break;
+        }
+      }
+    }
+    setState(() {
+      _saving = true;
+      _saveError = null;
+    });
+    try {
+      final saved = await SuikaiService.updateProfile(
+        UserProfile(
+          id: p.id,
+          name: name.text.trim(),
+          phone: phone.text.trim(),
+          email: email.text.trim(),
+          avatar: avatar,
+          city: cityText,
+          cityId:
+              matchedCity?.id ?? (cityText == p.city.trim() ? p.cityId : null),
+          viber: viber.text.trim(),
+          createdAt: p.createdAt,
+        ),
+      );
+      if (mounted) Navigator.pop(context, saved);
+    } catch (error, stackTrace) {
+      debugPrint('Profile save failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (mounted) setState(() => _saveError = '$error');
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
   }
 
   @override
@@ -552,12 +613,33 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
           ),
           const SizedBox(height: 12),
           TextField(
+            controller: viber,
+            decoration: const InputDecoration(labelText: 'Viber'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: city,
+            decoration: InputDecoration(
+              labelText: l10n.source('เมืองที่อยู่'),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
             controller: email,
             readOnly: true,
             decoration: InputDecoration(labelText: l10n.ui('email')),
           ),
           const SizedBox(height: 20),
-          ElevatedButton(onPressed: save, child: Text(l10n.save)),
+          if (_saveError != null) ...[
+            Text(_saveError!, style: const TextStyle(color: Colors.red)),
+            const SizedBox(height: 12),
+          ],
+          ElevatedButton(
+            onPressed: _saving ? null : save,
+            child: Text(
+              _saving ? l10n.source('กำลังบันทึก...') : l10n.save,
+            ),
+          ),
         ],
       ),
     );

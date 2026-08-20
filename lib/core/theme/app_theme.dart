@@ -5,11 +5,12 @@ class AppTheme {
 
   static const Color primaryOrange = Color(0xFFFF5A0A);
   static const Color primaryOrangeLight = Color(0xFFFFEEE5);
-  static const Color background = Color(0xFFFFFFFF);
+  static const Color navigationBlue = Color(0xFFFFFFFF);
+  static const Color background = Color(0xFFFFFBF8);
   static const Color surface = Colors.white;
   static const Color textPrimary = Color(0xFF202124);
   static const Color textSecondary = Color(0xFF6C7078);
-  static const Color divider = Color(0xFFEAECEF);
+  static const Color divider = Color(0xFFF0E9E5);
   static const Color danger = Color(0xFFD92D20);
   static const Color success = Color(0xFF16A34A);
   static const Color warning = Color(0xFFE28A00);
@@ -74,7 +75,7 @@ class AppTheme {
       ),
       inputDecorationTheme: InputDecorationTheme(
         filled: true,
-        fillColor: surface,
+        fillColor: const Color(0xFFFFFCFA),
         hintStyle: const TextStyle(color: textSecondary),
         contentPadding: const EdgeInsets.symmetric(
           horizontal: 16,
@@ -89,11 +90,25 @@ class AppTheme {
           borderSide: const BorderSide(color: primaryOrange, width: 1.5),
         ),
       ),
-      navigationBarTheme: const NavigationBarThemeData(
+      navigationBarTheme: NavigationBarThemeData(
         backgroundColor: surface,
-        indicatorColor: primaryOrangeLight,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        shadowColor: Colors.transparent,
+        indicatorColor: Colors.transparent,
+        iconTheme: WidgetStateProperty.resolveWith(
+          (states) => IconThemeData(
+            color: states.contains(WidgetState.selected)
+                ? primaryOrange
+                : textSecondary,
+          ),
+        ),
         labelTextStyle: WidgetStatePropertyAll(
-          TextStyle(fontSize: 12, fontWeight: FontWeight.w500),
+          TextStyle(
+            color: textSecondary,
+            fontSize: 12,
+            fontWeight: FontWeight.w500,
+          ),
         ),
       ),
       dividerColor: divider,

@@ -1035,9 +1035,8 @@ class _ShortVideos extends StatelessWidget {
         id: value.id,
         tiktokUrl: value.tiktokUrl,
         title: value.title,
-        sortOrder: value.sortOrder,
+        displayOrder: value.displayOrder,
         isActive: active,
-        createdBy: value.createdBy,
         createdAt: value.createdAt,
         updatedAt: DateTime.now(),
       ),
@@ -1083,7 +1082,7 @@ class _ShortVideos extends StatelessWidget {
                     leading: CircleAvatar(
                       backgroundColor: AppTheme.orangeSoft,
                       foregroundColor: AppTheme.orange,
-                      child: Text('${value.sortOrder}'),
+                      child: Text('${value.displayOrder}'),
                     ),
                     title: Text(
                       _shortVideoDate(value.createdAt),
@@ -1142,7 +1141,7 @@ class _ShortVideoDialogState extends State<_ShortVideoDialog> {
     super.initState();
     url = TextEditingController(text: widget.current?.tiktokUrl ?? '');
     createdAt = widget.current?.createdAt ?? DateTime.now();
-    order = TextEditingController(text: '${widget.current?.sortOrder ?? 0}');
+    order = TextEditingController(text: '${widget.current?.displayOrder ?? 0}');
     active = widget.current?.isActive ?? true;
   }
 
@@ -1209,9 +1208,8 @@ class _ShortVideoDialogState extends State<_ShortVideoDialog> {
               id: widget.current?.id ?? const Uuid().v4(),
               tiktokUrl: url.text.trim(),
               title: widget.current?.title ?? '',
-              sortOrder: int.parse(order.text),
+              displayOrder: int.parse(order.text),
               isActive: active,
-              createdBy: widget.current?.createdBy,
               createdAt: createdAt,
               updatedAt: now,
             ),
@@ -1419,7 +1417,10 @@ class _ListingsState extends State<_Listings> {
             itemBuilder: (_, i) {
               final p = rows[i];
               return ListTile(
-                leading: _VideoThumb(video: p['listing_video']),
+                leading: _VideoThumb(
+                  video: p['listing_video'],
+                  images: p['images'],
+                ),
                 title: Text(
                   '${p['title'] ?? ''}',
                   maxLines: 1,
@@ -1518,7 +1519,10 @@ class _ListingsState extends State<_Listings> {
           itemBuilder: (_, index) {
             final product = products[index];
             return ListTile(
-              leading: _VideoThumb(video: product['listing_video']),
+              leading: _VideoThumb(
+                video: product['listing_video'],
+                images: product['images'],
+              ),
               title: Text('${product['title'] ?? ''}'),
               subtitle: Text(
                 '${product['currency'] ?? ''} ${product['price'] ?? ''} • ${product['status'] ?? ''}',
@@ -1551,7 +1555,10 @@ class _ListingsState extends State<_Listings> {
               SizedBox(
                 height: 180,
                 width: double.maxFinite,
-                child: _AdminVideoPreview(video: p['listing_video']),
+                child: _AdminVideoPreview(
+                  video: p['listing_video'],
+                  images: p['images'],
+                ),
               ),
               const SizedBox(height: 12),
               SelectableText(
@@ -2541,7 +2548,8 @@ class _StoreLogo extends StatelessWidget {
 
 class _VideoThumb extends StatelessWidget {
   final dynamic video;
-  const _VideoThumb({required this.video});
+  final dynamic images;
+  const _VideoThumb({required this.video, this.images});
   @override
   Widget build(BuildContext context) {
     final record = video is Map
@@ -2553,10 +2561,7 @@ class _VideoThumb extends StatelessWidget {
         width: 56,
         height: 56,
         child: record == null
-            ? const ColoredBox(
-                color: AppTheme.orangeSoft,
-                child: Icon(Icons.videocam_outlined),
-              )
+            ? _LegacyListingImage(images: images, compact: true)
             : FutureBuilder<String>(
                 future: SuikaiService.signedThumbnailUrl(record),
                 builder: (_, snapshot) => snapshot.hasData
@@ -2573,23 +2578,39 @@ class _VideoThumb extends StatelessWidget {
 
 class _AdminVideoPreview extends StatelessWidget {
   final dynamic video;
-  const _AdminVideoPreview({required this.video});
+  final dynamic images;
+  const _AdminVideoPreview({required this.video, this.images});
   @override
   Widget build(BuildContext context) {
     final record = video is Map
         ? ListingVideoRecord.fromJson(Map<String, dynamic>.from(video as Map))
         : null;
-    if (record == null)
-      return const ColoredBox(
-        color: AppTheme.orangeSoft,
-        child: Icon(Icons.videocam_outlined, size: 48),
-      );
+    if (record == null) return _LegacyListingImage(images: images);
     return FutureBuilder<String>(
       future: SuikaiService.signedThumbnailUrl(record),
       builder: (_, snapshot) => snapshot.hasData
           ? Image.network(snapshot.data!, fit: BoxFit.contain)
           : const Center(child: Icon(Icons.videocam_outlined, size: 48)),
     );
+  }
+}
+
+class _LegacyListingImage extends StatelessWidget {
+  final dynamic images;
+  final bool compact;
+  const _LegacyListingImage({this.images, this.compact = false});
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = images is List ? images as List : const [];
+    final url = rows.isEmpty ? '' : '${rows.first}'.trim();
+    if (url.isEmpty) {
+      return ColoredBox(
+        color: AppTheme.orangeSoft,
+        child: Icon(Icons.image_not_supported_outlined, size: compact ? 24 : 48),
+      );
+    }
+    return Image.network(url, fit: BoxFit.cover);
   }
 }
 

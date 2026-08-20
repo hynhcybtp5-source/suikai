@@ -57,6 +57,45 @@ class SupabaseBackend {
 
 Map<String, dynamic> _json(dynamic value) =>
     Map<String, dynamic>.from(value as Map);
+
+/// PostgREST normally serializes an embedded to-many relation as a list, but
+/// older views/proxies can return a single object when exactly one row exists.
+/// Normalize the response shape before relation consumers inspect it.
+List<dynamic> _relationRows(dynamic value) => switch (value) {
+  List<dynamic> rows => rows,
+  List rows => rows,
+  Map<String, dynamic> row => [row],
+  Map row => [Map<String, dynamic>.from(row)],
+  _ => const [],
+};
+
+List<String> _listingImageUrls(
+  SupabaseClient client,
+  dynamic relation,
+) {
+  final rows = _relationRows(relation).map(_json).toList()
+    ..sort(
+      (a, b) => ((a['sort_order'] as num?)?.toInt() ?? 0).compareTo(
+        (b['sort_order'] as num?)?.toInt() ?? 0,
+      ),
+    );
+  final urls = <String>[];
+  for (final image in rows) {
+    var url = '${image['image_url'] ?? ''}'.trim();
+    final media = image['media_assets'];
+    if (media is Map) {
+      final asset = _json(media);
+      final bucket = '${asset['bucket'] ?? ''}'.trim();
+      final path = '${asset['object_path'] ?? ''}'.trim();
+      if (bucket.isNotEmpty && path.isNotEmpty) {
+        url = client.storage.from(bucket).getPublicUrl(path);
+      }
+    }
+    if (url.isNotEmpty && !urls.contains(url)) urls.add(url);
+  }
+  return urls;
+}
+
 String _mediaUrl(SupabaseClient client, Map<String, dynamic> media) => client
     .storage
     .from('${media['bucket']}')
@@ -132,11 +171,17 @@ class SupabaseAuthRepository implements AuthRepository {
   @override
   String? get currentUserId => client.auth.currentUser?.id;
 
+  @override
   Future<void> restore() async {
+    debugPrint('AUTH RESTORE START');
     try {
       await client.auth.getSession();
+      debugPrint(
+        'AUTH RESTORE COMPLETE sessionNull=${client.auth.currentSession == null} '
+        'currentUserNull=${client.auth.currentUser == null}',
+      );
     } on AuthException catch (error, stackTrace) {
-      debugPrint('Supabase auth restore failed: $error');
+      debugPrint('AUTH RESTORE FAILED errorType=${error.runtimeType}');
       debugPrintStack(stackTrace: stackTrace);
     }
   }
@@ -190,6 +235,7 @@ class SupabaseAuthRepository implements AuthRepository {
 
   @override
   Future<void> loginWithTelegram() async {
+    debugPrint('LOGIN START provider=telegram');
     if (_telegramClientId.isEmpty || _telegramCallbackUri.isEmpty) {
       throw StateError('telegram_client_id_not_configured');
     }
@@ -204,16 +250,22 @@ class SupabaseAuthRepository implements AuthRepository {
     await preferences.setString(_telegramStatePreference, state);
     await preferences.setString(_telegramVerifierPreference, verifier);
 
+    final callbackUri = Uri.parse(_telegramCallbackUri);
     final authorizationUri = Uri.parse(_telegramAuthorizationUrl).replace(
       queryParameters: {
         'response_type': 'code',
         'client_id': _telegramClientId,
         'redirect_uri': _telegramCallbackUri,
+        'origin': callbackUri.origin,
         'scope': 'openid',
         'state': state,
         'code_challenge': challenge,
         'code_challenge_method': 'S256',
       },
+    );
+    debugPrint(
+      'TELEGRAM AUTH URL CREATED '
+      'callbackHost=${callbackUri.host}',
     );
 
     final launched = await launchUrl(
@@ -233,6 +285,10 @@ class SupabaseAuthRepository implements AuthRepository {
   Future<void> completeTelegramLogin(Uri callbackUri) async {
     final code = callbackUri.queryParameters['code'];
     final callbackError = callbackUri.queryParameters['error'];
+    debugPrint(
+      'CALLBACK RECEIVED hasCode=${code?.isNotEmpty == true} '
+      'hasError=${callbackError?.isNotEmpty == true}',
+    );
     if ((code == null || code.isEmpty) &&
         (callbackError == null || callbackError.isEmpty)) {
       return;
@@ -246,10 +302,12 @@ class SupabaseAuthRepository implements AuthRepository {
     await preferences.remove(_telegramStatePreference);
     await preferences.remove(_telegramVerifierPreference);
 
-    if (expectedState == null ||
-        verifier == null ||
-        receivedState == null ||
-        !_constantTimeEquals(expectedState, receivedState)) {
+    final stateValid = expectedState != null &&
+        verifier != null &&
+        receivedState != null &&
+        _constantTimeEquals(expectedState, receivedState);
+    debugPrint('CALLBACK STATE VALID=$stateValid');
+    if (!stateValid) {
       throw StateError('telegram_oauth_state_mismatch');
     }
     if (callbackError != null && callbackError.isNotEmpty) {
@@ -261,21 +319,39 @@ class SupabaseAuthRepository implements AuthRepository {
       throw StateError('telegram_authorization_code_missing');
     }
 
-    final response = await client.functions.invoke(
-      'telegram-auth',
-      body: {
-        'code': code,
-        'code_verifier': verifier,
-        'redirect_uri': _telegramCallbackUri,
-      },
-    );
+    debugPrint('TOKEN EXCHANGE START');
+    late final FunctionResponse response;
+    try {
+      response = await client.functions.invoke(
+        'telegram-auth',
+        body: {
+          'code': code,
+          'code_verifier': verifier,
+          'redirect_uri': _telegramCallbackUri,
+        },
+      );
+      debugPrint('TOKEN EXCHANGE SUCCESS');
+    } catch (error) {
+      debugPrint('TOKEN EXCHANGE FAILED errorType=${error.runtimeType}');
+      rethrow;
+    }
     final payload = _json(response.data);
     final tokenHash = payload['token_hash']?.toString();
     if (tokenHash == null || tokenHash.isEmpty) {
       throw StateError('telegram_token_hash_missing');
     }
 
-    await client.auth.verifyOTP(type: OtpType.email, tokenHash: tokenHash);
+    debugPrint('VERIFY OTP START');
+    try {
+      await client.auth.verifyOTP(type: OtpType.email, tokenHash: tokenHash);
+      debugPrint(
+        'VERIFY OTP SUCCESS sessionNull=${client.auth.currentSession == null} '
+        'currentUserNull=${client.auth.currentUser == null}',
+      );
+    } catch (error) {
+      debugPrint('VERIFY OTP FAILED errorType=${error.runtimeType}');
+      rethrow;
+    }
     await syncCurrentProfile();
   }
 
@@ -330,6 +406,37 @@ class SupabaseProfileRepository implements ProfileRepository {
 
   @override
   Future<UserProfile?> get(String id) async {
+    if (client.auth.currentUser?.id != id) {
+      final row = await client.rpc(
+        'get_public_seller_profile',
+        params: {'p_owner_id': id},
+      );
+      if (row is! Map) return null;
+      final data = _json(row);
+      final bucket = data['avatar_bucket']?.toString();
+      final path = data['avatar_path']?.toString();
+      if (bucket != null &&
+          bucket.isNotEmpty &&
+          path != null &&
+          path.isNotEmpty) {
+        data['avatar'] = _mediaUrl(
+          client,
+          {'bucket': bucket, 'object_path': path},
+        );
+      }
+      final profile = _profileFromRow(data);
+      return UserProfile(
+        id: profile.id,
+        name: profile.name,
+        phone: '',
+        email: '',
+        avatar: '${data['avatar'] ?? ''}',
+        city: profile.city,
+        cityId: profile.cityId,
+        viber: '',
+        createdAt: profile.createdAt,
+      );
+    }
     final row = await client
         .from('profiles')
         .select()
@@ -450,10 +557,11 @@ class SupabaseCategoryRepository implements CategoryRepository {
       .eq('id', value.id);
 
   @override
-  Future<void> setActive(String id, bool active) => client
-      .from('categories')
-      .update({'is_active': active, 'active': active})
-      .eq('id', id);
+  Future<void> setActive(String id, bool active) =>
+      client
+          .from('categories')
+          .update({'is_active': active, 'active': active})
+          .eq('id', id);
 
   @override
   Future<void> reorder(String type, List<String> orderedIds) async {
@@ -532,9 +640,10 @@ class SupabaseListingRepository implements ListingRepository {
     return ListingRecord.fromJson({
       ...row,
       'category': row['category_id'] ?? row['category'] ?? '',
-      'listing_video': row['listing_videos'] is List
-          ? (row['listing_videos'] as List).firstOrNull
-          : (row['listing_videos'] ?? row['listing_video']),
+      'listing_video':
+          _relationRows(row['listing_videos']).firstOrNull ??
+          row['listing_video'],
+      'images': _listingImageUrls(client, row['listing_images']),
       'likes': likes,
       'views': views,
     });
@@ -557,6 +666,7 @@ class SupabaseListingRepository implements ListingRepository {
           '*, listing_videos(id,video_media_id,thumbnail_media_id,duration_milliseconds,size_bytes,'
           'video_media_assets:media_assets!listing_videos_video_media_id_fkey(object_path),'
           'thumbnail_media_assets:media_assets!listing_videos_thumbnail_media_id_fkey(object_path)), '
+          'listing_images(id,image_url,media_id,sort_order,media_assets(bucket,object_path)), '
           'cities(id,name,name_th,name_shn,name_en,name_my,is_active)',
         )
         .order('created_at', ascending: false);
@@ -584,10 +694,42 @@ class SupabaseListingRepository implements ListingRepository {
     'is_location_visible': value.isLocationVisible,
   };
 
+  Future<void> _replaceImages(ListingRecord value) async {
+    final oldRows = await client
+        .from('listing_images')
+        .select('media_id')
+        .eq('listing_id', value.id);
+    final mediaIds = <String?>[];
+    for (final url in value.images) {
+      mediaIds.add((await _mediaForUrl(client, url))?['id']?.toString());
+    }
+    await client.from('listing_images').delete().eq('listing_id', value.id);
+    if (value.images.isNotEmpty) {
+      await client.from('listing_images').insert([
+        for (var index = 0; index < value.images.length; index++)
+          {
+            'listing_id': value.id,
+            'image_url': value.images[index],
+            'media_id': mediaIds[index],
+            'sort_order': index,
+            'is_primary': index == 0,
+          },
+      ]);
+    }
+    final retained = mediaIds.whereType<String>().toSet();
+    for (final row in oldRows) {
+      final mediaId = row['media_id']?.toString();
+      if (!retained.contains(mediaId)) await _deleteMediaIfOrphan(client, mediaId);
+    }
+  }
+
   @override
   Future<ListingRecord> create(ListingRecord value) async {
     try {
       final authUserId = client.auth.currentUser?.id;
+      if (value.ownerId.trim().isEmpty) {
+        throw StateError('listing_owner_required');
+      }
       if (authUserId == null || authUserId != value.ownerId) {
         throw StateError('listing_owner_auth_mismatch');
       }
@@ -613,19 +755,22 @@ class SupabaseListingRepository implements ListingRepository {
           .insert(_payload(value))
           .select()
           .single();
+      await _replaceImages(value);
       final video = value.video;
-      if (video == null) throw StateError('listing_video_required');
-      await client.from('listing_videos').insert({
-        'listing_id': value.id,
-        'video_media_id': video.videoMediaId,
-        'thumbnail_media_id': video.thumbnailMediaId,
-        'duration_milliseconds': video.durationMilliseconds,
-        'size_bytes': video.sizeBytes,
-      });
+      if (video != null) {
+        await client.from('listing_videos').insert({
+          'listing_id': value.id,
+          'video_media_id': video.videoMediaId,
+          'thumbnail_media_id': video.thumbnailMediaId,
+          'duration_milliseconds': video.durationMilliseconds,
+          'size_bytes': video.sizeBytes,
+        });
+      }
       return ListingRecord.fromJson({
         ..._json(row),
         'category': row['category_id'] ?? row['category'] ?? value.category,
-        'listing_video': video.toJson(),
+        if (video != null) 'listing_video': video.toJson(),
+        'images': value.images,
       });
     } catch (error, stackTrace) {
       debugPrint(
@@ -675,6 +820,7 @@ class SupabaseListingRepository implements ListingRepository {
     if ('${updated['status']}' != value.status) {
       throw StateError('listing_status_update_mismatch');
     }
+    await _replaceImages(value);
     debugPrint(
       'Listing status updated: id=${value.id} status=${updated['status']}',
     );
@@ -871,7 +1017,6 @@ class SupabaseReportRepository implements ReportRepository {
     if (report.type == 'listing') 'listing_id': report.targetId,
     if (report.type == 'store') 'store_id': report.targetId,
     'reason': report.reason,
-    'status': 'open',
     'status': 'pending',
   });
 }
@@ -952,8 +1097,8 @@ class SupabaseShortVideoRepository implements ShortVideoRepository {
   Map<String, dynamic> _payload(ShortVideoRecord value) => {
     'id': value.id,
     'tiktok_url': value.tiktokUrl,
-    'title': value.title.trim().isEmpty ? null : value.title.trim(),
-    'sort_order': value.sortOrder,
+    'title': value.title.trim(),
+    'sort_order': value.displayOrder,
     'is_active': value.isActive,
     'created_by': value.createdBy ?? client.auth.currentUser?.id,
   };
@@ -1157,6 +1302,7 @@ class SupabaseAdminRepository implements AdminRepository {
   @override
   bool get isAuthenticated => _authenticated;
 
+  @override
   Future<void> restore() async {
     if (client.auth.currentUser == null) return;
     _authenticated = await client.rpc('is_active_admin') == true;
@@ -1268,21 +1414,24 @@ class SupabaseAdminRepository implements AdminRepository {
       () => client
           .from('listings')
           .select(
-            'id,owner_id,store_id,title,description,category_id,'
+            'id,owner_id,store_id,title,description,category,category_id,'
             'price,currency,city,status,created_at,latitude,longitude,'
             'is_location_visible,listing_videos(id,video_media_id,thumbnail_media_id,'
             'duration_milliseconds,size_bytes,'
             'video_media_assets:media_assets!listing_videos_video_media_id_fkey(object_path),'
-            'thumbnail_media_assets:media_assets!listing_videos_thumbnail_media_id_fkey(object_path))',
+            'thumbnail_media_assets:media_assets!listing_videos_thumbnail_media_id_fkey(object_path)),'
+            'listing_images(id,image_url,media_id,sort_order,media_assets(bucket,object_path))',
           )
           .order('created_at', ascending: false)
           .range(page * pageSize, (page + 1) * pageSize - 1),
     );
     return rows.map((row) {
       final value = _json(row);
-      final videos = value['listing_videos'] as List? ?? const [];
+      final videos = _relationRows(value['listing_videos']);
       value['listing_video'] = videos.isEmpty ? null : videos.first;
       value.remove('listing_videos');
+      value['images'] = _listingImageUrls(client, value['listing_images']);
+      value.remove('listing_images');
       return value;
     }).toList();
   }

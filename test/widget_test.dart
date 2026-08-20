@@ -7,6 +7,7 @@ import 'package:suikai/l10n/app_localizations.dart';
 import 'package:suikai/main.dart';
 import 'package:suikai/core/locale_controller.dart';
 import 'package:suikai/data/models.dart';
+import 'package:suikai/data/repositories.dart';
 import 'package:suikai/services/suikai_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'support/in_memory_repositories.dart';
@@ -16,6 +17,8 @@ void main() {
     SharedPreferences.setMockInitialValues({'selected_locale': 'th'});
     SuikaiService.auth = InMemoryAuthRepository();
     SuikaiService.admin = InMemoryAdminRepository();
+    SuikaiService.likes = _WidgetLikeRepository();
+    SuikaiService.deviceId = 'widget-test-device';
     SuikaiService.advertisements = InMemoryAdvertisementRepository();
     SuikaiService.setCategoriesForTesting(const [
       CategoryRecord(
@@ -58,13 +61,21 @@ void main() {
           city: 'เมืองนาง',
           location: 'เมืองนาง',
           time: 'now',
-          image: '/general.jpg',
+          image: '',
           phone: '0912345678',
           viber: '0912345678',
           likeCount: 0,
           viewCount: 0,
           status: ProductStatus.reserved,
-          images: ['/general.jpg'],
+          video: ListingVideoRecord(
+            id: 'general-video',
+            videoMediaId: 'general-video-media',
+            thumbnailMediaId: 'general-thumbnail-media',
+            videoPath: 'general.mp4',
+            thumbnailPath: 'general.jpg',
+            durationMilliseconds: 1000,
+            sizeBytes: 1024,
+          ),
         ),
         const ProductViewModel(
           id: 'test-store-product',
@@ -83,7 +94,15 @@ void main() {
           status: ProductStatus.available,
           storeId: 'test-store',
           ownerId: 'test-owner',
-          images: ['/image.jpg'],
+          video: ListingVideoRecord(
+            id: 'store-video',
+            videoMediaId: 'store-video-media',
+            thumbnailMediaId: 'store-thumbnail-media',
+            videoPath: 'store.mp4',
+            thumbnailPath: 'store.jpg',
+            durationMilliseconds: 1000,
+            sizeBytes: 1024,
+          ),
         ),
       ]);
   });
@@ -112,7 +131,7 @@ void main() {
     expect(validateRequiredCity('  User City  '), isNull);
   });
 
-  testWidgets('complete basic listing data advances without GPS or city id', (
+  testWidgets('video listing starts with only name category and price', (
     tester,
   ) async {
     await tester.pumpWidget(
@@ -125,36 +144,13 @@ void main() {
     );
     await tester.pump();
 
-    final categoryField = tester.widget<DropdownButtonFormField<String>>(
-      find.byType(DropdownButtonFormField<String>).first,
-    );
-    categoryField.onChanged?.call('listing_mobile');
-    await tester.pump();
-    await tester.enterText(
-      find.widgetWithText(TextFormField, 'ใส่ชื่อสินค้าที่ต้องการขาย'),
-      'Regression product',
-    );
-    await tester.enterText(
-      find.widgetWithText(TextFormField, 'ระบุราคา'),
-      '100',
-    );
-    await tester.drag(find.byType(ListView).first, const Offset(0, -1200));
-    await tester.pump();
-    tester
-        .widget<ElevatedButton>(
-          find.descendant(
-            of: find.byKey(const ValueKey('general-basic-next')),
-            matching: find.byType(ElevatedButton),
-          ),
-        )
-        .onPressed!
-        .call();
-    await tester.pump();
-
-    expect(find.text('รูปภาพสินค้า'), findsOneWidget);
+    expect(find.text('ข้อมูลสินค้า'), findsOneWidget);
+    expect(find.text('ชื่อสินค้า *'), findsOneWidget);
+    expect(find.text('หมวดหมู่ *'), findsOneWidget);
+    expect(find.text('ราคา *'), findsOneWidget);
   });
 
-  testWidgets('missing category shows an error on the visible basic step', (
+  testWidgets('video listing requires a category in its opening popup', (
     tester,
   ) async {
     await tester.pumpWidget(
@@ -166,29 +162,7 @@ void main() {
       ),
     );
     await tester.pump();
-    await tester.enterText(
-      find.widgetWithText(TextFormField, 'ใส่ชื่อสินค้าที่ต้องการขาย'),
-      'Regression product',
-    );
-    await tester.enterText(
-      find.widgetWithText(TextFormField, 'ระบุราคา'),
-      '100',
-    );
-    await tester.drag(find.byType(ListView).first, const Offset(0, -1200));
-    await tester.pump();
-    tester
-        .widget<ElevatedButton>(
-          find.descendant(
-            of: find.byKey(const ValueKey('general-basic-next')),
-            matching: find.byType(ElevatedButton),
-          ),
-        )
-        .onPressed!
-        .call();
-    await tester.pumpAndSettle();
-
-    expect(find.text('กรุณาเลือกหมวดหมู่สินค้า'), findsOneWidget);
-    expect(find.text('ข้อมูลพื้นฐาน'), findsOneWidget);
+    expect(find.text('หมวดหมู่ *'), findsOneWidget);
   });
 
   test('map category filter uses exact Supabase category ids', () {
@@ -260,7 +234,9 @@ void main() {
       (value) => !value.isStoreProduct && value.status != ProductStatus.sold,
     );
     final originalStatus = product.status;
+    final revisionBefore = MarketplaceCache.productsRevision.value;
     MarketplaceCache.setStatus(product.id, ProductStatus.sold);
+    expect(MarketplaceCache.productsRevision.value, revisionBefore + 1);
     expect(MarketplaceCache.productById(product.id), isNotNull);
     expect(
       MarketplaceCache.feedProducts.any((value) => value.id == product.id),
@@ -400,39 +376,27 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets(
-    'Store product form exposes five image slots and store statuses',
-    (tester) async {
-      await tester.pumpWidget(
-        MaterialApp(
-          locale: const Locale('en'),
-          supportedLocales: AppLocalizations.supportedLocales,
-          localizationsDelegates: const [
-            ...AppLocalizations.localizationsDelegates,
-            ShanMaterialLocalizationsDelegate(),
-            ShanWidgetsLocalizationsDelegate(),
-            ShanCupertinoLocalizationsDelegate(),
-          ],
-          home: const PostPage(storeId: 'store-test'),
-        ),
-      );
-      await tester.pump();
-      expect(find.text('Add store product'), findsOneWidget);
-      expect(find.text('0/5'), findsOneWidget);
-      expect(find.byIcon(Icons.image_outlined), findsNWidgets(4));
-      await tester.drag(find.byType(ListView), const Offset(0, -1200));
-      await tester.pumpAndSettle();
-      final statusDropdown = find.byWidgetPredicate(
-        (widget) => widget is DropdownButtonFormField<ProductStatus>,
-      );
-      await tester.tap(statusDropdown);
-      await tester.pumpAndSettle();
-      expect(find.text('Available'), findsWidgets);
-      expect(find.text('Out of stock'), findsOneWidget);
-      expect(find.text('Deleted'), findsOneWidget);
-      expect(tester.takeException(), isNull);
-    },
-  );
+  testWidgets('Store product starts with the shared video metadata popup', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        locale: const Locale('en'),
+        supportedLocales: AppLocalizations.supportedLocales,
+        localizationsDelegates: const [
+          ...AppLocalizations.localizationsDelegates,
+          ShanMaterialLocalizationsDelegate(),
+          ShanWidgetsLocalizationsDelegate(),
+          ShanCupertinoLocalizationsDelegate(),
+        ],
+        home: const PostPage(storeId: 'store-test'),
+      ),
+    );
+    await tester.pump();
+    expect(find.text('ข้อมูลสินค้า'), findsOneWidget);
+    expect(find.text('ชื่อสินค้า *'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets('Search stays responsive for every supported mobile language', (
     tester,
@@ -606,4 +570,13 @@ void main() {
     expect(find.text('open-store-flow'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+}
+
+class _WidgetLikeRepository implements LikeRepository {
+  @override
+  Future<Set<String>> likedIds(String deviceId) async => <String>{};
+  @override
+  Future<bool> like(String listingId, String deviceId) async => true;
+  @override
+  Future<bool> view(String listingId, String deviceId) async => true;
 }

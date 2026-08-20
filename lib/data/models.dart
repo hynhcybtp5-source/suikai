@@ -169,6 +169,7 @@ class ListingRecord {
   final double price;
 
   final ListingVideoRecord? video;
+  final List<String> images;
   final int likes, views;
   final DateTime createdAt, updatedAt;
   const ListingRecord({
@@ -182,6 +183,7 @@ class ListingRecord {
     required this.city,
     required this.status,
     this.video,
+    this.images = const [],
     required this.phone,
     required this.viber,
     required this.createdAt,
@@ -212,6 +214,7 @@ class ListingRecord {
     if (cityRecord != null) 'cities': cityRecord!.toJson(),
     'status': status,
     if (video != null) 'listing_video': video!.toJson(),
+    'images': images,
     'phone': phone,
     'viber_phone': viber,
     'likes': likes,
@@ -244,7 +247,8 @@ class ListingRecord {
         ? ListingVideoRecord.fromJson(
             Map<String, dynamic>.from(j['listing_video'] as Map),
           )
-        : throw const FormatException('listing_video_required'),
+        : null,
+    images: List<String>.from(j['images'] ?? const []),
     phone: '${j['phone'] ?? ''}',
     viber: '${j['viber_phone'] ?? ''}',
     likes: (j['likes'] as num?)?.toInt() ?? 0,
@@ -578,6 +582,7 @@ class AdvertisementRecord {
     'target_type': targetType,
     'target_id': targetId,
     'external_url': externalUrl,
+    'target_url': externalUrl,
     'start_at': startAt?.toUtc().toIso8601String(),
     'end_at': endAt?.toUtc().toIso8601String(),
     'display_order': displayOrder,
@@ -589,7 +594,7 @@ class AdvertisementRecord {
 
 class ShortVideoRecord {
   final String id, tiktokUrl, title;
-  final int sortOrder;
+  final int displayOrder;
   final bool isActive;
   final String? createdBy;
   final DateTime createdAt, updatedAt;
@@ -598,7 +603,7 @@ class ShortVideoRecord {
     required this.id,
     required this.tiktokUrl,
     this.title = '',
-    this.sortOrder = 0,
+    this.displayOrder = 0,
     this.isActive = true,
     this.createdBy,
     required this.createdAt,
@@ -617,7 +622,10 @@ class ShortVideoRecord {
         id: '${json['id']}',
         tiktokUrl: '${json['tiktok_url'] ?? ''}',
         title: '${json['title'] ?? ''}',
-        sortOrder: (json['sort_order'] as num?)?.toInt() ?? 0,
+        displayOrder:
+            (json['sort_order'] as num?)?.toInt() ??
+            (json['display_order'] as num?)?.toInt() ??
+            0,
         isActive: json['is_active'] == true,
         createdBy: json['created_by']?.toString(),
         createdAt: DateTime.tryParse('${json['created_at']}') ?? DateTime.now(),
@@ -628,7 +636,7 @@ class ShortVideoRecord {
     'id': id,
     'tiktok_url': tiktokUrl,
     'title': title,
-    'sort_order': sortOrder,
+    'sort_order': displayOrder,
     'is_active': isActive,
     'created_by': createdBy,
     'created_at': createdAt.toIso8601String(),

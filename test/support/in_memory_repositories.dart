@@ -17,6 +17,41 @@ class InMemoryStorageService implements StorageService {
     String? bucket,
     String? objectPrefix,
   }) async => sourcePath;
+
+  @override
+  Future<StoredMedia> persistPrivateBinary({
+    required String sourcePath,
+    required String bucket,
+    required String objectPrefix,
+    required String extension,
+    required String mimeType,
+  }) async => StoredMedia(
+    id: const Uuid().v4(),
+    bucket: bucket,
+    objectPath: '$objectPrefix/test.$extension',
+    sizeBytes: 1,
+  );
+
+  @override
+  Future<StoredMedia> persistPrivateBytes({
+    required List<int> bytes,
+    required String bucket,
+    required String objectPrefix,
+    required String extension,
+    required String mimeType,
+  }) async => StoredMedia(
+    id: const Uuid().v4(),
+    bucket: bucket,
+    objectPath: '$objectPrefix/test.$extension',
+    sizeBytes: bytes.length,
+  );
+
+  @override
+  Future<String> createSignedUrl({
+    required String bucket,
+    required String objectPath,
+    required int expiresInSeconds,
+  }) async => 'memory://$bucket/$objectPath';
 }
 
 class InMemoryAdvertisementRepository implements AdvertisementRepository {
@@ -82,6 +117,7 @@ class InMemoryAuthRepository implements AuthRepository {
     return id;
   }
 
+  @override
   Future<void> restore() async {
     final prefs = await SharedPreferences.getInstance();
     _current = prefs.getString(_session);
@@ -143,14 +179,15 @@ class InMemoryAuthRepository implements AuthRepository {
     _current = null;
     await (await SharedPreferences.getInstance()).remove(_session);
   }
+
   @override
-Future<void> loginWithTelegram() async {}
+  Future<void> loginWithTelegram() async {}
 
-@override
-Future<void> completeTelegramWebLogin() async {}
+  @override
+  Future<void> completeTelegramWebLogin() async {}
 
-@override
-Future<void> syncCurrentProfile() async {}
+  @override
+  Future<void> syncCurrentProfile() async {}
 }
 
 class InMemoryProfileRepository implements ProfileRepository {
@@ -161,9 +198,10 @@ class InMemoryProfileRepository implements ProfileRepository {
   }
 
   @override
-  Future<void> save(UserProfile p) async {
+  Future<UserProfile> save(UserProfile p) async {
     final old = _map(TestDatabase.users.get(p.id));
     await TestDatabase.users.put(p.id, {...old, ...p.toJson()});
+    return UserProfile.fromJson(_map(TestDatabase.users.get(p.id)));
   }
 }
 
@@ -174,9 +212,22 @@ class InMemoryListingRepository implements ListingRepository {
           .map((v) => ListingRecord.fromJson(_map(v)))
           .toList()
         ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+
+  @override
+  Future<List<ListingRecord>> publicListings() async => (await all())
+      .where(
+        (value) =>
+            value.isPublished &&
+            !value.isHidden &&
+            value.deletedAt == null &&
+            (value.status == 'available' || value.status == 'reserved'),
+      )
+      .toList();
   @override
   Future<ListingRecord> create(ListingRecord v) async {
-    if (v.city.trim().isEmpty) throw StateError('listing_city_required');
+    if (v.storeId != null && v.city.trim().isEmpty) {
+      throw StateError('store_listing_city_required');
+    }
     await TestDatabase.listings.put(v.id, v.toJson());
     final notificationId = 'new_listing:${v.id}';
     await TestDatabase.adminNotifications.put(notificationId, {
@@ -200,6 +251,19 @@ class InMemoryListingRepository implements ListingRepository {
   }
 
   @override
+  Future<void> updateStatus({
+    required String id,
+    required String ownerId,
+    required String status,
+  }) async {
+    final old = TestDatabase.listings.get(id);
+    if (old == null || _map(old)['owner_id'] != ownerId) {
+      throw StateError('listing_status_update_not_applied');
+    }
+    await TestDatabase.listings.put(id, {..._map(old), 'status': status});
+  }
+
+  @override
   Future<void> delete(String id, String ownerId) async {
     final old = TestDatabase.listings.get(id);
     if (old != null && _map(old)['owner_id'] == ownerId)
@@ -212,6 +276,18 @@ class InMemoryStoreRepository implements StoreRepository {
   Future<List<StoreRecord>> all() async => TestDatabase.stores.values
       .map((v) => StoreRecord.fromJson(_map(v)))
       .toList();
+
+  @override
+  Future<List<StoreRecord>> publicStores() async => (await all())
+      .where(
+        (store) =>
+            store.status == 'approved' &&
+            store.lifecycleStatus == 'active' &&
+            !store.isHidden &&
+            store.deletedAt == null,
+      )
+      .toList();
+
   @override
   Future<StoreRecord> create(StoreRecord v) async {
     final pending = StoreRecord(
@@ -469,7 +545,7 @@ class InMemoryShortVideoRepository implements ShortVideoRepository {
           .map(_map)
           .map(ShortVideoRecord.fromJson)
           .toList()
-        ..sort((a, b) => a.sortOrder.compareTo(b.sortOrder));
+        ..sort((a, b) => a.displayOrder.compareTo(b.displayOrder));
 
   @override
   Future<List<ShortVideoRecord>> active() async =>
@@ -499,6 +575,7 @@ class InMemoryAdminRepository implements AdminRepository {
   @override
   bool get isAuthenticated => _authenticated;
 
+  @override
   Future<void> restore() async {
     _authenticated =
         (await SharedPreferences.getInstance()).getBool(_sessionKey) ?? false;

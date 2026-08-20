@@ -1,5 +1,8 @@
-import 'dart:typed_data';
+import 'dart:io';
+import 'package:ffmpeg_kit_flutter_new_min_gpl/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new_min_gpl/return_code.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
@@ -74,6 +77,8 @@ class SuikaiService {
   static List<CityRecord> _cityCache = [];
   static late String deviceId;
   static final Map<String, _SignedUrlCacheEntry> _thumbnailUrlCache = {};
+  static final Map<String, Future<File>> _videoDownloadCache = {};
+  static final Map<String, Future<File>> _watermarkedVideoShareCache = {};
   static bool get usesSupabase => SupabaseBackend.enabled;
   static Session? get currentSession =>
       usesSupabase ? SupabaseBackend.client.auth.currentSession : null;
@@ -111,6 +116,7 @@ class SuikaiService {
       storage = SupabaseStorageService(client);
       admin = SupabaseAdminRepository(client);
       await auth.restore();
+      await admin.restore();
       final prefs = await SharedPreferences.getInstance();
       deviceId = prefs.getString('local_device_id') ?? const Uuid().v4();
       await prefs.setString('local_device_id', deviceId);
@@ -410,6 +416,130 @@ class SuikaiService {
     return true;
   }
 
+  static Future<bool> shareProductVideo({
+    required ListingVideoRecord video,
+    required String title,
+  }) async {
+    if (kIsWeb) return false;
+    try {
+      final file = await _watermarkedVideoShareCache.putIfAbsent(
+        video.videoMediaId,
+        () => _watermarkVideoForShare(video),
+      );
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [
+            XFile(
+              file.path,
+              mimeType: 'video/mp4',
+              name: 'suikai-${video.videoMediaId}.mp4',
+            ),
+          ],
+          text: title,
+          title: title,
+        ),
+      );
+      return true;
+    } catch (error, stackTrace) {
+      debugPrint('Video share watermark failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      _watermarkedVideoShareCache.remove(video.videoMediaId);
+      return false;
+    }
+  }
+
+  static Future<File> _watermarkVideoForShare(ListingVideoRecord video) async {
+    final output = File(
+      '${Directory.systemTemp.path}/suikai-video-watermarked-v2-${video.videoMediaId}.mp4',
+    );
+    if (await output.exists() && await output.length() > 0) return output;
+    if (await output.exists()) await output.delete();
+
+    final source = await _videoDownloadCache.putIfAbsent(
+      video.videoMediaId,
+      () => _downloadVideoForShare(video),
+    );
+    final logo = await _shareWatermarkLogoFile();
+    final command = [
+      '-y',
+      '-i',
+      source.path,
+      '-loop',
+      '1',
+      '-i',
+      logo.path,
+      '-filter_complex',
+      '[1:v][0:v]scale2ref=w=iw*0.08:h=ow/mdar[watermark][base];'
+          '[watermark]setsar=1,format=rgba,'
+          'colorchannelmixer=aa=0.33[watermarkAlpha];'
+          '[base][watermarkAlpha]overlay='
+          'x=main_w-overlay_w-main_w*0.03:y=main_w*0.03:format=auto[output]',
+      '-map',
+      '[output]',
+      '-map',
+      '0:a?',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '20',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'copy',
+      '-movflags',
+      '+faststart',
+      '-shortest',
+      output.path,
+    ];
+    final session = await FFmpegKit.executeWithArguments(command);
+    final returnCode = await session.getReturnCode();
+    if (!ReturnCode.isSuccess(returnCode) ||
+        !await output.exists() ||
+        await output.length() == 0) {
+      if (await output.exists()) await output.delete();
+      throw StateError('video_watermark_failed');
+    }
+    return output;
+  }
+
+  static Future<File> _shareWatermarkLogoFile() async {
+    final logo = File(
+      '${Directory.systemTemp.path}/suikai-share-watermark-logo.png',
+    );
+    if (await logo.exists() && await logo.length() > 0) return logo;
+    final data = await rootBundle.load(
+      'assets/images/suikai_watermark_logo.png',
+    );
+    await logo.writeAsBytes(
+      data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+      flush: true,
+    );
+    if (await logo.length() == 0) {
+      throw const FileSystemException('watermark_logo_copy_failed');
+    }
+    return logo;
+  }
+
+  static Future<File> _downloadVideoForShare(ListingVideoRecord video) async {
+    final file = File(
+      '${Directory.systemTemp.path}/suikai-video-${video.videoMediaId}.mp4',
+    );
+    if (await file.exists() && await file.length() > 0) return file;
+
+    final url = await signedVideoUrl(video);
+    final response = await http
+        .get(Uri.parse(url))
+        .timeout(const Duration(minutes: 2));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw HttpException('video_download_failed:${response.statusCode}');
+    }
+    await file.writeAsBytes(response.bodyBytes, flush: true);
+    if (await file.length() == 0) throw const FileSystemException();
+    return file;
+  }
+
   static Future<SelectedImage?> pickImage({
     ImageSource source = ImageSource.gallery,
   }) async {
@@ -465,6 +595,24 @@ class SuikaiService {
   static Future<SelectedVideoPost> prepareVideoPost(String sourcePath) async =>
       SelectedVideoPost(await VideoPostProcessor.prepare(sourcePath));
 
+  /// Legacy image listings remain supported by the old Supabase project.
+  static Future<List<String>> persistSelectedImages(
+    List<SelectedImage> images, {
+    String? listingId,
+  }) async {
+    final prefix = listingId == null ? null : 'listings/$listingId';
+    return Future.wait(
+      images.map(
+        (image) => storage.persistImage(
+          image.file.path,
+          image.extension,
+          bucket: 'listing-images',
+          objectPrefix: prefix,
+        ),
+      ),
+    );
+  }
+
   static String _requireUser() {
     final id = currentUserId;
     if (id == null) throw StateError('login_required');
@@ -492,14 +640,10 @@ class SuikaiService {
     bool isLocationVisible = true,
   }) async {
     final ownerId = _requireUser();
-    if (video == null) throw StateError('listing_video_required');
     if (title.trim().isEmpty || category.trim().isEmpty || price < 0) {
       throw StateError('listing_required_fields_missing');
     }
     final normalizedStatus = status;
-    if (!const {'available', 'reserved', 'sold'}.contains(normalizedStatus)) {
-      throw StateError('invalid_store_product_status');
-    }
     var listingPhone = phone;
     var listingViber = viber;
     if (listingType == 'general') {
@@ -520,30 +664,34 @@ class SuikaiService {
     }
     final now = DateTime.now();
     final id = const Uuid().v4();
-    final draftPrefix = 'listings/drafts/${_requireUser()}/$id';
-    final media = await storage.persistPrivateBinary(
-      sourcePath: video.prepared.path,
-      bucket: 'listing-videos',
-      objectPrefix: draftPrefix,
-      extension: 'mp4',
-      mimeType: 'video/mp4',
-    );
-    final thumbnail = await storage.persistPrivateBytes(
-      bytes: video.prepared.thumbnailBytes,
-      bucket: 'listing-thumbnails',
-      objectPrefix: draftPrefix,
-      extension: 'jpg',
-      mimeType: 'image/jpeg',
-    );
-    final savedVideo = ListingVideoRecord(
-      id: '',
-      videoMediaId: media.id,
-      thumbnailMediaId: thumbnail.id,
-      videoPath: media.objectPath,
-      thumbnailPath: thumbnail.objectPath,
-      durationMilliseconds: video.prepared.durationMilliseconds,
-      sizeBytes: media.sizeBytes,
-    );
+    final savedImages = await persistSelectedImages(images, listingId: id);
+    ListingVideoRecord? savedVideo;
+    if (video != null) {
+      final draftPrefix = 'listings/drafts/${_requireUser()}/$id';
+      final media = await storage.persistPrivateBinary(
+        sourcePath: video.prepared.path,
+        bucket: 'listing-videos',
+        objectPrefix: draftPrefix,
+        extension: 'mp4',
+        mimeType: 'video/mp4',
+      );
+      final thumbnail = await storage.persistPrivateBytes(
+        bytes: video.prepared.thumbnailBytes,
+        bucket: 'listing-thumbnails',
+        objectPrefix: draftPrefix,
+        extension: 'jpg',
+        mimeType: 'image/jpeg',
+      );
+      savedVideo = ListingVideoRecord(
+        id: '',
+        videoMediaId: media.id,
+        thumbnailMediaId: thumbnail.id,
+        videoPath: media.objectPath,
+        thumbnailPath: thumbnail.objectPath,
+        durationMilliseconds: video.prepared.durationMilliseconds,
+        sizeBytes: media.sizeBytes,
+      );
+    }
     final value = ListingRecord(
       id: id,
       ownerId: ownerId,
@@ -557,6 +705,7 @@ class SuikaiService {
       cityId: cityId,
       status: normalizedStatus,
       video: savedVideo,
+      images: savedImages,
       phone: listingPhone,
       viber: listingViber,
       latitude: latitude,

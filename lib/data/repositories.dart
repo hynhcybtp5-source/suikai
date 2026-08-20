@@ -134,6 +134,7 @@ class StoredMedia {
 /// Backend-neutral contract used only by privileged administration UI.
 abstract interface class AdminRepository {
   bool get isAuthenticated;
+  Future<void> restore();
   Future<bool> login(String email, String password);
   Future<void> logout();
   Future<Map<String, int>> summary();

@@ -1,5 +1,9 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:video_player/video_player.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
@@ -224,6 +228,7 @@ class ProductViewModel {
   final double? latitude;
   final double? longitude;
   final bool isLocationVisible;
+  final ListingVideoRecord? video;
 
   const ProductViewModel({
     required this.id,
@@ -249,9 +254,11 @@ class ProductViewModel {
     this.latitude,
     this.longitude,
     this.isLocationVisible = true,
+    this.video,
   });
 
   bool get isStoreProduct => storeId != null;
+  bool get hasVideo => video != null;
   String get price => formatPrice(priceValue, currencyCode);
   String localizedCity(String localeCode, {String fallback = ''}) {
     if (city.trim().isNotEmpty) return city.trim();
@@ -276,6 +283,76 @@ class ProductViewModel {
 String? primaryProductImage(ProductViewModel product) {
   final source = product.images.firstOrNull ?? product.image;
   return source.trim().isEmpty ? null : source;
+}
+
+enum _ListingShareOption { productLink, image, video }
+
+Future<_ListingShareOption?> _showListingShareOptions(
+  BuildContext context,
+  ProductViewModel product, {
+  bool includeImage = false,
+}) {
+  if (!product.hasVideo) return Future.value(_ListingShareOption.productLink);
+  return showModalBottomSheet<_ListingShareOption>(
+    context: context,
+    builder: (context) => SafeArea(
+      child: Wrap(
+        children: [
+          ListTile(
+            leading: const Icon(Icons.link_rounded),
+            title: const LocalizedText('แชร์ลิงก์สินค้า'),
+            onTap: () => Navigator.pop(context, _ListingShareOption.productLink),
+          ),
+          if (includeImage)
+            ListTile(
+              leading: const Icon(Icons.image_outlined),
+              title: const LocalizedText('แชร์รูปสินค้า'),
+              onTap: () => Navigator.pop(context, _ListingShareOption.image),
+            ),
+          ListTile(
+            leading: const Icon(Icons.video_file_rounded),
+            title: const LocalizedText('แชร์วิดีโอ'),
+            onTap: () => Navigator.pop(context, _ListingShareOption.video),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+Future<void> copyProductLink(
+  BuildContext context,
+  ProductViewModel product,
+) async {
+  final link = Uri.base
+      .replace(
+        path: Uri.base.path.isEmpty ? '/' : Uri.base.path,
+        queryParameters: {'product': product.id},
+  )
+      .toString();
+  await Clipboard.setData(ClipboardData(text: link));
+  if (context.mounted) {
+    showInfo(
+      context,
+      AppLocalizations.of(context).source('คัดลอกลิงก์สินค้าแล้ว'),
+    );
+  }
+}
+
+List<String> listingImageUrls(Map<String, dynamic> item) {
+  // Repository serialization exposes resolved URLs as `images`, while direct
+  // RPC rows retain the `listing_images` relation.
+  final rawImages = item['listing_images'] ?? item['images'];
+  if (rawImages is! List) return const [];
+
+  final urls = <String>[];
+  for (final entry in rawImages) {
+    final url = entry is Map
+        ? entry['image_url']?.toString().trim() ?? ''
+        : entry?.toString().trim() ?? '';
+    if (url.isNotEmpty) urls.add(url);
+  }
+  return urls;
 }
 
 String? validateRequiredCity(String? value) =>
@@ -321,6 +398,85 @@ String formatCurrencyAmount(double value, String currencyCode) {
   );
   final fraction = decimals > 0 ? '.${parts.last}' : '';
   return '$whole$fraction ${currencyCode.toUpperCase()}';
+}
+
+DateTime? productCreatedAt(ProductViewModel product) =>
+    DateTime.tryParse(product.time)?.toLocal();
+
+bool isNewProduct(ProductViewModel product, {DateTime? now}) {
+  final createdAt = productCreatedAt(product);
+  if (createdAt == null) return false;
+  return (now ?? DateTime.now()).difference(createdAt) <=
+      const Duration(hours: 6);
+}
+
+bool isPopularProduct(ProductViewModel product) => product.viewCount >= 100;
+
+/// Keeps each six-hour Home feed window stable while giving the established
+/// inventory a fresh order in the next window. Newly posted items stay pinned
+/// above it for their first six hours.
+int compareHomeFeedProducts(
+  ProductViewModel left,
+  ProductViewModel right, {
+  DateTime? now,
+}) {
+  final reference = now ?? DateTime.now();
+  final leftCreated = productCreatedAt(left);
+  final rightCreated = productCreatedAt(right);
+  final leftIsNew = isNewProduct(left, now: reference);
+  final rightIsNew = isNewProduct(right, now: reference);
+  if (leftIsNew != rightIsNew) return leftIsNew ? -1 : 1;
+  if (leftIsNew && rightIsNew) {
+    return (rightCreated ?? DateTime(0)).compareTo(leftCreated ?? DateTime(0));
+  }
+  final bucket =
+      reference.millisecondsSinceEpoch ~/
+      const Duration(hours: 6).inMilliseconds;
+  final rankDifference = _homeFeedRank(
+    left.id,
+    bucket,
+  ).compareTo(_homeFeedRank(right.id, bucket));
+  if (rankDifference != 0) return rankDifference;
+  return left.id.compareTo(right.id);
+}
+
+int _homeFeedRank(String id, int bucket) {
+  var hash = 2166136261 ^ bucket;
+  for (final codeUnit in id.codeUnits) {
+    hash = (hash ^ codeUnit) * 16777619;
+    hash &= 0x7fffffff;
+  }
+  return hash;
+}
+
+String videoDurationLabel(ListingVideoRecord video) {
+  final seconds = (video.durationMilliseconds / 1000).ceil();
+  final minutes = seconds ~/ 60;
+  return '$minutes:${(seconds % 60).toString().padLeft(2, '0')}';
+}
+
+List<ProductViewModel> similarProducts(ProductViewModel product) {
+  final city = product.city.trim().toLowerCase();
+  return MarketplaceCache.feedProducts
+      .where(
+        (candidate) =>
+            candidate.id != product.id &&
+            candidate.status != ProductStatus.sold &&
+            candidate.status != ProductStatus.outOfStock &&
+            candidate.status != ProductStatus.deleted,
+      )
+      .toList()
+    ..sort((a, b) {
+      final aCity = city.isNotEmpty && a.city.trim().toLowerCase() == city;
+      final bCity = city.isNotEmpty && b.city.trim().toLowerCase() == city;
+      if (aCity != bCity) return aCity ? -1 : 1;
+      final aCategory = a.category == product.category;
+      final bCategory = b.category == product.category;
+      if (aCategory != bCategory) return aCategory ? -1 : 1;
+      return (productCreatedAt(b) ?? DateTime(0)).compareTo(
+        productCreatedAt(a) ?? DateTime(0),
+      );
+    });
 }
 
 String normalizeText(String? value) => (value ?? '').trim();
@@ -493,7 +649,10 @@ class MarketplaceCache {
         return true;
       }
       final store = storeById(product.storeId!);
-      return store?.approved == true;
+      // publicListings() already projects only active, approved stores. Home
+      // fetches listings before StoreListPage populates this optional cache, so
+      // an unknown store must not hide an otherwise public listing.
+      return store == null || store.approved;
     }).toList();
   }
 
@@ -516,13 +675,18 @@ class MarketplaceCache {
   }
 
   static void cacheProducts(Iterable<ProductViewModel> remote) {
+    var changed = false;
     for (final product in remote) {
       final index = products.indexWhere((item) => item.id == product.id);
-      if (index < 0)
+      if (index < 0) {
         products.add(product);
-      else
+        changed = true;
+      } else {
         products[index] = product;
+        changed = true;
+      }
     }
+    if (changed) productsRevision.value++;
   }
 
   static void syncRemoteProducts(Iterable<ProductViewModel> values) {
@@ -559,6 +723,7 @@ class MarketplaceCache {
   ) {
     products.removeWhere((product) => product.storeId == storeId);
     products.insertAll(0, remote);
+    productsRevision.value++;
   }
 
   static List<ProductViewModel> get managedProducts {
@@ -600,6 +765,7 @@ class MarketplaceCache {
       latitude: current.latitude,
       longitude: current.longitude,
       isLocationVisible: current.isLocationVisible,
+      video: current.video,
     );
   }
 
@@ -631,11 +797,16 @@ class MarketplaceCache {
       latitude: p.latitude,
       longitude: p.longitude,
       isLocationVisible: p.isLocationVisible,
+      video: p.video,
     );
+    productsRevision.value++;
   }
 
-  static void removeProduct(String id) =>
-      products.removeWhere((p) => p.id == id);
+  static void removeProduct(String id) {
+    final exists = products.any((p) => p.id == id);
+    products.removeWhere((p) => p.id == id);
+    if (exists) productsRevision.value++;
+  }
 }
 
 class InteractionStore {
@@ -743,7 +914,7 @@ class RootScaffold extends StatelessWidget {
       SuikaiRoutes.home,
       SuikaiRoutes.stores,
       SuikaiRoutes.post,
-      SuikaiRoutes.shortVideos,
+      SuikaiRoutes.map,
       SuikaiRoutes.profile,
     ];
     Navigator.pushNamed(context, routeByIndex[index]);
@@ -761,7 +932,7 @@ class RootScaffold extends StatelessWidget {
         labelBehavior: NavigationDestinationLabelBehavior.alwaysHide,
         selectedIndex: selectedIndex,
         indicatorColor: Colors.transparent,
-        backgroundColor: Colors.white,
+        backgroundColor: AppTheme.surface,
         onDestinationSelected: (index) => _onTap(context, index),
         destinations: [
           NavigationDestination(
@@ -786,12 +957,9 @@ class RootScaffold extends StatelessWidget {
             label: '+${l10n.post}',
           ),
           NavigationDestination(
-            icon: const Icon(Icons.play_circle_outline_rounded),
-            selectedIcon: const Icon(
-              Icons.play_circle_fill_rounded,
-              color: AppTheme.orange,
-            ),
-            label: AppLocalizations.of(context).source('วิดีโอสั้น'),
+            icon: const Icon(Icons.map_outlined),
+            selectedIcon: const Icon(Icons.map_rounded, color: AppTheme.orange),
+            label: AppLocalizations.of(context).source('แผนที่'),
           ),
           NavigationDestination(
             icon: const Icon(Icons.person_outline_rounded),
@@ -814,57 +982,60 @@ class _SuikaiHeader extends StatelessWidget {
   Widget build(BuildContext context) {
     final compact = MediaQuery.sizeOf(context).width < 400;
     final buttonSize = compact ? 40.0 : 42.0;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(22, 18, 18, 14),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                LocalizedText(
-                  'Suikai',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: AppTheme.orange,
-                    fontSize: compact ? 34 : 38,
-                    height: .95,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: -.8,
+    return Container(
+      color: AppTheme.surface,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(22, 18, 18, 14),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  LocalizedText(
+                    'Suikai',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: AppTheme.orange,
+                      fontSize: compact ? 34 : 38,
+                      height: .95,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: -.8,
+                    ),
                   ),
-                ),
-                const SizedBox(height: 5),
-                LocalizedText(
-                  AppLocalizations.of(context).tagline,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: AppTheme.textMuted,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w500,
+                  const SizedBox(height: 5),
+                  LocalizedText(
+                    AppLocalizations.of(context).tagline,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: AppTheme.textMuted,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
-                ),
-              ],
-            ),
-          ),
-          Builder(
-            builder: (context) => IconButton(
-              tooltip: AppLocalizations.of(context).source('เมนู'),
-              onPressed: () => Scaffold.of(context).openDrawer(),
-              icon: const Icon(
-                Icons.menu_rounded,
-                color: AppTheme.orange,
-                size: 25,
-              ),
-              style: IconButton.styleFrom(
-                backgroundColor: AppTheme.orangeSoft,
-                fixedSize: Size.square(buttonSize),
+                ],
               ),
             ),
-          ),
-        ],
+            Builder(
+              builder: (context) => IconButton(
+                tooltip: AppLocalizations.of(context).source('เมนู'),
+                onPressed: () => Scaffold.of(context).openDrawer(),
+                icon: const Icon(
+                  Icons.menu_rounded,
+                  color: AppTheme.orange,
+                  size: 25,
+                ),
+                style: IconButton.styleFrom(
+                  backgroundColor: AppTheme.orangeSoft,
+                  fixedSize: Size.square(buttonSize),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -951,6 +1122,11 @@ class _SuikaiDrawer extends StatelessWidget {
               icon: Icons.language_rounded,
               label: 'เปลี่ยนภาษา',
               onTap: () => _language(context),
+            ),
+            _DrawerItem(
+              icon: Icons.play_circle_outline_rounded,
+              label: 'ข่าว',
+              onTap: () => _route(context, SuikaiRoutes.shortVideos),
             ),
             _DrawerItem(
               icon: Icons.map_outlined,
@@ -1041,6 +1217,69 @@ class _LanguageOption extends StatelessWidget {
       ],
     ),
   );
+}
+
+class _HomeHeader extends StatelessWidget {
+  const _HomeHeader();
+
+  @override
+  Widget build(BuildContext context) {
+    final compact = MediaQuery.sizeOf(context).width < 360;
+    return Container(
+      padding: EdgeInsets.fromLTRB(18, compact ? 13 : 15, 16, 13),
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        border: Border(bottom: BorderSide(color: Color(0xFFF3ECE7))),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                LocalizedText(
+                  'Suikai',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: AppTheme.orange,
+                    fontSize: compact ? 27 : 30,
+                    height: .95,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: -.9,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                LocalizedText(
+                  AppLocalizations.of(context).tagline,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: AppTheme.textMuted,
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Builder(
+            builder: (context) => IconButton(
+              tooltip: AppLocalizations.of(context).source('เมนู'),
+              onPressed: () => Scaffold.of(context).openDrawer(),
+              icon: const Icon(Icons.menu_rounded, size: 22),
+              color: AppTheme.textPrimary,
+              style: IconButton.styleFrom(
+                backgroundColor: const Color(0xFFFFF5F0),
+                side: const BorderSide(color: Color(0xFFF7E6DC)),
+                fixedSize: const Size.square(42),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class HomePage extends StatefulWidget {
@@ -1327,12 +1566,14 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    debugPrint('ROOT initState');
-    _loadListings();
-    _loadFx();
+    debugPrint('HOME initState');
+    debugPrint('HOME before _loadListings');
+    unawaited(_loadListings());
+    debugPrint('HOME after _loadListings call');
+    unawaited(_loadFx());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_completeDeferredStartup());
-      _initializeNearby();
+      unawaited(_initializeNearby());
     });
   }
 
@@ -1344,6 +1585,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _initializeNearby() async {
+    debugPrint('HOME location init start');
     try {
       final existing = await SuikaiService.getCurrentPosition(request: false);
       if (existing != null) {
@@ -1379,7 +1621,18 @@ class _HomePageState extends State<HomePage> {
       if (mounted && position != null) {
         setState(() => _currentPosition = position);
       }
-    } catch (_) {}
+    } on LocationFailure catch (error) {
+      debugPrint('HOME location unavailable: ${error.reason}');
+      if (mounted && _currentPosition != null) {
+        setState(() => _currentPosition = null);
+      }
+    } catch (error, stackTrace) {
+      debugPrint('HOME location unavailable: $error');
+      debugPrint('$stackTrace');
+      if (mounted && _currentPosition != null) {
+        setState(() => _currentPosition = null);
+      }
+    }
   }
 
   Future<void> _loadFx() async {
@@ -1405,22 +1658,11 @@ class _HomePageState extends State<HomePage> {
   Future<void> _loadListings() async {
     try {
       final data = await SuikaiService.fetchListings();
+      debugPrint('HOME LISTINGS RECEIVED: ${data.length}');
       final next = <ProductViewModel>[];
       for (final item in data) {
-        final images = item['listing_images'] as List<dynamic>?;
         final stats = item['listing_stats'] as Map<String, dynamic>?;
-        final image = images != null && images.isNotEmpty
-            ? (images.first as Map<String, dynamic>)['image_url']?.toString() ??
-                  ''
-            : '';
-        final imageUrls = (images ?? const [])
-            .map(
-              (entry) =>
-                  (entry as Map<String, dynamic>)['image_url']?.toString() ??
-                  '',
-            )
-            .where((url) => url.isNotEmpty)
-            .toList();
+        final imageUrls = listingImageUrls(item);
         next.add(
           ProductViewModel(
             id: item['id'].toString(),
@@ -1438,7 +1680,7 @@ class _HomePageState extends State<HomePage> {
                 : null,
             location: item['city']?.toString() ?? '',
             time: item['created_at']?.toString() ?? '',
-            image: image,
+            image: imageUrls.isEmpty ? '' : imageUrls.first,
             phone: item['phone']?.toString() ?? '',
             viber: item['viber_phone']?.toString() ?? '',
             likeCount:
@@ -1449,17 +1691,30 @@ class _HomePageState extends State<HomePage> {
             storeId: item['store_id']?.toString(),
             ownerId: item['owner_id']?.toString(),
             images: imageUrls,
+            video: item['listing_video'] is Map
+                ? ListingVideoRecord.fromJson(
+                    Map<String, dynamic>.from(item['listing_video'] as Map),
+                  )
+                : null,
             latitude: (item['latitude'] as num?)?.toDouble(),
             longitude: (item['longitude'] as num?)?.toDouble(),
             isLocationVisible: item['is_location_visible'] != false,
           ),
         );
       }
+      debugPrint('HOME LISTINGS MAPPED: ${next.length}');
       if (mounted) {
+        debugPrint(
+          'HOME CACHE BEFORE: ${MarketplaceCache.feedProducts.length}',
+        );
         MarketplaceCache.syncRemoteProducts(next);
+        debugPrint('HOME CACHE AFTER: ${MarketplaceCache.feedProducts.length}');
         setState(() {});
       }
-    } catch (_) {}
+    } catch (error, stackTrace) {
+      debugPrint('HOME LISTINGS ERROR: $error');
+      debugPrint('$stackTrace');
+    }
   }
 
   @override
@@ -1504,7 +1759,7 @@ class _HomePageState extends State<HomePage> {
             product.longitude,
           );
       return matchesKeyword && matchesCategory && matchesPrice && matchesNearby;
-    }).toList();
+    }).toList()..sort(compareHomeFeedProducts);
     return RootScaffold(
       selectedIndex: 0,
       body: CustomScrollView(
@@ -1513,7 +1768,9 @@ class _HomePageState extends State<HomePage> {
           SliverToBoxAdapter(child: _priceFilter(context)),
           SliverToBoxAdapter(child: _categories(context)),
           SliverToBoxAdapter(child: _banner(context)),
-          SliverToBoxAdapter(child: _sectionTitle(context)),
+          SliverToBoxAdapter(
+            child: _sectionTitle(context, nearby: _currentPosition != null),
+          ),
           SliverPadding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 26),
             sliver: SliverLayoutBuilder(
@@ -1525,12 +1782,32 @@ class _HomePageState extends State<HomePage> {
                     ? 5
                     : width >= 760
                     ? 4
+                    : width < 560
+                    ? 2
                     : 3;
                 return SliverGrid(
-                  delegate: SliverChildBuilderDelegate(
-                    (context, index) => ProductCard(product: items[index]),
-                    childCount: items.length,
-                  ),
+                  delegate: SliverChildBuilderDelegate((context, index) {
+                    final product = items[index];
+                    final position = _currentPosition;
+                    final distanceKm =
+                        position == null ||
+                            product.latitude == null ||
+                            product.longitude == null
+                        ? null
+                        : Geolocator.distanceBetween(
+                                position.latitude,
+                                position.longitude,
+                                product.latitude!,
+                                product.longitude!,
+                              ) /
+                              1000;
+                    return ProductCard(
+                      product: product,
+                      viewerItems: items,
+                      distanceKm: distanceKm,
+                      homeStyle: true,
+                    );
+                  }, childCount: items.length),
                   gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                     crossAxisCount: columns,
                     crossAxisSpacing: 10,
@@ -1538,8 +1815,8 @@ class _HomePageState extends State<HomePage> {
                     childAspectRatio: width >= 1024
                         ? .78
                         : width < 400
-                        ? .60
-                        : .66,
+                        ? .67
+                        : .72,
                   ),
                 );
               },
@@ -1552,7 +1829,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _homeHeader(BuildContext context) {
-    return const _SuikaiHeader();
+    return const _HomeHeader();
   }
 
   Widget _priceFilter(BuildContext context) {
@@ -1569,32 +1846,44 @@ class _HomePageState extends State<HomePage> {
         }
       },
       child: Container(
-        margin: const EdgeInsets.fromLTRB(16, 6, 16, 14),
+        margin: const EdgeInsets.fromLTRB(16, 10, 16, 18),
         decoration: BoxDecoration(
           color: Colors.white,
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(color: AppTheme.border),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: const Color(0xFFF0E9E5)),
           boxShadow: const [
             BoxShadow(
-              color: Color(0x08000000),
-              blurRadius: 12,
-              offset: Offset(0, 3),
+              color: Color(0x0A3B2A20),
+              blurRadius: 16,
+              offset: Offset(0, 5),
             ),
           ],
         ),
         child: Column(
           children: [
             InkWell(
-              borderRadius: BorderRadius.circular(18),
+              borderRadius: BorderRadius.circular(16),
               onTap: () => setState(() => _searchExpanded = !_searchExpanded),
               child: Padding(
                 padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 14,
+                  horizontal: 15,
+                  vertical: 13,
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.search_rounded, color: AppTheme.orange),
+                    Container(
+                      width: 34,
+                      height: 34,
+                      decoration: const BoxDecoration(
+                        color: AppTheme.orangeSoft,
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(
+                        Icons.search_rounded,
+                        color: AppTheme.orange,
+                        size: 20,
+                      ),
+                    ),
                     const SizedBox(width: 10),
                     Expanded(
                       child: Text(
@@ -1607,6 +1896,7 @@ class _HomePageState extends State<HomePage> {
                           color: _appliedKeyword.isEmpty
                               ? AppTheme.textMuted
                               : Colors.black87,
+                          fontSize: 14,
                           fontWeight: FontWeight.w600,
                         ),
                       ),
@@ -1763,13 +2053,8 @@ class _HomePageState extends State<HomePage> {
     ];
 
     return Container(
-      margin: const EdgeInsets.fromLTRB(16, 0, 16, 14),
-      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 10),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(17),
-        border: Border.all(color: AppTheme.border),
-      ),
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 18),
+      padding: const EdgeInsets.symmetric(vertical: 2),
       child: SingleChildScrollView(
         scrollDirection: Axis.horizontal,
         child: Row(
@@ -1784,18 +2069,21 @@ class _HomePageState extends State<HomePage> {
                   _draftCategory = category.$3;
                 }),
                 child: SizedBox(
-                  width: 74,
+                  width: 72,
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Container(
-                        width: 43,
-                        height: 43,
+                        width: 46,
+                        height: 46,
                         decoration: BoxDecoration(
                           color: _selectedCategory == category.$3
                               ? AppTheme.orange
-                              : AppTheme.orangeSoft,
+                              : const Color(0xFFFFF5F0),
                           shape: BoxShape.circle,
+                          border: _selectedCategory == category.$3
+                              ? null
+                              : Border.all(color: const Color(0xFFF7E6DC)),
                         ),
                         child: Icon(
                           category.$1,
@@ -1811,9 +2099,11 @@ class _HomePageState extends State<HomePage> {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w500,
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontWeight: _selectedCategory == category.$3
+                              ? FontWeight.w700
+                              : FontWeight.w500,
                         ),
                       ),
                     ],
@@ -1827,17 +2117,32 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _sectionTitle(BuildContext context) {
+  Widget _sectionTitle(BuildContext context, {required bool nearby}) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(17, 5, 17, 12),
+      padding: const EdgeInsets.fromLTRB(18, 1, 18, 13),
       child: Row(
         children: [
           Expanded(
             child: LocalizedText(
-              AppLocalizations.of(context).latestListings,
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+              nearby
+                  ? AppLocalizations.of(context).source('สินค้าใกล้คุณ')
+                  : AppLocalizations.of(context).latestListings,
+              style: const TextStyle(
+                fontSize: 19,
+                letterSpacing: -.25,
+                fontWeight: FontWeight.w800,
+              ),
             ),
           ),
+          if (nearby)
+            const Padding(
+              padding: EdgeInsets.only(right: 8),
+              child: Icon(
+                Icons.near_me_outlined,
+                size: 18,
+                color: AppTheme.orange,
+              ),
+            ),
           InkWell(
             onTap: () => setState(() {
               _selectedCategory = 'all';
@@ -2402,10 +2707,7 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
   Future<void> _refreshStoreProducts() async {
     final rows = await SuikaiService.fetchListingsForStore(widget.storeId);
     final products = rows.map((item) {
-      final images = (item['listing_images'] as List? ?? const [])
-          .map((entry) => '${(entry as Map)['image_url'] ?? ''}')
-          .where((url) => url.isNotEmpty)
-          .toList();
+      final imageUrls = listingImageUrls(item);
       return ProductViewModel(
         id: '${item['id']}',
         title: '${item['title'] ?? ''}',
@@ -2422,7 +2724,7 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
             : null,
         location: '${item['city'] ?? ''}',
         time: '${item['created_at'] ?? ''}',
-        image: images.firstOrNull ?? '',
+        image: imageUrls.isEmpty ? '' : imageUrls.first,
         phone: '${item['phone'] ?? ''}',
         viber: '${item['viber_phone'] ?? ''}',
         likeCount: 0,
@@ -2430,7 +2732,12 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
         status: _productStatus('${item['status']}'),
         storeId: '${item['store_id']}',
         ownerId: '${item['owner_id']}',
-        images: images,
+        images: imageUrls,
+        video: item['listing_video'] is Map
+            ? ListingVideoRecord.fromJson(
+                Map<String, dynamic>.from(item['listing_video'] as Map),
+              )
+            : null,
         latitude: (item['latitude'] as num?)?.toDouble(),
         longitude: (item['longitude'] as num?)?.toDouble(),
         isLocationVisible: item['is_location_visible'] != false,
@@ -2456,15 +2763,8 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
       MarketplaceCache.removeProduct(product.id);
     } else {
       final status = _productStatus(action);
-      await SuikaiService.updateListing(
+      await SuikaiService.updateListingStatus(
         listingId: product.id,
-        title: product.title,
-        description: product.description,
-        city: product.city,
-        phone: product.phone,
-        viber: product.viber,
-        price: product.priceValue.toDouble(),
-        currency: product.currencyCode,
         status: action,
       );
       MarketplaceCache.setStatus(product.id, status);
@@ -2793,6 +3093,53 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
             ),
             const SizedBox(height: 12),
           ],
+          if ((store.coverUrl ?? '').trim().isNotEmpty) ...[
+            SizedBox(
+              height: 170,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(16),
+                    child: persistentImage(
+                      store.coverUrl!,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) =>
+                          const ColoredBox(color: AppTheme.orangeSoft),
+                    ),
+                  ),
+                  Positioned(
+                    right: 12,
+                    bottom: 12,
+                    child: Material(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(22),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            tooltip: 'โทร',
+                            onPressed: store.phone.trim().isEmpty
+                                ? null
+                                : () => launchPhone(store.phone),
+                            icon: const Icon(Icons.phone_rounded),
+                          ),
+                          IconButton(
+                            tooltip: 'Viber',
+                            onPressed: store.viber.trim().isEmpty
+                                ? null
+                                : () => launchViber(store.viber),
+                            icon: const Icon(Icons.call_rounded),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
           Row(
             children: [
               ClipRRect(
@@ -2883,11 +3230,20 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
             Padding(
               padding: const EdgeInsets.only(bottom: 10),
               child: InkWell(
-                onTap: () => Navigator.pushNamed(
-                  context,
-                  SuikaiRoutes.productDetail,
-                  arguments: product.id,
-                ),
+                onTap: () => product.hasVideo
+                    ? Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => FullscreenListingVideoViewer(
+                            items: products,
+                            initialProductId: product.id,
+                          ),
+                        ),
+                      )
+                    : Navigator.pushNamed(
+                        context,
+                        SuikaiRoutes.productDetail,
+                        arguments: product.id,
+                      ),
                 borderRadius: BorderRadius.circular(14),
                 child: Container(
                   padding: const EdgeInsets.all(10),
@@ -2900,17 +3256,35 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
                     children: [
                       ClipRRect(
                         borderRadius: BorderRadius.circular(10),
-                        child: persistentImage(
-                          product.image,
-                          width: 72,
-                          height: 72,
-                          fit: BoxFit.cover,
-                          errorBuilder: (_, error, stackTrace) => Container(
-                            width: 72,
-                            height: 72,
-                            color: const Color(0xFFF2F2F2),
-                          ),
-                        ),
+                        child: product.hasVideo
+                            ? FutureBuilder<String>(
+                                future: SuikaiService.signedThumbnailUrl(
+                                  product.video!,
+                                ),
+                                builder: (_, snapshot) => snapshot.hasData
+                                    ? persistentImage(
+                                        snapshot.data!,
+                                        width: 72,
+                                        height: 72,
+                                        fit: BoxFit.cover,
+                                      )
+                                    : Container(
+                                        width: 72,
+                                        height: 72,
+                                        color: const Color(0xFFF2F2F2),
+                                      ),
+                              )
+                            : persistentImage(
+                                product.image,
+                                width: 72,
+                                height: 72,
+                                fit: BoxFit.cover,
+                                errorBuilder: (_, _, _) => Container(
+                                  width: 72,
+                                  height: 72,
+                                  color: const Color(0xFFF2F2F2),
+                                ),
+                              ),
                       ),
                       const SizedBox(width: 10),
                       Expanded(
@@ -2985,6 +3359,7 @@ class _StoreDetailPageState extends State<StoreDetailPage> {
   }
 }
 
+/* Retired image-listing editor. Kept out of compilation while preserving file history.
 class EditListingPage extends StatefulWidget {
   final String productId;
   const EditListingPage({super.key, required this.productId});
@@ -3578,10 +3953,12 @@ class _EditListingPageState extends State<EditListingPage> {
         ),
       ]);
       if (mounted) Navigator.pop(context, true);
-    } catch (_) {
+    } catch (error, stackTrace) {
+      debugPrint('Edit listing save failed: id=${product.id} error=$error');
+      debugPrintStack(stackTrace: stackTrace);
       if (!mounted) return;
       setState(() => _saving = false);
-      showInfo(context, l10n.saveFailed);
+      showInfo(context, '${l10n.saveFailed}: $error');
     }
   }
 }
@@ -3595,6 +3972,18 @@ class _ProductImageDraft {
     : this._(selectedImage: image);
 }
 
+*/
+
+class EditListingPage extends StatelessWidget {
+  final String productId;
+  const EditListingPage({super.key, required this.productId});
+
+  @override
+  Widget build(BuildContext context) =>
+      const _MissingPage(title: 'ประกาศวิดีโอแก้ไขได้เฉพาะข้อมูลสถานะ');
+}
+
+/* Retired image-listing composer. VideoPostPage below is the sole listing creator.
 class PostPage extends StatefulWidget {
   final bool startGeneral;
   final String? storeId;
@@ -3748,9 +4137,23 @@ class _PostPageState extends State<PostPage> {
 
   @override
   Widget build(BuildContext context) {
-    if (widget.storeId != null) return _buildStoreProductForm();
-    if (!_showGeneralWizard) return _buildTypeChooser();
-    return _buildWizard();
+    if (kIsWeb && (widget.storeId != null || _showGeneralWizard)) {
+      return const Scaffold(
+        body: Center(
+          child: Padding(
+            padding: EdgeInsets.all(24),
+            child: Text(
+              'Video Post ยังไม่รองรับบน Web กรุณาใช้แอป Android หรือ iOS',
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      );
+    }
+    if (widget.storeId != null || _showGeneralWizard) {
+      return VideoPostPage(storeId: widget.storeId);
+    }
+    return _buildTypeChooser();
   }
 
   Widget _buildStoreProductForm() {
@@ -5222,6 +5625,948 @@ class _PostPageState extends State<PostPage> {
   );
 }
 
+*/
+
+class PostPage extends StatelessWidget {
+  final bool startGeneral;
+  final String? storeId;
+  const PostPage({super.key, this.startGeneral = false, this.storeId});
+
+  @override
+  Widget build(BuildContext context) => VideoPostPage(storeId: storeId);
+}
+
+class VideoPostPage extends StatefulWidget {
+  final String? storeId;
+  const VideoPostPage({super.key, this.storeId});
+  @override
+  State<VideoPostPage> createState() => _VideoPostPageState();
+}
+
+class _VideoPostPageState extends State<VideoPostPage> {
+  final _form = GlobalKey<FormState>();
+  final _title = TextEditingController();
+  final _price = TextEditingController();
+  String? _category;
+  bool _detailsConfirmed = false;
+  bool _posting = false;
+  String _progressMessage = '';
+  SelectedVideoPost? _video;
+  VideoPlayerController? _preview;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _showDetails());
+  }
+
+  @override
+  void dispose() {
+    _title.dispose();
+    _price.dispose();
+    _preview?.dispose();
+    super.dispose();
+  }
+
+  Future<void> _showDetails() async {
+    if (widget.storeId == null && !await _checkGeneralPostingProfile()) {
+      if (mounted) Navigator.pop(context);
+      return;
+    }
+    final accepted = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        final l10n = AppLocalizations.of(dialogContext);
+        return AlertDialog(
+        title: Text(l10n.source('ข้อมูลสินค้า')),
+        content: Form(
+          key: _form,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextFormField(
+                controller: _title,
+                decoration: InputDecoration(
+                  labelText: l10n.source('ชื่อสินค้า *'),
+                ),
+                validator: (v) => normalizeText(v).isEmpty
+                    ? l10n.source('กรุณาใส่ชื่อสินค้า')
+                    : null,
+              ),
+              DropdownButtonFormField<String>(
+                value: _category,
+                decoration: InputDecoration(
+                  labelText: l10n.source('หมวดหมู่ *'),
+                ),
+                items:
+                    SuikaiService.categoryRecords('listing', activeOnly: true)
+                        .map(
+                          (c) => DropdownMenuItem(
+                            value: c.id,
+                            child: Text(
+                              c.localizedName(
+                                Localizations.localeOf(
+                                  dialogContext,
+                                ).languageCode,
+                              ),
+                            ),
+                          ),
+                        )
+                        .toList(),
+                onChanged: (v) => setState(() => _category = v),
+                validator: (v) => v == null
+                    ? l10n.source('กรุณาเลือกหมวดหมู่สินค้า')
+                    : null,
+              ),
+              TextFormField(
+                controller: _price,
+                keyboardType: TextInputType.number,
+                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                decoration: InputDecoration(labelText: l10n.source('ราคา *')),
+                validator: (v) => parsePriceValue(v) == null
+                    ? l10n.source('กรุณากรอกราคาที่ถูกต้อง')
+                    : null,
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(l10n.source('ยกเลิก')),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              if (_form.currentState!.validate())
+                Navigator.pop(dialogContext, true);
+            },
+            child: Text(l10n.source('ตกลง')),
+          ),
+        ],
+      );
+      },
+    );
+    if (!mounted) return;
+    if (accepted != true) {
+      Navigator.pop(context);
+      return;
+    }
+    setState(() => _detailsConfirmed = true);
+    await _chooseVideoSource();
+  }
+
+  Future<bool> _checkGeneralPostingProfile() async {
+    final l10n = AppLocalizations.of(context);
+    UserProfile? profile;
+    try {
+      profile = await SuikaiService.currentProfile();
+    } catch (error, stackTrace) {
+      debugPrint('General posting profile check failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (mounted)
+        showInfo(context, 'ไม่สามารถตรวจสอบข้อมูลโปรไฟล์ได้: $error');
+      return false;
+    }
+    final missing = SuikaiService.incompleteGeneralPostingProfileFields(
+      profile,
+    );
+    if (missing.isEmpty) return true;
+    final labels = {
+      'name': l10n.ui('name'),
+      'phone': l10n.ui('phone'),
+      'city': l10n.source('เมืองที่อยู่'),
+    };
+    final missingLabels = missing.map((field) => labels[field]!).join(', ');
+    if (!mounted) return false;
+    final editProfile = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(l10n.source('กรอกข้อมูลโปรไฟล์ให้ครบ')),
+        content: Text(missingLabels),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(l10n.source('ยกเลิก')),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(l10n.source('ไปแก้ไขโปรไฟล์')),
+          ),
+        ],
+      ),
+    );
+    if (editProfile != true || !mounted) return false;
+    await Navigator.push<UserProfile>(
+      context,
+      MaterialPageRoute(builder: (_) => const ProfileSettingsPage()),
+    );
+    if (!mounted) return false;
+    try {
+      final updated = await SuikaiService.currentProfile();
+      return SuikaiService.incompleteGeneralPostingProfileFields(
+        updated,
+      ).isEmpty;
+    } catch (error, stackTrace) {
+      debugPrint('General posting profile recheck failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (mounted)
+        showInfo(context, 'ไม่สามารถตรวจสอบข้อมูลโปรไฟล์ได้: $error');
+      return false;
+    }
+  }
+
+  Future<void> _chooseVideoSource() async {
+    final l10n = AppLocalizations.of(context);
+    final source = await showModalBottomSheet<ImageSource>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.videocam_rounded),
+              title: Text(l10n.source('ถ่ายวิดีโอ')),
+              onTap: () => Navigator.pop(context, ImageSource.camera),
+            ),
+            ListTile(
+              leading: const Icon(Icons.video_library_outlined),
+              title: Text(l10n.source('เลือกจากคลัง')),
+              onTap: () => Navigator.pop(context, ImageSource.gallery),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (source == null || !mounted) return;
+    setState(() {
+      _posting = true;
+      _progressMessage = l10n.source('กำลังเตรียมและบีบอัดวิดีโอ...');
+    });
+    try {
+      SelectedVideoPost? selected;
+      if (source == ImageSource.camera) {
+        final recording = await Navigator.push<XFile>(
+          context,
+          MaterialPageRoute(builder: (_) => const VideoRecorderPage()),
+        );
+        if (recording != null) {
+          selected = await SuikaiService.prepareVideoPost(recording.path);
+        }
+      } else {
+        selected = await SuikaiService.pickVideoPost(source: source);
+      }
+      if (selected == null || !mounted) return;
+      final controller = VideoPlayerController.file(
+        File(selected.prepared.path),
+      );
+      await controller.initialize();
+      await _preview?.dispose();
+      if (!mounted) {
+        await controller.dispose();
+        return;
+      }
+      setState(() {
+        _video = selected;
+        _preview = controller;
+        _progressMessage = '';
+      });
+    } on FormatException catch (error) {
+      if (mounted)
+        showInfo(
+          context,
+          error.message == 'video_duration_exceeds_30_seconds'
+              ? l10n.source('วิดีโอต้องยาวไม่เกิน 30 วินาที')
+              : l10n.source('วิดีโอหลังบีบอัดต้องมีขนาดไม่เกิน 5 MB'),
+        );
+    } catch (_) {
+      if (mounted) showInfo(context, l10n.source('ไม่สามารถเตรียมวิดีโอได้'));
+    } finally {
+      if (mounted) {
+        setState(() {
+          _posting = false;
+          _progressMessage = '';
+        });
+      }
+    }
+  }
+
+  Future<void> _publish() async {
+    final video = _video;
+    if (video == null) return;
+    final l10n = AppLocalizations.of(context);
+    if (SuikaiService.currentUserId?.trim().isEmpty != false) {
+      showInfo(context, 'กรุณาเข้าสู่ระบบก่อนโพสต์สินค้า');
+      return;
+    }
+    setState(() {
+      _posting = true;
+      _progressMessage = l10n.source('กำลังอัปโหลดวิดีโอ...');
+    });
+    try {
+      String? city;
+      String? cityId;
+      String phone = '';
+      String viber = '';
+      double? latitude;
+      double? longitude;
+      if (widget.storeId == null) {
+        final profile = await SuikaiService.currentProfile();
+        city = profile?.city.trim().isEmpty == false
+            ? profile!.city.trim()
+            : null;
+        cityId = profile?.cityId;
+        phone = profile?.phone ?? '';
+        try {
+          final position = await SuikaiService.getCurrentPosition();
+          latitude = position?.latitude;
+          longitude = position?.longitude;
+          if (latitude != null && longitude != null) {
+            final resolved = await SuikaiService.resolveCityForCoordinates(
+              latitude,
+              longitude,
+            );
+            city = resolved?.name ?? city;
+            cityId = resolved?.id ?? cityId;
+          }
+        } catch (_) {}
+      } else {
+        final store = (await SuikaiService.fetchStores())
+            .where((row) => '${row['id']}' == widget.storeId)
+            .firstOrNull;
+        city = store?['city']?.toString();
+        cityId = store?['city_id']?.toString();
+        phone = store?['phone']?.toString() ?? '';
+        viber = store?['viber_phone']?.toString() ?? '';
+        latitude = (store?['latitude'] as num?)?.toDouble();
+        longitude = (store?['longitude'] as num?)?.toDouble();
+      }
+      await SuikaiService.createListing(
+        title: normalizeText(_title.text),
+        description: '',
+        category: _category!,
+        city: city,
+        cityId: cityId,
+        phone: normalizePhone(phone),
+        viber: normalizePhone(viber),
+        price: parsePriceValue(_price.text)!.toDouble(),
+        currency: 'MMK',
+        listingType: widget.storeId == null ? 'general' : 'store',
+        storeId: widget.storeId,
+        video: video,
+        latitude: latitude,
+        longitude: longitude,
+        isLocationVisible: widget.storeId != null || latitude != null,
+      );
+      if (mounted) {
+        HapticFeedback.mediumImpact();
+        Navigator.pop(context, true);
+      }
+    } catch (error) {
+      if (mounted) showInfo(context, 'ลงประกาศไม่สำเร็จ: $error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _posting = false;
+          _progressMessage = '';
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(
+      title: LocalizedText(
+        widget.storeId == null ? 'ลงขายด้วยวิดีโอ' : 'เพิ่มสินค้าแบบวิดีโอ',
+      ),
+    ),
+    body: !_detailsConfirmed
+        ? const SizedBox.shrink()
+        : Padding(
+            padding: const EdgeInsets.all(16),
+            child: _preview == null
+                ? _posting
+                      ? _VideoPreparingState(message: _progressMessage)
+                      : Center(
+                          child: ElevatedButton.icon(
+                            onPressed: _chooseVideoSource,
+                            icon: const Icon(Icons.videocam_rounded),
+                            label: const LocalizedText('ถ่ายหรือเลือกวิดีโอ'),
+                          ),
+                        )
+                : Column(
+                    children: [
+                      Expanded(
+                        child: AspectRatio(
+                          aspectRatio: _preview!.value.aspectRatio,
+                          child: VideoPlayer(_preview!),
+                        ),
+                      ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          IconButton(
+                            onPressed: () => setState(
+                              () => _preview!.value.isPlaying
+                                  ? _preview!.pause()
+                                  : _preview!.play(),
+                            ),
+                            icon: Icon(
+                              _preview!.value.isPlaying
+                                  ? Icons.pause
+                                  : Icons.play_arrow,
+                            ),
+                          ),
+                          Text(
+                            '${(_video!.prepared.durationMilliseconds / 1000).toStringAsFixed(1)} ${AppLocalizations.of(context).source('วินาที')}',
+                          ),
+                        ],
+                      ),
+                      if (_posting && _progressMessage.isNotEmpty) ...[
+                        const SizedBox(height: 12),
+                        const LinearProgressIndicator(),
+                        const SizedBox(height: 6),
+                        Text(_progressMessage),
+                      ],
+                      Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed: _posting ? null : _chooseVideoSource,
+                              child: const LocalizedText('ถ่ายใหม่'),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: ElevatedButton(
+                              onPressed: _posting ? null : _publish,
+                              child: LocalizedText(
+                                _posting ? 'กำลังโพสต์...' : 'โพสต์',
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+          ),
+  );
+}
+
+class _VideoPreparingState extends StatefulWidget {
+  final String message;
+  const _VideoPreparingState({required this.message});
+
+  @override
+  State<_VideoPreparingState> createState() => _VideoPreparingStateState();
+}
+
+class _VideoPreparingStateState extends State<_VideoPreparingState>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _pulse = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1050),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Center(
+    child: Semantics(
+      liveRegion: true,
+      label: widget.message,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ScaleTransition(
+            scale: Tween<double>(
+              begin: .92,
+              end: 1.06,
+            ).animate(CurvedAnimation(parent: _pulse, curve: Curves.easeInOut)),
+            child: Container(
+              width: 96,
+              height: 96,
+              padding: const EdgeInsets.all(19),
+              decoration: BoxDecoration(
+                color: AppTheme.orangeSoft.withValues(alpha: .24),
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: AppTheme.orange.withValues(alpha: .55),
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: AppTheme.orange.withValues(alpha: .13),
+                    blurRadius: 22,
+                    spreadRadius: 4,
+                  ),
+                ],
+              ),
+              child: const Stack(
+                alignment: Alignment.center,
+                children: [
+                  CircularProgressIndicator(
+                    color: AppTheme.orange,
+                    strokeWidth: 3.5,
+                  ),
+                  Icon(
+                    Icons.movie_creation_outlined,
+                    color: AppTheme.orange,
+                    size: 27,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 24),
+          const LocalizedText(
+            'กำลังเตรียมวิดีโอ',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+          ),
+          const SizedBox(height: 8),
+          LocalizedText(
+            widget.message.isEmpty ? 'กำลังบีบอัดวิดีโอ...' : widget.message,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: AppTheme.textMuted),
+          ),
+          const SizedBox(height: 8),
+          const LocalizedText(
+            'โปรดรอสักครู่ ระบบกำลังปรับไฟล์ให้พร้อมใช้งาน',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: AppTheme.textMuted, fontSize: 12),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class VideoRecorderPage extends StatefulWidget {
+  const VideoRecorderPage({super.key});
+
+  @override
+  State<VideoRecorderPage> createState() => _VideoRecorderPageState();
+}
+
+class _VideoRecorderPageState extends State<VideoRecorderPage> {
+  static const _maximum = Duration(seconds: 30);
+  CameraController? _camera;
+  VideoPlayerController? _preview;
+  Timer? _timer;
+  Duration _elapsed = Duration.zero;
+  XFile? _recording;
+  String? _error;
+  bool _initializing = true;
+  bool _isRecording = false;
+  bool _isStopping = false;
+  bool _front = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeCamera();
+  }
+
+  Future<void> _initializeCamera() async {
+    setState(() {
+      _initializing = true;
+      _error = null;
+    });
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) throw StateError('camera_unavailable');
+      final preferred = cameras.where(
+        (item) =>
+            item.lensDirection ==
+            (_front ? CameraLensDirection.front : CameraLensDirection.back),
+      );
+      final selected = preferred.firstOrNull ?? cameras.first;
+      var controller = CameraController(
+        selected,
+        // Medium requests a less-wide camera stream than the prior 16:9 high
+        // preset, reducing the cover crop on tall phone screens.
+        ResolutionPreset.medium,
+        enableAudio: true,
+      );
+      try {
+        await controller.initialize();
+      } on CameraException {
+        // Some front cameras reject the preferred stream size. Retry with the
+        // broadly supported 4:3 low preset instead of leaving a black preview.
+        await controller.dispose();
+        controller = CameraController(
+          selected,
+          ResolutionPreset.low,
+          enableAudio: true,
+        );
+        await controller.initialize();
+      }
+      await controller.lockCaptureOrientation(DeviceOrientation.portraitUp);
+      if (!mounted) {
+        await controller.dispose();
+        return;
+      }
+      final old = _camera;
+      setState(() => _camera = controller);
+      await old?.dispose();
+    } on CameraException catch (error) {
+      if (mounted) setState(() => _error = error.description ?? error.code);
+    } catch (_) {
+      if (mounted) setState(() => _error = 'ไม่สามารถเปิดกล้องได้');
+    } finally {
+      if (mounted) setState(() => _initializing = false);
+    }
+  }
+
+  Future<void> _startRecording() async {
+    final camera = _camera;
+    if (camera == null || _isRecording || _isStopping) return;
+    try {
+      await camera.startVideoRecording();
+      if (!mounted) return;
+      setState(() {
+        _elapsed = Duration.zero;
+        _isRecording = true;
+      });
+      _timer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+        final next = _elapsed + const Duration(milliseconds: 100);
+        if (!mounted) {
+          timer.cancel();
+          return;
+        }
+        if (next >= _maximum) {
+          setState(() => _elapsed = _maximum);
+          unawaited(_stopRecording());
+        } else {
+          setState(() => _elapsed = next);
+        }
+      });
+    } on CameraException catch (error) {
+      if (mounted)
+        showInfo(context, error.description ?? 'ไม่สามารถเริ่มบันทึกได้');
+    }
+  }
+
+  Future<void> _stopRecording() async {
+    final camera = _camera;
+    if (camera == null || !_isRecording || _isStopping) return;
+    _timer?.cancel();
+    setState(() {
+      _isRecording = false;
+      _isStopping = true;
+    });
+    try {
+      final recording = await camera.stopVideoRecording();
+      final preview = VideoPlayerController.file(File(recording.path));
+      await preview.initialize();
+      await preview.setLooping(true);
+      if (!mounted) {
+        await preview.dispose();
+        return;
+      }
+      await _preview?.dispose();
+      setState(() {
+        _recording = recording;
+        _preview = preview;
+      });
+      await preview.play();
+    } on CameraException catch (error) {
+      if (mounted)
+        showInfo(context, error.description ?? 'ไม่สามารถบันทึกวิดีโอได้');
+    } finally {
+      if (mounted) setState(() => _isStopping = false);
+    }
+  }
+
+  Future<void> _retake() async {
+    await _preview?.dispose();
+    if (mounted) {
+      setState(() {
+        _preview = null;
+        _recording = null;
+        _elapsed = Duration.zero;
+      });
+    }
+  }
+
+  Future<void> _switchCamera() async {
+    if (_isRecording || _recording != null) return;
+    final cameras = await availableCameras();
+    final wantsFront = !_front;
+    final next = cameras
+        .where(
+          (item) =>
+              item.lensDirection ==
+              (wantsFront
+                  ? CameraLensDirection.front
+                  : CameraLensDirection.back),
+        )
+        .firstOrNull;
+    if (next == null) {
+      if (mounted) showInfo(context, 'ไม่พบกล้องด้านนี้ในอุปกรณ์');
+      return;
+    }
+    final current = _camera;
+    setState(() {
+      _camera = null;
+      _front = wantsFront;
+    });
+    // Android/iOS can hold the physical camera until its controller is fully
+    // disposed. Release it before initializing the opposite lens.
+    await current?.dispose();
+    if (!mounted) return;
+    await _initializeCamera();
+  }
+
+  String get _timerLabel =>
+      '${_elapsed.inMinutes.toString().padLeft(2, '0')}:${(_elapsed.inSeconds % 60).toString().padLeft(2, '0')}';
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _preview?.dispose();
+    _camera?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final preview = _preview;
+    final progress = _elapsed.inMilliseconds / _maximum.inMilliseconds;
+    final screenPadding = MediaQuery.paddingOf(context);
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          if (preview != null)
+            _FullscreenCameraSurface(
+              aspectRatio: preview.value.aspectRatio,
+              child: VideoPlayer(preview),
+            )
+          else if (_camera != null && _camera!.value.isInitialized)
+            _FullscreenCameraSurface(
+              aspectRatio: _camera!.value.aspectRatio,
+              childHandlesAspectRatio: true,
+              child: CameraPreview(_camera!),
+            )
+          else
+            Center(
+              child: _initializing
+                  ? const CircularProgressIndicator(color: AppTheme.orange)
+                  : Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: LocalizedText(
+                        _error ?? 'ไม่สามารถเปิดกล้องได้',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                    ),
+            ),
+          if (preview == null && _camera != null)
+            const Positioned.fill(
+              child: IgnorePointer(child: _RuleOfThirdsGrid()),
+            ),
+          Positioned(
+            top: screenPadding.top + 10,
+            left: 12,
+            child: _VideoOverlayButton(
+              icon: Icons.close_rounded,
+              onTap: _isRecording ? null : () => Navigator.pop(context),
+            ),
+          ),
+          if (preview == null && _camera != null)
+            Positioned(
+              top: screenPadding.top + 10,
+              right: 12,
+              child: _VideoOverlayButton(
+                icon: Icons.cameraswitch_rounded,
+                onTap: _isRecording ? null : _switchCamera,
+              ),
+            ),
+          if (preview == null)
+            Positioned(
+              top: screenPadding.top + 16,
+              left: 0,
+              right: 0,
+              child: Column(
+                children: [
+                  LocalizedText(
+                    '$_timerLabel / 00:30',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 17,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: 140,
+                    child: LinearProgressIndicator(
+                      value: progress,
+                      minHeight: 5,
+                      borderRadius: BorderRadius.circular(9),
+                      color: AppTheme.orange,
+                      backgroundColor: Colors.white30,
+                    ),
+                  ),
+                  const SizedBox(height: 5),
+                  const LocalizedText(
+                    'บันทึกได้สูงสุด 30 วินาที',
+                    style: TextStyle(color: Colors.white70, fontSize: 11),
+                  ),
+                ],
+              ),
+            ),
+          Positioned(
+            left: 20,
+            right: 20,
+            bottom: screenPadding.bottom + 24,
+            child: preview == null
+                ? Center(
+                    child: GestureDetector(
+                      onTap: _isStopping
+                          ? null
+                          : _isRecording
+                          ? _stopRecording
+                          : _startRecording,
+                      child: Container(
+                        width: 72,
+                        height: 72,
+                        padding: const EdgeInsets.all(5),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: _isRecording
+                                ? AppTheme.orange
+                                : Colors.white,
+                            width: 3,
+                          ),
+                        ),
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            color: AppTheme.orange,
+                            borderRadius: BorderRadius.circular(
+                              _isRecording ? 10 : 32,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  )
+                : Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: _retake,
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.white,
+                            side: const BorderSide(color: Colors.white70),
+                          ),
+                          child: const LocalizedText('ถ่ายใหม่'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: () => Navigator.pop(context, _recording),
+                          child: const LocalizedText('ใช้วิดีโอนี้'),
+                        ),
+                      ),
+                    ],
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FullscreenCameraSurface extends StatelessWidget {
+  final double aspectRatio;
+  final Widget child;
+  final bool childHandlesAspectRatio;
+  const _FullscreenCameraSurface({
+    required this.aspectRatio,
+    required this.child,
+    this.childHandlesAspectRatio = false,
+  });
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final screenRatio = constraints.maxWidth / constraints.maxHeight;
+      // Scale proportionally until the shorter camera/video dimension covers
+      // the full portrait viewport. Clip the overflow rather than distorting it.
+      final scale = aspectRatio / screenRatio;
+      final content = childHandlesAspectRatio
+          ? child
+          : AspectRatio(aspectRatio: aspectRatio, child: child);
+      return ClipRect(
+        child: Transform.scale(
+          scale: scale < 1 ? 1 / scale : scale,
+          child: Center(child: content),
+        ),
+      );
+    },
+  );
+}
+
+class _RuleOfThirdsGrid extends StatelessWidget {
+  const _RuleOfThirdsGrid();
+
+  @override
+  Widget build(BuildContext context) =>
+      CustomPaint(painter: _RuleOfThirdsPainter());
+}
+
+class _RuleOfThirdsPainter extends CustomPainter {
+  const _RuleOfThirdsPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.white.withValues(alpha: .22)
+      ..strokeWidth = 1;
+    for (final fraction in const [.333333, .666667]) {
+      canvas.drawLine(
+        Offset(size.width * fraction, 0),
+        Offset(size.width * fraction, size.height),
+        paint,
+      );
+      canvas.drawLine(
+        Offset(0, size.height * fraction),
+        Offset(size.width, size.height * fraction),
+        paint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _RuleOfThirdsPainter oldDelegate) => false;
+}
+
+class _VideoOverlayButton extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback? onTap;
+  const _VideoOverlayButton({required this.icon, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) => Material(
+    color: Colors.black45,
+    shape: const CircleBorder(),
+    child: IconButton(
+      onPressed: onTap,
+      icon: Icon(icon, color: Colors.white),
+    ),
+  );
+}
+
 class _FieldLabel extends StatelessWidget {
   final String text;
   const _FieldLabel(this.text);
@@ -5686,10 +7031,8 @@ class _MapPageState extends State<MapPage> {
         );
       }).toList();
       final products = results[1].map((item) {
-        final images = (item['listing_images'] as List? ?? const [])
-            .map((entry) => '${(entry as Map)['image_url'] ?? ''}')
-            .where((url) => url.isNotEmpty)
-            .toList();
+        final stats = item['listing_stats'] as Map<String, dynamic>?;
+        final imageUrls = listingImageUrls(item);
         return ProductViewModel(
           id: '${item['id']}',
           title: '${item['title'] ?? ''}',
@@ -5706,15 +7049,20 @@ class _MapPageState extends State<MapPage> {
               : null,
           location: '${item['city'] ?? ''}',
           time: '${item['created_at'] ?? ''}',
-          image: images.firstOrNull ?? '',
+          image: imageUrls.isEmpty ? '' : imageUrls.first,
           phone: '${item['phone'] ?? ''}',
           viber: '${item['viber_phone'] ?? ''}',
-          likeCount: 0,
-          viewCount: 0,
+          likeCount: (stats?['like_count'] as num?)?.toInt() ?? 0,
+          viewCount: (stats?['view_count'] as num?)?.toInt() ?? 0,
           status: _productStatus('${item['status']}'),
           storeId: item['store_id']?.toString(),
           ownerId: item['owner_id']?.toString(),
-          images: images,
+          images: imageUrls,
+          video: item['listing_video'] is Map
+              ? ListingVideoRecord.fromJson(
+                  Map<String, dynamic>.from(item['listing_video'] as Map),
+                )
+              : null,
           latitude: (item['latitude'] as num?)?.toDouble(),
           longitude: (item['longitude'] as num?)?.toDouble(),
           isLocationVisible: item['is_location_visible'] == true,
@@ -6001,6 +7349,7 @@ class _MapPageState extends State<MapPage> {
           return InkWell(
             borderRadius: BorderRadius.circular(12),
             onTap: () => setState(() {
+              HapticFeedback.selectionClick();
               _category = item.$1;
               _selected = null;
               _selectedProduct = null;
@@ -6096,7 +7445,7 @@ class _MapPageState extends State<MapPage> {
                           shape: BoxShape.circle,
                           border: Border.all(
                             color: _selected?.id == store.id
-                                ? AppTheme.orange
+                                ? Colors.blue.shade700
                                 : Colors.white,
                             width: 3,
                           ),
@@ -6104,9 +7453,9 @@ class _MapPageState extends State<MapPage> {
                         ),
                         clipBehavior: Clip.antiAlias,
                         child: store.logo.trim().isEmpty
-                            ? const Icon(
+                            ? Icon(
                                 Icons.storefront_rounded,
-                                color: AppTheme.orange,
+                                color: Colors.blue.shade700,
                               )
                             : persistentImage(
                                 store.logo,
@@ -6114,9 +7463,9 @@ class _MapPageState extends State<MapPage> {
                                   'map-store-logo-${store.id}-${store.logo}',
                                 ),
                                 fit: BoxFit.cover,
-                                errorBuilder: (_, _, _) => const Icon(
+                                errorBuilder: (_, _, _) => Icon(
                                   Icons.storefront_rounded,
-                                  color: AppTheme.orange,
+                                  color: Colors.blue.shade700,
                                 ),
                               ),
                       ),
@@ -6169,7 +7518,7 @@ class _MapPageState extends State<MapPage> {
                             shape: BoxShape.circle,
                             border: Border.all(
                               color: _selectedProduct?.id == product.id
-                                  ? Colors.blue.shade700
+                                  ? AppTheme.orange
                                   : Colors.white,
                               width: 3,
                             ),
@@ -6179,7 +7528,7 @@ class _MapPageState extends State<MapPage> {
                           child: product.image.trim().isEmpty
                               ? const Icon(
                                   Icons.sell_outlined,
-                                  color: Colors.blue,
+                                  color: AppTheme.orange,
                                 )
                               : persistentImage(
                                   product.image,
@@ -6189,7 +7538,7 @@ class _MapPageState extends State<MapPage> {
                                   fit: BoxFit.cover,
                                   errorBuilder: (_, _, _) => const Icon(
                                     Icons.image_not_supported_outlined,
-                                    color: Colors.blue,
+                                    color: AppTheme.orange,
                                   ),
                                 ),
                         ),
@@ -6278,28 +7627,53 @@ class _MapPageState extends State<MapPage> {
     borderRadius: BorderRadius.circular(18),
     child: InkWell(
       borderRadius: BorderRadius.circular(18),
-      onTap: () => Navigator.pushNamed(
-        context,
-        SuikaiRoutes.productDetail,
-        arguments: product.id,
-      ),
+      onTap: () => product.hasVideo
+          ? Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => FullscreenListingVideoViewer(
+                  items: _productsForView,
+                  initialProductId: product.id,
+                ),
+              ),
+            )
+          : Navigator.pushNamed(
+              context,
+              SuikaiRoutes.productDetail,
+              arguments: product.id,
+            ),
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Row(
           children: [
             ClipRRect(
               borderRadius: BorderRadius.circular(11),
-              child: persistentImage(
-                product.image,
-                width: 68,
-                height: 68,
-                fit: BoxFit.cover,
-                errorBuilder: (_, _, _) => const SizedBox(
-                  width: 68,
-                  height: 68,
-                  child: Icon(Icons.image_not_supported_outlined),
-                ),
-              ),
+              child: product.hasVideo
+                  ? FutureBuilder<String>(
+                      future: SuikaiService.signedThumbnailUrl(product.video!),
+                      builder: (_, snapshot) => snapshot.hasData
+                          ? persistentImage(
+                              snapshot.data!,
+                              width: 68,
+                              height: 68,
+                              fit: BoxFit.cover,
+                            )
+                          : const SizedBox(
+                              width: 68,
+                              height: 68,
+                              child: Icon(Icons.play_circle_outline),
+                            ),
+                    )
+                  : persistentImage(
+                      product.image,
+                      width: 68,
+                      height: 68,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, _, _) => const SizedBox(
+                        width: 68,
+                        height: 68,
+                        child: Icon(Icons.image_not_supported_outlined),
+                      ),
+                    ),
             ),
             const SizedBox(width: 11),
             Expanded(
@@ -6837,7 +8211,9 @@ class ProfilePage extends StatefulWidget {
 }
 
 class _ProfilePageState extends State<ProfilePage> {
-  String _tab = 'ประกาศของฉัน';
+  String _tab = 'ประกาศ';
+  String _listingFilter = 'ทั้งหมด';
+  // Used by the retained legacy profile builder below.
   String _metric = 'all';
   String? _selectedStoreId;
   UserProfile? _profile;
@@ -6900,6 +8276,590 @@ class _ProfilePageState extends State<ProfilePage> {
 
   @override
   Widget build(BuildContext context) {
+    final userId = SuikaiService.currentUserId;
+    final owned = userId == null
+        ? <ProductViewModel>[]
+        : MarketplaceCache.products
+              .where((product) => product.ownerId == userId)
+              .toList();
+    final general = owned.where((product) => !product.isStoreProduct).toList();
+    final storeProducts = owned
+        .where((product) => product.storeId == _selectedStoreId)
+        .toList();
+    final sold = general
+        .where((product) => product.status == ProductStatus.sold)
+        .length;
+    final likes = general.fold<int>(
+      0,
+      (sum, product) => sum + product.likeCount,
+    );
+    final visibleGeneral = general.where((product) {
+      return switch (_listingFilter) {
+        'พร้อมขาย' => product.status == ProductStatus.available,
+        'จอง' => product.status == ProductStatus.reserved,
+        'ขายแล้ว' => product.status == ProductStatus.sold,
+        _ => true,
+      };
+    }).toList();
+
+    return RootScaffold(
+      selectedIndex: 4,
+      body: Stack(
+        children: [
+          Column(
+            children: [
+              const _ProfileTopBar(),
+              Expanded(
+                child: ListView(
+                  padding: const EdgeInsets.only(bottom: 104),
+                  children: [
+                    _profileHero(context, general.length, sold, likes),
+                    const SizedBox(height: 18),
+                    _profileTabs(),
+                    const SizedBox(height: 16),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 180),
+                        child: _tab == 'ประกาศ'
+                            ? _listingsSection(context, visibleGeneral)
+                            : _tab == 'ร้านของฉัน'
+                            ? _storesSection(context, storeProducts)
+                            : _manageSection(context, owned),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          Positioned(
+            right: 20,
+            bottom: 20,
+            child: FloatingActionButton.small(
+              heroTag: 'profile-post-listing',
+              tooltip: AppLocalizations.of(context).source('ลงประกาศ'),
+              backgroundColor: AppTheme.orange,
+              foregroundColor: Colors.white,
+              onPressed: () => Navigator.pushNamed(context, SuikaiRoutes.post),
+              child: const Icon(Icons.add_rounded),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _profileHero(
+    BuildContext context,
+    int listingCount,
+    int soldCount,
+    int likeCount,
+  ) {
+    final completeFields =
+        3 -
+        SuikaiService.incompleteGeneralPostingProfileFields(_profile).length;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        SizedBox(
+          height: 148,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Container(
+                height: 118,
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      Color(0xFFFFC5A6),
+                      AppTheme.orange,
+                      Color(0xFFDD4907),
+                    ],
+                  ),
+                ),
+                child: const Align(
+                  alignment: Alignment.bottomLeft,
+                  child: Padding(
+                    padding: EdgeInsets.fromLTRB(20, 0, 20, 18),
+                    child: Icon(
+                      Icons.waves_rounded,
+                      color: Color(0x70FFFFFF),
+                      size: 46,
+                    ),
+                  ),
+                ),
+              ),
+              Positioned(
+                right: 10,
+                top: 8,
+                child: PopupMenuButton<String>(
+                  icon: const Icon(
+                    Icons.more_horiz_rounded,
+                    color: Colors.white,
+                  ),
+                  onSelected: (value) async {
+                    if (value == 'settings') await _editProfile(context);
+                    if (value == 'open_store' && context.mounted) {
+                      await Navigator.pushNamed(context, SuikaiRoutes.openShop);
+                      _loadMyStores();
+                    }
+                    if (value == 'logout') await _logout(context);
+                  },
+                  itemBuilder: (_) => const [
+                    PopupMenuItem(
+                      value: 'settings',
+                      child: LocalizedText('ตั้งค่า'),
+                    ),
+                    PopupMenuItem(
+                      value: 'open_store',
+                      child: LocalizedText('เปิดร้าน'),
+                    ),
+                    PopupMenuItem(
+                      value: 'logout',
+                      child: LocalizedText('ออกจากระบบ'),
+                    ),
+                  ],
+                ),
+              ),
+              Positioned(
+                left: 20,
+                bottom: 0,
+                child: _ProfileAvatar(
+                  profile: _profile,
+                  completion: completeFields / 3,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _profile?.name.trim().isNotEmpty == true
+                          ? _profile!.name
+                          : AppLocalizations.of(context).source('บัญชีผู้ขาย'),
+                      style: const TextStyle(
+                        fontSize: 21,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.location_on_outlined,
+                          size: 15,
+                          color: AppTheme.textMuted,
+                        ),
+                        const SizedBox(width: 3),
+                        Expanded(
+                          child: Text(
+                            (_profile?.city ?? '').trim().isNotEmpty
+                                ? _profile!.city
+                                : AppLocalizations.of(
+                                    context,
+                                  ).source('ยังไม่ได้ระบุพื้นที่'),
+                            style: const TextStyle(
+                              fontSize: 13,
+                              color: AppTheme.textMuted,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              OutlinedButton.icon(
+                onPressed: () => _editProfile(context),
+                icon: const Icon(Icons.edit_outlined, size: 16),
+                label: Text(AppLocalizations.of(context).ui('editProfile')),
+                style: OutlinedButton.styleFrom(
+                  minimumSize: const Size(0, 38),
+                  padding: const EdgeInsets.symmetric(horizontal: 11),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: Row(
+            children: [
+              Expanded(
+                child: _ProfileStat(label: 'ประกาศ', value: '$listingCount'),
+              ),
+              const SizedBox(
+                height: 38,
+                child: VerticalDivider(color: AppTheme.border),
+              ),
+              Expanded(
+                child: _ProfileStat(label: 'ขายแล้ว', value: '$soldCount'),
+              ),
+              const SizedBox(
+                height: 38,
+                child: VerticalDivider(color: AppTheme.border),
+              ),
+              Expanded(
+                child: _ProfileStat(label: 'ถูกใจ', value: '$likeCount'),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _profileTabs() => Container(
+    decoration: const BoxDecoration(
+      border: Border(bottom: BorderSide(color: AppTheme.border)),
+    ),
+    child: Row(
+      children: ['ประกาศ', 'ร้านของฉัน', 'จัดการ']
+          .map(
+            (tab) => Expanded(
+              child: InkWell(
+                onTap: () => setState(() => _tab = tab),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 180),
+                  padding: const EdgeInsets.only(bottom: 11),
+                  decoration: BoxDecoration(
+                    border: Border(
+                      bottom: BorderSide(
+                        color: _tab == tab
+                            ? AppTheme.orange
+                            : Colors.transparent,
+                        width: 2,
+                      ),
+                    ),
+                  ),
+                  child: Center(
+                    child: LocalizedText(
+                      tab,
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        color: _tab == tab
+                            ? AppTheme.orange
+                            : AppTheme.textPrimary,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          )
+          .toList(),
+    ),
+  );
+
+  Widget _listingsSection(BuildContext context, List<ProductViewModel> items) =>
+      Column(
+        key: const ValueKey('listings'),
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: ['ทั้งหมด', 'พร้อมขาย', 'จอง', 'ขายแล้ว']
+                  .map(
+                    (filter) => Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: ChoiceChip(
+                        label: LocalizedText(filter),
+                        selected: _listingFilter == filter,
+                        selectedColor: AppTheme.orangeSoft,
+                        side: BorderSide(
+                          color: _listingFilter == filter
+                              ? AppTheme.orange
+                              : AppTheme.border,
+                        ),
+                        labelStyle: TextStyle(
+                          color: _listingFilter == filter
+                              ? AppTheme.orangeDark
+                              : AppTheme.textPrimary,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        onSelected: (_) =>
+                            setState(() => _listingFilter = filter),
+                      ),
+                    ),
+                  )
+                  .toList(),
+            ),
+          ),
+          const SizedBox(height: 16),
+          _listingGrid(
+            context,
+            items,
+            emptyMessage: 'ยังไม่มีประกาศในสถานะนี้',
+          ),
+        ],
+      );
+
+  Future<void> _editProfile(BuildContext context) async {
+    final saved = await Navigator.push<UserProfile>(
+      context,
+      MaterialPageRoute(builder: (_) => const ProfileSettingsPage()),
+    );
+    if (!mounted) return;
+    if (saved != null) {
+      setState(() => _profile = saved);
+    } else {
+      _loadProfile();
+    }
+  }
+
+  Future<void> _logout(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const LocalizedText('ออกจากระบบ'),
+        content: const LocalizedText('ต้องการออกจากระบบใช่หรือไม่'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const LocalizedText('ยกเลิก'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const LocalizedText('ออกจากระบบ'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await SuikaiService.logout();
+    if (mounted) {
+      Navigator.of(
+        context,
+      ).pushNamedAndRemoveUntil(SuikaiRoutes.home, (_) => false);
+    }
+  }
+
+  Widget _listingGrid(
+    BuildContext context,
+    List<ProductViewModel> items, {
+    required String emptyMessage,
+  }) {
+    if (items.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 42),
+        child: Center(
+          child: LocalizedText(
+            emptyMessage,
+            style: const TextStyle(color: AppTheme.textMuted),
+          ),
+        ),
+      );
+    }
+    return GridView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      itemCount: items.length,
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 2,
+        crossAxisSpacing: 12,
+        mainAxisSpacing: 12,
+        childAspectRatio: .68,
+      ),
+      itemBuilder: (_, index) =>
+          _ProfileListingTile(product: items[index], viewerItems: items),
+    );
+  }
+
+  Widget _storesSection(BuildContext context, List<ProductViewModel> products) {
+    if (_myStores.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 36),
+        child: Column(
+          children: [
+            const LocalizedText('ยังไม่มีร้านค้า'),
+            const SizedBox(height: 12),
+            ElevatedButton.icon(
+              onPressed: () async {
+                await Navigator.pushNamed(context, SuikaiRoutes.openShop);
+                _loadMyStores();
+              },
+              icon: const Icon(Icons.storefront_outlined),
+              label: const LocalizedText('เปิดร้าน'),
+            ),
+          ],
+        ),
+      );
+    }
+    final selected = _myStores
+        .where((store) => store.id == _selectedStoreId)
+        .firstOrNull;
+    if (selected != null && !selected.approved) {
+      return Container(
+        key: const ValueKey('pending-store'),
+        margin: const EdgeInsets.only(top: 14),
+        padding: const EdgeInsets.all(24),
+        decoration: BoxDecoration(
+          color: AppTheme.orangeSoft,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: const Color(0xFFFFD6C1)),
+        ),
+        child: Column(
+          children: [
+            const Icon(
+              Icons.hourglass_top_rounded,
+              color: AppTheme.orange,
+              size: 32,
+            ),
+            const SizedBox(height: 12),
+            const LocalizedText(
+              'รออนุมัติ',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'ร้าน ${selected.name} กำลังรอการตรวจสอบ',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: AppTheme.textMuted),
+            ),
+          ],
+        ),
+      );
+    }
+    return Column(
+      key: const ValueKey('store'),
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        DropdownButtonFormField<String>(
+          value: _selectedStoreId,
+          isExpanded: true,
+          decoration: const InputDecoration(labelText: 'เลือกร้านค้า'),
+          items: _myStores
+              .map(
+                (store) =>
+                    DropdownMenuItem(value: store.id, child: Text(store.name)),
+              )
+              .toList(),
+          onChanged: (value) => setState(() => _selectedStoreId = value),
+        ),
+        if (selected != null) ...[
+          const SizedBox(height: 10),
+          ListTile(
+            leading: const Icon(Icons.storefront_outlined),
+            title: Text(selected.name),
+            subtitle: Text(selected.city),
+            trailing: const Icon(Icons.chevron_right_rounded),
+            onTap: () => Navigator.pushNamed(
+              context,
+              SuikaiRoutes.storeDetail,
+              arguments: selected.id,
+            ),
+          ),
+        ],
+        const SizedBox(height: 10),
+        _listingGrid(context, products, emptyMessage: 'ยังไม่มีสินค้าในร้าน'),
+      ],
+    );
+  }
+
+  Widget _manageSection(
+    BuildContext context,
+    List<ProductViewModel> owned,
+  ) => Column(
+    key: const ValueKey('manage'),
+    children: [
+      ListTile(
+        leading: const Icon(Icons.history_rounded),
+        title: const LocalizedText('ประวัติการขาย'),
+        subtitle: LocalizedText(
+          '${owned.where((item) => item.status == ProductStatus.sold).length} รายการขายแล้ว',
+        ),
+      ),
+      ListTile(
+        leading: const Icon(Icons.settings_outlined),
+        title: const LocalizedText('ตั้งค่า'),
+        onTap: () => _editProfile(context),
+      ),
+      ListTile(
+        leading: const Icon(Icons.logout_rounded),
+        title: const LocalizedText('ออกจากระบบ'),
+        onTap: () => _logout(context),
+      ),
+      const Divider(),
+      const Align(
+        alignment: Alignment.centerLeft,
+        child: LocalizedText(
+          'จัดการสถานะสินค้า',
+          style: TextStyle(fontWeight: FontWeight.w800),
+        ),
+      ),
+      const SizedBox(height: 8),
+      for (final item in owned)
+        ListTile(
+          dense: true,
+          title: Text(item.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+          trailing: DropdownButton<ProductStatus>(
+            value: _statusEdits[item.id] ?? item.status,
+            items:
+                (item.isStoreProduct
+                        ? const [
+                            ProductStatus.available,
+                            ProductStatus.outOfStock,
+                            ProductStatus.deleted,
+                          ]
+                        : const [
+                            ProductStatus.available,
+                            ProductStatus.reserved,
+                            ProductStatus.sold,
+                          ])
+                    .map(
+                      (status) => DropdownMenuItem(
+                        value: status,
+                        child: Text(_statusLabel(context, status)),
+                      ),
+                    )
+                    .toList(),
+            onChanged: (value) => _changeStatus(item, value),
+          ),
+        ),
+    ],
+  );
+
+  Future<void> _changeStatus(
+    ProductViewModel item,
+    ProductStatus? status,
+  ) async {
+    if (status == null) return;
+    try {
+      await SuikaiService.updateListingStatus(
+        listingId: item.id,
+        status: status == ProductStatus.outOfStock
+            ? 'out_of_stock'
+            : status.name,
+      );
+      MarketplaceCache.setStatus(item.id, status);
+      if (mounted) setState(() => _statusEdits[item.id] = status);
+    } catch (error, stackTrace) {
+      debugPrint(
+        'Profile listing status update failed: id=${item.id} error=$error',
+      );
+      debugPrintStack(stackTrace: stackTrace);
+      if (mounted) showInfo(context, 'อัปเดตสถานะไม่สำเร็จ: $error');
+    }
+  }
+
+  // Kept temporarily as a source reference while the profile UI is migrated;
+  // all user-facing flows are exposed by the three tabs above.
+  // ignore: unused_element
+  Widget _legacyBuild(BuildContext context) {
     final currentUserId = SuikaiService.currentUserId;
     final all = currentUserId == null
         ? <ProductViewModel>[]
@@ -7009,13 +8969,17 @@ class _ProfilePageState extends State<ProfilePage> {
                       ),
                       IconButton(
                         onPressed: () async {
-                          await Navigator.push(
+                          final saved = await Navigator.push<UserProfile>(
                             context,
                             MaterialPageRoute(
                               builder: (_) => const ProfileSettingsPage(),
                             ),
                           );
-                          _loadProfile();
+                          if (saved != null && mounted) {
+                            setState(() => _profile = saved);
+                          } else {
+                            _loadProfile();
+                          }
                         },
                         icon: const Icon(Icons.settings_outlined),
                       ),
@@ -7289,11 +9253,17 @@ class _ProfilePageState extends State<ProfilePage> {
                               isDense: true,
                             ),
                             items:
-                                const [
-                                      ProductStatus.available,
-                                      ProductStatus.outOfStock,
-                                      ProductStatus.deleted,
-                                    ]
+                                (item.isStoreProduct
+                                        ? const [
+                                            ProductStatus.available,
+                                            ProductStatus.outOfStock,
+                                            ProductStatus.deleted,
+                                          ]
+                                        : const [
+                                            ProductStatus.available,
+                                            ProductStatus.reserved,
+                                            ProductStatus.sold,
+                                          ])
                                     .map(
                                       (status) => DropdownMenuItem(
                                         value: status,
@@ -7315,15 +9285,8 @@ class _ProfilePageState extends State<ProfilePage> {
                                   item.ownerId != currentUserId)
                                 return;
                               try {
-                                await SuikaiService.updateListing(
+                                await SuikaiService.updateListingStatus(
                                   listingId: item.id,
-                                  title: item.title,
-                                  description: item.description,
-                                  city: item.city,
-                                  phone: item.phone,
-                                  viber: item.viber,
-                                  price: item.priceValue.toDouble(),
-                                  currency: item.currencyCode,
                                   status: value == ProductStatus.outOfStock
                                       ? 'out_of_stock'
                                       : value.name,
@@ -7332,9 +9295,18 @@ class _ProfilePageState extends State<ProfilePage> {
                                 if (mounted) {
                                   setState(() => _statusEdits[item.id] = value);
                                 }
-                              } catch (_) {
-                                if (mounted)
-                                  showInfo(context, 'อัปเดตสถานะไม่สำเร็จ');
+                              } catch (error, stackTrace) {
+                                debugPrint(
+                                  'Profile listing status update failed: '
+                                  'id=${item.id} error=$error',
+                                );
+                                debugPrintStack(stackTrace: stackTrace);
+                                if (mounted) {
+                                  showInfo(
+                                    context,
+                                    'อัปเดตสถานะไม่สำเร็จ: $error',
+                                  );
+                                }
                               }
                             },
                           ),
@@ -7349,6 +9321,98 @@ class _ProfilePageState extends State<ProfilePage> {
       ),
     );
   }
+}
+
+class _ProfileTopBar extends StatelessWidget {
+  const _ProfileTopBar();
+
+  @override
+  Widget build(BuildContext context) => Container(
+    height: 58,
+    color: AppTheme.surface,
+    padding: const EdgeInsets.symmetric(horizontal: 20),
+    alignment: Alignment.centerLeft,
+    child: const LocalizedText(
+      'จัดการของฉัน',
+      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+    ),
+  );
+}
+
+class _ProfileAvatar extends StatelessWidget {
+  final UserProfile? profile;
+  final double completion;
+  const _ProfileAvatar({required this.profile, required this.completion});
+
+  @override
+  Widget build(BuildContext context) => Container(
+    width: 82,
+    height: 82,
+    padding: const EdgeInsets.all(3),
+    decoration: BoxDecoration(
+      color: Colors.white,
+      shape: BoxShape.circle,
+      boxShadow: const [
+        BoxShadow(
+          color: Color(0x19000000),
+          blurRadius: 10,
+          offset: Offset(0, 3),
+        ),
+      ],
+      border: Border.all(
+        color: completion == 1 ? AppTheme.orange : AppTheme.orangeSoft,
+        width: 2,
+      ),
+    ),
+    child: ClipOval(
+      child: (profile?.avatar ?? '').isEmpty
+          ? Container(
+              color: AppTheme.orangeSoft,
+              child: const Icon(
+                Icons.person_rounded,
+                color: AppTheme.orange,
+                size: 42,
+              ),
+            )
+          : persistentImage(
+              profile!.avatar,
+              fit: BoxFit.cover,
+              errorBuilder: (_, __, ___) => Container(
+                color: AppTheme.orangeSoft,
+                child: const Icon(
+                  Icons.person_rounded,
+                  color: AppTheme.orange,
+                  size: 42,
+                ),
+              ),
+            ),
+    ),
+  );
+}
+
+class _ProfileStat extends StatelessWidget {
+  final String label;
+  final String value;
+  const _ProfileStat({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) => Column(
+    children: [
+      LocalizedText(
+        value,
+        style: const TextStyle(
+          fontSize: 18,
+          fontWeight: FontWeight.w800,
+          color: AppTheme.textPrimary,
+        ),
+      ),
+      const SizedBox(height: 2),
+      LocalizedText(
+        label,
+        style: const TextStyle(fontSize: 12, color: AppTheme.textMuted),
+      ),
+    ],
+  );
 }
 
 class _StatBox extends StatelessWidget {
@@ -7394,6 +9458,109 @@ class _StatBox extends StatelessWidget {
   );
 }
 
+class _ProfileListingTile extends StatelessWidget {
+  final ProductViewModel product;
+  final List<ProductViewModel> viewerItems;
+
+  const _ProfileListingTile({required this.product, required this.viewerItems});
+
+  @override
+  Widget build(BuildContext context) => Material(
+    color: AppTheme.surface,
+    borderRadius: BorderRadius.circular(14),
+    clipBehavior: Clip.antiAlias,
+    child: InkWell(
+      onTap: () => product.hasVideo
+          ? Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => FullscreenListingVideoViewer(
+                  items: viewerItems,
+                  initialProductId: product.id,
+                ),
+              ),
+            )
+          : Navigator.pushNamed(
+              context,
+              SuikaiRoutes.productDetail,
+              arguments: product.id,
+            ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                product.hasVideo
+                    ? FutureBuilder<String>(
+                        future: SuikaiService.signedThumbnailUrl(
+                          product.video!,
+                        ),
+                        builder: (_, snapshot) => snapshot.hasData
+                            ? persistentImage(snapshot.data!, fit: BoxFit.cover)
+                            : Container(
+                                color: AppTheme.orangeSoft,
+                                child: const Icon(Icons.play_circle_outline),
+                              ),
+                      )
+                    : persistentImage(
+                        product.image,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => Container(
+                          color: AppTheme.orangeSoft,
+                          child: const Icon(Icons.image_outlined),
+                        ),
+                      ),
+                if (product.hasVideo)
+                  const Positioned(
+                    right: 6,
+                    top: 6,
+                    child: Icon(
+                      Icons.play_circle_fill_rounded,
+                      color: Colors.white,
+                    ),
+                  ),
+                Positioned(
+                  left: 5,
+                  top: 5,
+                  child: _statusChip(context, product.status),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(10, 8, 10, 9),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  product.price,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: AppTheme.orangeDark,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  product.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: AppTheme.textPrimary,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
 class SearchPage extends StatefulWidget {
   const SearchPage({super.key});
 
@@ -7419,8 +9586,13 @@ class _NotificationsPageState extends State<NotificationsPage> {
     'store_edit_rejected' => 'ไม่อนุมัติการแก้ไขร้าน',
     'promotion_approved' => 'อนุมัติการโปรโมตร้านแล้ว',
     'promotion_rejected' => 'ไม่อนุมัติการโปรโมตร้าน',
+    'listing_liked' => 'มีคนถูกใจประกาศของคุณ',
     _ => type.replaceAll('_', ' '),
   };
+
+  String _detail(NotificationRecord value) =>
+      '${value.payload['listing_title'] ?? value.payload['review_note'] ?? ''}\n'
+      '${value.createdAt.toLocal()}';
 
   Future<void> _read(NotificationRecord value) async {
     if (!value.isRead) await SuikaiService.markNotificationRead(value.id);
@@ -7503,7 +9675,7 @@ class _NotificationsPageState extends State<NotificationsPage> {
                       ),
                     ),
                     subtitle: Text(
-                      '${value.payload['review_note'] ?? ''}\n${value.createdAt.toLocal()}',
+                      _detail(value),
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                     ),
@@ -7677,8 +9849,10 @@ class _SearchPageState extends State<SearchPage> {
                     mainAxisSpacing: 12,
                     childAspectRatio: width >= 760 ? .78 : responsiveRatio,
                   ),
-                  itemBuilder: (context, index) =>
-                      ProductCard(product: results[index]),
+                  itemBuilder: (context, index) => ProductCard(
+                    product: results[index],
+                    viewerItems: results,
+                  ),
                 );
               },
             ),
@@ -7780,14 +9954,26 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
   }
 
   Future<void> _copyProductLink(ProductViewModel product) async {
-    final link = Uri.base
-        .replace(
-          path: Uri.base.path.isEmpty ? '/' : Uri.base.path,
-          queryParameters: {'product': product.id},
-        )
-        .toString();
-    await Clipboard.setData(ClipboardData(text: link));
-    if (mounted) showInfo(context, 'คัดลอกลิงก์สินค้าแล้ว');
+    await copyProductLink(context, product);
+  }
+
+  Future<void> _shareProduct(ProductViewModel product) async {
+    final option = await _showListingShareOptions(context, product);
+    if (!mounted || option == null) return;
+    if (option == _ListingShareOption.productLink) {
+      await _copyProductLink(product);
+      return;
+    }
+    final shared = await SuikaiService.shareProductVideo(
+      video: product.video!,
+      title: product.title,
+    );
+    if (mounted && !shared) {
+      showInfo(
+        context,
+        AppLocalizations.of(context).source('ไม่สามารถแชร์วิดีโอได้'),
+      );
+    }
   }
 
   Future<void> _edit(ProductViewModel product) async {
@@ -7948,10 +10134,17 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
                         : status.name,
                     newImages: newImages,
                   );
+                  MarketplaceCache.setStatus(product.id, status);
                   if (dialogContext.mounted) Navigator.pop(dialogContext, true);
-                } catch (_) {
-                  if (context.mounted)
-                    showInfo(context, 'บันทึกการแก้ไขไม่สำเร็จ');
+                } catch (error, stackTrace) {
+                  debugPrint(
+                    'Product detail status update failed: '
+                    'id=${product.id} error=$error',
+                  );
+                  debugPrintStack(stackTrace: stackTrace);
+                  if (context.mounted) {
+                    showInfo(context, 'บันทึกการแก้ไขไม่สำเร็จ: $error');
+                  }
                 }
               },
               child: const LocalizedText('บันทึก'),
@@ -7975,13 +10168,19 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
     if (product == null) {
       return const _MissingPage(title: 'ไม่พบสินค้า');
     }
+    final mediaImages = product.images.isNotEmpty
+        ? product.images
+        : product.image.isNotEmpty
+        ? [product.image]
+        : const <String>[];
+    final similar = similarProducts(product).take(12).toList();
     return Scaffold(
       appBar: AppBar(
         title: const LocalizedText('รายละเอียดสินค้า'),
         actions: [
           IconButton(
             tooltip: AppLocalizations.of(context).source('แชร์สินค้า'),
-            onPressed: () => _copyProductLink(product),
+            onPressed: () => _shareProduct(product),
             icon: const Icon(Icons.link_rounded),
           ),
           if (product.ownerId != null &&
@@ -8016,56 +10215,72 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
         children: [
           SizedBox(
             height: MediaQuery.sizeOf(context).height * .52,
-            child: Stack(
-              children: [
-                PageView.builder(
-                  itemCount: product.imageUrls.length,
-                  onPageChanged: (index) => setState(() => _imageIndex = index),
-                  itemBuilder: (context, index) => GestureDetector(
-                    key: ValueKey('product-image-${product.imageUrls[index]}'),
+            child: product.video != null
+                ? GestureDetector(
                     onTap: () => Navigator.of(context).push(
                       MaterialPageRoute<void>(
-                        builder: (_) => _FullscreenImageViewer(
-                          images: product.imageUrls,
-                          initialIndex: index,
+                        builder: (_) => FullscreenListingVideoViewer(
+                          items: [product],
+                          initialProductId: product.id,
                         ),
                       ),
                     ),
-                    child: ColoredBox(
-                      color: const Color(0xFFF5F5F5),
-                      child: persistentImage(
-                        product.imageUrls[index],
+                    child: FutureBuilder<String>(
+                      future: SuikaiService.signedThumbnailUrl(product.video!),
+                      builder: (_, snapshot) => snapshot.hasData
+                          ? persistentImage(snapshot.data!, fit: BoxFit.contain)
+                          : const _VideoPreviewPlaceholder(),
+                    ),
+                  )
+                : mediaImages.isNotEmpty
+                ? Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      PageView.builder(
                         key: ValueKey(
-                          'detail-image-${product.imageUrls[index]}',
+                          '${product.id}:${mediaImages.join('|')}',
                         ),
-                        fit: BoxFit.contain,
-                        errorBuilder: (_, _, _) => const Center(
-                          child: Icon(Icons.broken_image_outlined),
+                        itemCount: mediaImages.length,
+                        onPageChanged: (index) {
+                          setState(() => _imageIndex = index);
+                        },
+                        itemBuilder: (_, index) => persistentImage(
+                          mediaImages[index],
+                          fit: BoxFit.contain,
+                          errorBuilder: (_, _, _) =>
+                              const _ProductImagePlaceholder(),
                         ),
                       ),
-                    ),
-                  ),
-                ),
-                Positioned(
-                  right: 12,
-                  bottom: 12,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 5,
-                    ),
-                    decoration: BoxDecoration(
-                      color: Colors.black54,
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: LocalizedText(
-                      '${_imageIndex + 1}/${product.imageUrls.length}',
-                      style: const TextStyle(color: Colors.white),
-                    ),
-                  ),
-                ),
-              ],
-            ),
+                      if (mediaImages.length > 1)
+                        Positioned(
+                          bottom: 12,
+                          left: 0,
+                          right: 0,
+                          child: Center(
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                color: Colors.black54,
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 9,
+                                  vertical: 4,
+                                ),
+                                child: Text(
+                                  '${_imageIndex + 1}/${mediaImages.length}',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  )
+                : const _ProductImagePlaceholder(),
           ),
           const SizedBox(height: 12),
           LocalizedText(
@@ -8170,12 +10385,36 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
             icon: const Icon(Icons.flag_outlined),
             label: const LocalizedText('Report'),
           ),
+          if (similar.isNotEmpty) ...[
+            const SizedBox(height: 22),
+            const LocalizedText(
+              'สินค้าที่คล้ายกัน',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              height: 210,
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                itemCount: similar.length,
+                separatorBuilder: (_, __) => const SizedBox(width: 10),
+                itemBuilder: (_, index) => SizedBox(
+                  width: 145,
+                  child: ProductCard(
+                    product: similar[index],
+                    viewerItems: similar,
+                  ),
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );
   }
 }
 
+/* Retired listing image gallery.
 class _FullscreenImageViewer extends StatefulWidget {
   final List<String> images;
   final int initialIndex;
@@ -8284,6 +10523,8 @@ class _ZoomableProductImageState extends State<_ZoomableProductImage> {
     ),
   );
 }
+
+*/
 
 class ReportPage extends StatefulWidget {
   final String productId;
@@ -9373,19 +11614,848 @@ class _MiniMapPainter extends CustomPainter {
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
-class ProductCard extends StatelessWidget {
-  final ProductViewModel product;
+class _VideoPreviewPlaceholder extends StatelessWidget {
+  const _VideoPreviewPlaceholder();
 
-  const ProductCard({super.key, required this.product});
+  @override
+  Widget build(BuildContext context) => const ColoredBox(
+    color: Color(0xFFF2F2F2),
+    child: Center(child: Icon(Icons.videocam_outlined, size: 42)),
+  );
+}
+
+class _ProductImagePlaceholder extends StatelessWidget {
+  const _ProductImagePlaceholder();
+
+  @override
+  Widget build(BuildContext context) => const ColoredBox(
+    color: Color(0xFFF2F2F2),
+    child: Center(child: Icon(Icons.image_outlined, size: 42)),
+  );
+}
+
+class FullscreenListingVideoViewer extends StatefulWidget {
+  final List<ProductViewModel> items;
+  final String initialProductId;
+  const FullscreenListingVideoViewer({
+    super.key,
+    required this.items,
+    required this.initialProductId,
+  });
+
+  @override
+  State<FullscreenListingVideoViewer> createState() =>
+      _FullscreenListingVideoViewerState();
+}
+
+class _FullscreenListingVideoViewerState
+    extends State<FullscreenListingVideoViewer> {
+  late final List<ProductViewModel> _items;
+  late final PageController _pages;
+  int _activeIndex = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _items = widget.items.where((item) => item.hasVideo).toList();
+    final index = _items.indexWhere(
+      (item) => item.id == widget.initialProductId,
+    );
+    _activeIndex = index < 0 ? 0 : index;
+    _pages = PageController(initialPage: _activeIndex);
+  }
+
+  @override
+  void dispose() {
+    _pages.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: Colors.black,
+    body: PageView.builder(
+      controller: _pages,
+      scrollDirection: Axis.vertical,
+      itemCount: _items.length,
+      onPageChanged: (index) => setState(() => _activeIndex = index),
+      itemBuilder: (_, index) => _ListingVideoPage(
+        product: _items[index],
+        isActive: index == _activeIndex,
+      ),
+    ),
+  );
+}
+
+class _ListingVideoPage extends StatefulWidget {
+  final ProductViewModel product;
+  final bool isActive;
+  const _ListingVideoPage({required this.product, required this.isActive});
+  @override
+  State<_ListingVideoPage> createState() => _ListingVideoPageState();
+}
+
+class _ListingVideoPageState extends State<_ListingVideoPage> {
+  VideoPlayerController? _controller;
+  String? _error;
+
+  ProductViewModel get _product => widget.product;
+  StoreViewModel? get _store => _product.storeId == null
+      ? null
+      : MarketplaceCache.storeById(_product.storeId!);
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final url = await SuikaiService.signedVideoUrl(_product.video!);
+      final controller = VideoPlayerController.networkUrl(Uri.parse(url));
+      await controller.initialize();
+      await controller.setLooping(true);
+      if (widget.isActive) await controller.play();
+      await SuikaiService.trackView(_product.id);
+      if (!mounted) {
+        await controller.dispose();
+        return;
+      }
+      setState(() => _controller = controller);
+    } catch (_) {
+      if (mounted) setState(() => _error = 'ไม่สามารถเล่นวิดีโอนี้ได้');
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant _ListingVideoPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.isActive == widget.isActive) return;
+    widget.isActive ? _controller?.play() : _controller?.pause();
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    super.dispose();
+  }
+
+  void _openSeller() {
+    if (_store != null) {
+      Navigator.pushNamed(
+        context,
+        SuikaiRoutes.storeDetail,
+        arguments: _store!.id,
+      );
+    } else if (_product.ownerId != null && _product.ownerId!.isNotEmpty) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => PublicSellerProfilePage(ownerId: _product.ownerId!),
+        ),
+      );
+    }
+  }
+
+  Future<void> _share() async {
+    final option = await _showListingShareOptions(
+      context,
+      _product,
+      includeImage: true,
+    );
+    if (!mounted || option == null) return;
+    if (option == _ListingShareOption.productLink) {
+      await copyProductLink(context, _product);
+      return;
+    }
+    if (option == _ListingShareOption.image) {
+      try {
+        final image = await SuikaiService.signedThumbnailUrl(_product.video!);
+        final shared = await SuikaiService.shareProductImage(
+          imageSource: image,
+          title: _product.title,
+          price: _product.price,
+        );
+        if (mounted && !shared) showInfo(context, 'ไม่สามารถแชร์รายการนี้ได้');
+      } catch (_) {
+        if (mounted) showInfo(context, 'ไม่สามารถแชร์รายการนี้ได้');
+      }
+      return;
+    }
+    final shared = await SuikaiService.shareProductVideo(
+      video: _product.video!,
+      title: _product.title,
+    );
+    if (mounted && !shared) {
+      showInfo(
+        context,
+        AppLocalizations.of(context).source('ไม่สามารถแชร์วิดีโอได้'),
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      onTap: () => Navigator.pushNamed(
-        context,
-        SuikaiRoutes.productDetail,
-        arguments: product.id,
+    final product = _product;
+    final controller = _controller;
+    final sellerName = _store?.name ?? 'ผู้ขาย Suikai';
+    return SafeArea(
+      child: GestureDetector(
+        onHorizontalDragEnd: (details) {
+          if ((details.primaryVelocity ?? 0) > 650) _openSeller();
+        },
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            ColoredBox(
+              color: Colors.black,
+              child: controller == null
+                  ? Center(
+                      child: _error == null
+                          ? const _VideoLoadingState()
+                          : LocalizedText(
+                              _error!,
+                              style: const TextStyle(color: Colors.white),
+                            ),
+                    )
+                  : Center(
+                      child: AspectRatio(
+                        aspectRatio: controller.value.aspectRatio,
+                        child: VideoPlayer(controller),
+                      ),
+                    ),
+            ),
+            const DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Color(0x66000000),
+                    Colors.transparent,
+                    Color(0xC9000000),
+                  ],
+                  stops: [0, .36, 1],
+                ),
+              ),
+            ),
+            Positioned(
+              top: 8,
+              left: 8,
+              child: _VideoOverlayButton(
+                icon: Icons.arrow_back_rounded,
+                onTap: () => Navigator.pop(context),
+              ),
+            ),
+            Positioned(
+              top: 12,
+              right: 16,
+              child: TextButton.icon(
+                onPressed: () => Navigator.pushNamed(
+                  context,
+                  SuikaiRoutes.report,
+                  arguments: product.id,
+                ),
+                icon: const Icon(Icons.flag_outlined, size: 15),
+                label: const LocalizedText('รายงาน'),
+                style: TextButton.styleFrom(
+                  foregroundColor: Colors.white70,
+                  textStyle: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              right: 12,
+              bottom: 138,
+              child: _VideoActionRail(
+                product: product,
+                store: _store,
+                onOpenSeller: _openSeller,
+                onShare: _share,
+              ),
+            ),
+            Positioned(
+              left: 18,
+              right: 86,
+              bottom: 18,
+              child: _VideoProductInfo(
+                product: product,
+                sellerName: sellerName,
+              ),
+            ),
+          ],
+        ),
       ),
+    );
+  }
+}
+
+class _VideoLoadingState extends StatefulWidget {
+  const _VideoLoadingState();
+
+  @override
+  State<_VideoLoadingState> createState() => _VideoLoadingStateState();
+}
+
+class _VideoLoadingStateState extends State<_VideoLoadingState>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _pulse = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Column(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      ScaleTransition(
+        scale: Tween<double>(
+          begin: .86,
+          end: 1.08,
+        ).animate(CurvedAnimation(parent: _pulse, curve: Curves.easeInOut)),
+        child: Container(
+          width: 64,
+          height: 64,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: AppTheme.orangeSoft.withValues(alpha: .18),
+            shape: BoxShape.circle,
+            border: Border.all(color: AppTheme.orange.withValues(alpha: .7)),
+          ),
+          child: const CircularProgressIndicator(
+            color: AppTheme.orange,
+            strokeWidth: 3,
+          ),
+        ),
+      ),
+      const SizedBox(height: 16),
+      const LocalizedText(
+        'กำลังเตรียมวิดีโอ...',
+        style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700),
+      ),
+      const SizedBox(height: 5),
+      const LocalizedText(
+        'กำลังเชื่อมต่อและโหลดวิดีโอ',
+        style: TextStyle(color: Colors.white70, fontSize: 12),
+      ),
+    ],
+  );
+}
+
+class _VideoActionRail extends StatelessWidget {
+  final ProductViewModel product;
+  final StoreViewModel? store;
+  final VoidCallback onOpenSeller;
+  final Future<void> Function() onShare;
+  const _VideoActionRail({
+    required this.product,
+    required this.store,
+    required this.onOpenSeller,
+    required this.onShare,
+  });
+
+  @override
+  Widget build(BuildContext context) => Column(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      GestureDetector(
+        onTap: onOpenSeller,
+        child: _VideoSellerAvatar(product: product, store: store),
+      ),
+      const SizedBox(height: 17),
+      ValueListenableBuilder<Set<String>>(
+        valueListenable: InteractionStore.likedIds,
+        builder: (context, liked, _) {
+          final isLiked = liked.contains(product.id);
+          return _VideoRailAction(
+            icon: isLiked
+                ? Icons.thumb_up_rounded
+                : Icons.thumb_up_alt_outlined,
+            label: '${product.likeCount + (isLiked ? 1 : 0)}',
+            onTap: () {
+              HapticFeedback.lightImpact();
+              InteractionStore.addLike(product.id);
+            },
+            active: isLiked,
+          );
+        },
+      ),
+      const SizedBox(height: 15),
+      _VideoRailAction(
+        icon: Icons.phone_in_talk_outlined,
+        label: 'โทร',
+        onTap: product.phone.trim().isEmpty
+            ? null
+            : () => launchPhone(product.phone),
+      ),
+      const SizedBox(height: 15),
+      _VideoRailAction(
+        icon: Icons.ios_share_rounded,
+        label: 'แชร์',
+        onTap: onShare,
+      ),
+    ],
+  );
+}
+
+class _VideoSellerAvatar extends StatelessWidget {
+  final ProductViewModel product;
+  final StoreViewModel? store;
+  const _VideoSellerAvatar({required this.product, required this.store});
+
+  @override
+  Widget build(BuildContext context) {
+    final logo = store?.logo.trim() ?? '';
+    if (logo.isNotEmpty) return _avatarImage(logo);
+    if (product.ownerId == null)
+      return _avatarFallback(Icons.storefront_rounded);
+    return FutureBuilder<UserProfile?>(
+      future: SuikaiService.profiles.get(product.ownerId!),
+      builder: (context, snapshot) {
+        final avatar = snapshot.data?.avatar.trim() ?? '';
+        return avatar.isEmpty
+            ? _avatarFallback(Icons.person_rounded)
+            : _avatarImage(avatar);
+      },
+    );
+  }
+
+  Widget _avatarImage(String source) => Container(
+    width: 48,
+    height: 48,
+    clipBehavior: Clip.antiAlias,
+    decoration: BoxDecoration(
+      shape: BoxShape.circle,
+      border: Border.all(color: AppTheme.orange, width: 2),
+    ),
+    child: persistentImage(
+      source,
+      fit: BoxFit.cover,
+      errorBuilder: (_, _, _) => _avatarFallback(Icons.person_rounded),
+    ),
+  );
+
+  Widget _avatarFallback(IconData icon) => Container(
+    width: 48,
+    height: 48,
+    decoration: BoxDecoration(
+      color: Colors.white,
+      shape: BoxShape.circle,
+      border: Border.all(color: AppTheme.orange, width: 2),
+    ),
+    child: Icon(icon, color: AppTheme.orange),
+  );
+}
+
+class _VideoRailAction extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final VoidCallback? onTap;
+  final bool active;
+  const _VideoRailAction({
+    required this.icon,
+    required this.label,
+    this.onTap,
+    this.active = false,
+  });
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+    onTap: onTap,
+    child: Opacity(
+      opacity: onTap == null ? .45 : 1,
+      child: Column(
+        children: [
+          Icon(icon, color: active ? AppTheme.orange : Colors.white, size: 29),
+          const SizedBox(height: 3),
+          Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _VideoProductInfo extends StatelessWidget {
+  final ProductViewModel product;
+  final String sellerName;
+  const _VideoProductInfo({required this.product, required this.sellerName});
+
+  @override
+  Widget build(BuildContext context) => Column(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Text(
+        sellerName,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 14,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+      const SizedBox(height: 6),
+      LocalizedText(
+        product.title,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 20,
+          height: 1.1,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+      const SizedBox(height: 5),
+      LocalizedText(
+        product.price,
+        style: const TextStyle(
+          color: AppTheme.orange,
+          fontSize: 19,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+      const SizedBox(height: 5),
+      Row(
+        children: [
+          const Icon(
+            Icons.location_on_outlined,
+            color: Colors.white70,
+            size: 15,
+          ),
+          const SizedBox(width: 3),
+          Expanded(
+            child: Text(
+              productCityLabel(context, product),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+      if (product.description.trim().isNotEmpty) ...[
+        const SizedBox(height: 5),
+        LocalizedText(
+          product.description,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            color: Colors.white70,
+            fontSize: 12,
+            height: 1.25,
+          ),
+        ),
+      ],
+      const SizedBox(height: 8),
+      _statusChip(context, product.status),
+    ],
+  );
+}
+
+class PublicSellerProfilePage extends StatelessWidget {
+  final String ownerId;
+  const PublicSellerProfilePage({super.key, required this.ownerId});
+
+  @override
+  Widget build(BuildContext context) {
+    final listings = MarketplaceCache.products
+        .where((item) => item.ownerId == ownerId)
+        .toList();
+    final active = listings
+        .where(
+          (item) =>
+              item.status != ProductStatus.sold &&
+              item.status != ProductStatus.outOfStock &&
+              item.status != ProductStatus.deleted,
+        )
+        .toList();
+    final sold = listings
+        .where((item) => item.status == ProductStatus.sold)
+        .length;
+    final contact = active
+        .where((item) => item.phone.trim().isNotEmpty)
+        .firstOrNull;
+    return Scaffold(
+      backgroundColor: const Color(0xFFFFFBF8),
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        foregroundColor: AppTheme.textPrimary,
+        title: const LocalizedText('โปรไฟล์ผู้ขาย'),
+      ),
+      body: FutureBuilder<UserProfile?>(
+        future: SuikaiService.profiles.get(ownerId),
+        builder: (context, snapshot) {
+          final profile = snapshot.data;
+          final name = profile?.name.trim().isNotEmpty == true
+              ? profile!.name
+              : AppLocalizations.of(context).source('ผู้ขาย Suikai');
+          return ListView(
+            padding: const EdgeInsets.fromLTRB(16, 18, 16, 32),
+            children: [
+              Row(
+                children: [
+                  _PublicProfileAvatar(profile: profile),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          name,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        if (profile?.city.trim().isNotEmpty == true) ...[
+                          const SizedBox(height: 4),
+                          Row(
+                            children: [
+                              const Icon(
+                                Icons.location_on_outlined,
+                                size: 15,
+                                color: AppTheme.textMuted,
+                              ),
+                              const SizedBox(width: 3),
+                              Expanded(
+                                child: Text(
+                                  profile!.city,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: AppTheme.textMuted,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  if (contact != null)
+                    IconButton.filled(
+                      onPressed: () => launchPhone(contact.phone),
+                      icon: const Icon(Icons.phone_in_talk_outlined),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 20),
+              Row(
+                children: [
+                  _SellerMetric(value: '${active.length}', label: 'กำลังขาย'),
+                  const SizedBox(width: 10),
+                  _SellerMetric(value: '$sold', label: 'ขายแล้ว'),
+                  const SizedBox(width: 10),
+                  _SellerMetric(
+                    value:
+                        '${listings.fold<int>(0, (sum, item) => sum + item.likeCount)}',
+                    label: 'ถูกใจ',
+                  ),
+                ],
+              ),
+              const SizedBox(height: 24),
+              const LocalizedText(
+                'สินค้าที่กำลังขาย',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 12),
+              if (active.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 30),
+                  child: Center(
+                    child: LocalizedText(
+                      'ยังไม่มีสินค้าที่กำลังขาย',
+                      style: TextStyle(color: AppTheme.textMuted),
+                    ),
+                  ),
+                )
+              else
+                GridView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: active.length,
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 2,
+                    mainAxisSpacing: 12,
+                    crossAxisSpacing: 12,
+                    childAspectRatio: .7,
+                  ),
+                  itemBuilder: (_, index) =>
+                      ProductCard(product: active[index], viewerItems: active),
+                ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _PublicProfileAvatar extends StatelessWidget {
+  final UserProfile? profile;
+  const _PublicProfileAvatar({this.profile});
+
+  @override
+  Widget build(BuildContext context) {
+    final avatar = profile?.avatar.trim() ?? '';
+    return Container(
+      width: 72,
+      height: 72,
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: AppTheme.orangeSoft,
+        shape: BoxShape.circle,
+        border: Border.all(color: const Color(0xFFF7D8C8)),
+      ),
+      child: avatar.isEmpty
+          ? const Icon(Icons.person_rounded, color: AppTheme.orange, size: 34)
+          : persistentImage(
+              avatar,
+              fit: BoxFit.cover,
+              errorBuilder: (_, _, _) => const Icon(
+                Icons.person_rounded,
+                color: AppTheme.orange,
+                size: 34,
+              ),
+            ),
+    );
+  }
+}
+
+class _SellerMetric extends StatelessWidget {
+  final String value;
+  final String label;
+  const _SellerMetric({required this.value, required this.label});
+
+  @override
+  Widget build(BuildContext context) => Expanded(
+    child: Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 11),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFFF0E9E5)),
+      ),
+      child: Column(
+        children: [
+          Text(
+            value,
+            style: const TextStyle(
+              color: AppTheme.orange,
+              fontSize: 17,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 2),
+          LocalizedText(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 10, color: AppTheme.textMuted),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _ProductBadge extends StatelessWidget {
+  final String label;
+  final Color color;
+  final IconData icon;
+
+  const _ProductBadge({
+    required this.label,
+    required this.color,
+    required this.icon,
+  });
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+    decoration: BoxDecoration(
+      color: color,
+      borderRadius: BorderRadius.circular(8),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 12, color: Colors.white),
+        const SizedBox(width: 2),
+        Text(
+          label,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 9,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class ProductCard extends StatelessWidget {
+  final ProductViewModel product;
+  final List<ProductViewModel>? viewerItems;
+  final double? distanceKm;
+  final bool homeStyle;
+
+  const ProductCard({
+    super.key,
+    required this.product,
+    this.viewerItems,
+    this.distanceKm,
+    this.homeStyle = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final imageUrl = primaryProductImage(product);
+    if (homeStyle) {
+      return _HomeProductCard(
+        product: product,
+        viewerItems: viewerItems,
+        distanceKm: distanceKm,
+      );
+    }
+    return InkWell(
+      onTap: () => product.hasVideo
+          ? Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => FullscreenListingVideoViewer(
+                  items: viewerItems ?? MarketplaceCache.feedProducts,
+                  initialProductId: product.id,
+                ),
+              ),
+            )
+          : Navigator.pushNamed(
+              context,
+              SuikaiRoutes.productDetail,
+              arguments: product.id,
+            ),
       borderRadius: BorderRadius.circular(12),
       child: Container(
         clipBehavior: Clip.antiAlias,
@@ -9409,17 +12479,56 @@ class ProductCard extends StatelessWidget {
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  persistentImage(
-                    product.image,
-                    fit: BoxFit.cover,
-                    errorBuilder: (_, error, stackTrace) =>
-                        Container(color: const Color(0xFFF3F3F3)),
-                  ),
+                  if (product.hasVideo)
+                    FutureBuilder<String>(
+                      future: SuikaiService.signedThumbnailUrl(product.video!),
+                      builder: (context, snapshot) => snapshot.hasData
+                          ? persistentImage(
+                              snapshot.data!,
+                              fit: BoxFit.cover,
+                              errorBuilder: (_, _, _) =>
+                                  Container(color: const Color(0xFFF3F3F3)),
+                            )
+                          : Container(
+                              color: const Color(0xFFF3F3F3),
+                              child: const Center(
+                                child: Icon(Icons.play_circle_outline),
+                              ),
+                            ),
+                    )
+                  else if (imageUrl != null)
+                    persistentImage(
+                      imageUrl,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, error, stackTrace) =>
+                          Container(color: const Color(0xFFF3F3F3)),
+                    )
+                  else
+                    Container(color: const Color(0xFFF3F3F3)),
+                  if (product.hasVideo)
+                    const Center(
+                      child: Icon(
+                        Icons.play_circle_fill_rounded,
+                        color: Colors.white,
+                        size: 42,
+                      ),
+                    ),
+                  if (product.hasVideo)
+                    Positioned(
+                      right: 7,
+                      bottom: 7,
+                      child: _ProductBadge(
+                        label: videoDurationLabel(product.video!),
+                        color: Colors.black87,
+                        icon: Icons.play_arrow_rounded,
+                      ),
+                    ),
                   Positioned(
                     right: 6,
                     top: 6,
                     child: GestureDetector(
                       onTap: () {
+                        HapticFeedback.lightImpact();
                         final added = InteractionStore.addLike(product.id);
                         showInfo(
                           context,
@@ -9430,12 +12539,18 @@ class ProductCard extends StatelessWidget {
                         valueListenable: InteractionStore.likedIds,
                         builder: (context, liked, _) {
                           final isLiked = liked.contains(product.id);
-                          return Icon(
-                            isLiked
-                                ? Icons.thumb_up
-                                : Icons.thumb_up_alt_outlined,
-                            color: Colors.white,
-                            size: 21,
+                          return AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 180),
+                            transitionBuilder: (child, animation) =>
+                                ScaleTransition(scale: animation, child: child),
+                            child: Icon(
+                              isLiked
+                                  ? Icons.thumb_up
+                                  : Icons.thumb_up_alt_outlined,
+                              key: ValueKey(isLiked),
+                              color: Colors.white,
+                              size: 21,
+                            ),
                           );
                         },
                       ),
@@ -9472,7 +12587,28 @@ class ProductCard extends StatelessWidget {
                   Positioned(
                     left: 7,
                     top: 7,
-                    child: _cardStatusMarker(product.status),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _cardStatusMarker(product.status),
+                        if (isNewProduct(product)) ...[
+                          const SizedBox(height: 4),
+                          const _ProductBadge(
+                            label: 'ลงใหม่',
+                            color: Colors.blue,
+                            icon: Icons.fiber_new_rounded,
+                          ),
+                        ],
+                        if (isPopularProduct(product)) ...[
+                          const SizedBox(height: 4),
+                          const _ProductBadge(
+                            label: 'กำลังนิยม',
+                            color: AppTheme.orange,
+                            icon: Icons.local_fire_department_rounded,
+                          ),
+                        ],
+                      ],
+                    ),
                   ),
                 ],
               ),
@@ -9514,6 +12650,19 @@ class ProductCard extends StatelessWidget {
                         ),
                       ],
                     ),
+                    if (distanceKm != null) ...[
+                      const SizedBox(height: 3),
+                      Text(
+                        '${distanceKm!.toStringAsFixed(distanceKm! < 10 ? 1 : 0)} กม. จากคุณ',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 9.5,
+                          color: AppTheme.orange,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
                     const Spacer(),
                     Row(
                       children: [
@@ -9552,6 +12701,277 @@ class ProductCard extends StatelessWidget {
       ),
     );
   }
+}
+
+class _HomeProductCard extends StatelessWidget {
+  final ProductViewModel product;
+  final List<ProductViewModel>? viewerItems;
+  final double? distanceKm;
+
+  const _HomeProductCard({
+    required this.product,
+    this.viewerItems,
+    this.distanceKm,
+  });
+
+  void _open(BuildContext context) {
+    if (product.hasVideo) {
+      Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => FullscreenListingVideoViewer(
+            items: viewerItems ?? MarketplaceCache.feedProducts,
+            initialProductId: product.id,
+          ),
+        ),
+      );
+      return;
+    }
+    Navigator.pushNamed(
+      context,
+      SuikaiRoutes.productDetail,
+      arguments: product.id,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final imageUrl = primaryProductImage(product);
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(16),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: () => _open(context),
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: const Color(0xFFF0E9E5)),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x0A3B2A20),
+                blurRadius: 12,
+                offset: Offset(0, 4),
+              ),
+            ],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                flex: 57,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    if (product.hasVideo)
+                      FutureBuilder<String>(
+                        future: SuikaiService.signedThumbnailUrl(
+                          product.video!,
+                        ),
+                        builder: (context, snapshot) => snapshot.hasData
+                            ? persistentImage(
+                                snapshot.data!,
+                                fit: BoxFit.cover,
+                                errorBuilder: (_, _, _) => _imageFallback(),
+                              )
+                            : _imageFallback(showPlay: true),
+                      )
+                    else if (imageUrl != null)
+                      persistentImage(
+                        imageUrl,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, _, _) => _imageFallback(),
+                      )
+                    else
+                      _imageFallback(),
+                    if (product.hasVideo)
+                      const Center(
+                        child: Icon(
+                          Icons.play_circle_fill_rounded,
+                          color: Colors.white,
+                          size: 42,
+                        ),
+                      ),
+                    Positioned(
+                      top: 8,
+                      right: 8,
+                      child: GestureDetector(
+                        onTap: () {
+                          HapticFeedback.lightImpact();
+                          final added = InteractionStore.addLike(product.id);
+                          showInfo(
+                            context,
+                            added ? 'ถูกใจแล้ว' : 'อุปกรณ์นี้เคยกด Like แล้ว',
+                          );
+                        },
+                        child: ValueListenableBuilder<Set<String>>(
+                          valueListenable: InteractionStore.likedIds,
+                          builder: (context, liked, _) {
+                            final isLiked = liked.contains(product.id);
+                            return Container(
+                              width: 32,
+                              height: 32,
+                              decoration: const BoxDecoration(
+                                color: Colors.white,
+                                shape: BoxShape.circle,
+                              ),
+                              child: Icon(
+                                isLiked
+                                    ? Icons.thumb_up_rounded
+                                    : Icons.thumb_up_alt_outlined,
+                                color: isLiked
+                                    ? AppTheme.orange
+                                    : AppTheme.textPrimary,
+                                size: 17,
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      left: 8,
+                      top: 8,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _cardStatusMarker(product.status),
+                          if (isNewProduct(product)) ...[
+                            const SizedBox(width: 5),
+                            const _ProductBadge(
+                              label: 'ลงใหม่',
+                              color: AppTheme.orange,
+                              icon: Icons.fiber_new_rounded,
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    if (product.hasVideo)
+                      Positioned(
+                        right: 8,
+                        bottom: 8,
+                        child: _ProductBadge(
+                          label: videoDurationLabel(product.video!),
+                          color: Colors.black87,
+                          icon: Icons.play_arrow_rounded,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              Expanded(
+                flex: 43,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(10, 9, 10, 8),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      LocalizedText(
+                        product.price,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: AppTheme.orange,
+                          fontSize: 14,
+                          height: 1.1,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 5),
+                      LocalizedText(
+                        product.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: AppTheme.textPrimary,
+                          fontSize: 12.5,
+                          height: 1.15,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 5),
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.location_on_outlined,
+                            size: 13,
+                            color: AppTheme.textMuted,
+                          ),
+                          const SizedBox(width: 2),
+                          Expanded(
+                            child: Text(
+                              productCityLabel(context, product),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 10,
+                                color: AppTheme.textMuted,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const Spacer(),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: distanceKm == null
+                                ? LocalizedText(
+                                    product.time,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 9.5,
+                                      color: AppTheme.textMuted,
+                                    ),
+                                  )
+                                : Text(
+                                    '${distanceKm!.toStringAsFixed(distanceKm! < 10 ? 1 : 0)} กม. จากคุณ',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 9.5,
+                                      color: AppTheme.orange,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                          ),
+                          const Icon(
+                            Icons.thumb_up_alt_outlined,
+                            size: 12,
+                            color: AppTheme.textMuted,
+                          ),
+                          const SizedBox(width: 2),
+                          LocalizedText(
+                            '${product.likeCount + (InteractionStore.isLiked(product.id) ? 1 : 0)}',
+                            style: const TextStyle(
+                              fontSize: 9.5,
+                              color: AppTheme.textMuted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _imageFallback({bool showPlay = false}) => ColoredBox(
+    color: const Color(0xFFFFF5F0),
+    child: Center(
+      child: Icon(
+        showPlay ? Icons.play_circle_outline_rounded : Icons.image_outlined,
+        color: AppTheme.orange.withValues(alpha: .65),
+        size: 30,
+      ),
+    ),
+  );
 }
 
 Widget _statusChip(BuildContext context, ProductStatus status) {

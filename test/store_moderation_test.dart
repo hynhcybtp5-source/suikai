@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -6,8 +7,28 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:suikai/data/models.dart';
 import 'package:suikai/features/admin/admin_dashboard.dart';
 import 'package:suikai/services/suikai_service.dart';
+import 'package:suikai/services/video_post_processor.dart';
 
 import 'support/in_memory_repositories.dart';
+
+SelectedVideoPost _selectedVideo() => SelectedVideoPost(
+  PreparedVideoPost(
+    path: '/tmp/suikai-test-video.mp4',
+    thumbnailBytes: Uint8List.fromList([0xFF, 0xD8, 0xFF]),
+    durationMilliseconds: 1000,
+    sizeBytes: 1024,
+  ),
+);
+
+ListingVideoRecord _listingVideo() => const ListingVideoRecord(
+  id: 'test-video',
+  videoMediaId: 'test-video-media',
+  thumbnailMediaId: 'test-thumbnail-media',
+  videoPath: 'listings/test/video.mp4',
+  thumbnailPath: 'listings/test/thumbnail.jpg',
+  durationMilliseconds: 1000,
+  sizeBytes: 1024,
+);
 
 void main() {
   late Directory databaseDirectory;
@@ -47,6 +68,36 @@ void main() {
   tearDownAll(() async {
     await Hive.close();
     await databaseDirectory.delete(recursive: true);
+  });
+
+  test('listing creation rejects a missing video', () async {
+    final profile = await SuikaiService.register(
+      name: 'Video required',
+      phone: '0910000000',
+      email: 'video-required@suikai.local',
+      password: 'password123',
+      city: '',
+    );
+    await SuikaiService.login(profile.email, 'password123');
+    await expectLater(
+      SuikaiService.createListing(
+        title: 'No video',
+        description: '',
+        category: 'listing_mobile',
+        phone: profile.phone,
+        viber: '',
+        price: 1,
+        currency: 'MMK',
+        listingType: 'general',
+      ),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.message,
+          'message',
+          'listing_video_required',
+        ),
+      ),
+    );
   });
 
   test('store changes and promotion require admin approval', () async {
@@ -188,7 +239,7 @@ void main() {
     },
   );
 
-  test('store product edit preserves id and unchanged image paths', () async {
+  test('store product edit preserves id and video metadata', () async {
     final profile = await SuikaiService.register(
       name: 'Owner',
       phone: '0912345678',
@@ -218,7 +269,7 @@ void main() {
         currency: 'THB',
         city: 'เมืองนาง',
         status: 'available',
-        images: const ['/persistent/image-a.jpg', '/persistent/image-b.jpg'],
+        video: _listingVideo(),
         phone: '0912345678',
         viber: '0912345678',
         createdAt: createdAt,
@@ -235,17 +286,21 @@ void main() {
       viber: '0912345678',
       price: 100,
       currency: 'THB',
-      status: 'out_of_stock',
+      status: 'reserved',
     );
     var saved = (await InMemoryListingRepository().all()).singleWhere(
       (value) => value.id == 'store-product-edit',
     );
     expect(saved.id, 'store-product-edit');
+    expect(saved.status, 'reserved');
+    expect(saved.video?.videoPath, 'listings/test/video.mp4');
+    expect(
+      (await InMemoryListingRepository().publicListings()).where(
+        (value) => value.id == saved.id,
+      ),
+      isNotEmpty,
+    );
     expect(saved.createdAt, createdAt);
-    expect(saved.images, const [
-      '/persistent/image-a.jpg',
-      '/persistent/image-b.jpg',
-    ]);
 
     await SuikaiService.updateListing(
       listingId: saved.id,
@@ -257,14 +312,12 @@ void main() {
       price: saved.price,
       currency: saved.currency,
       status: saved.status,
-      images: const ['/persistent/replacement.jpg'],
     );
     await TestDatabase.listings.close();
     TestDatabase.listings = await Hive.openBox('listings');
     saved = (await InMemoryListingRepository().all()).singleWhere(
       (value) => value.id == 'store-product-edit',
     );
-    expect(saved.images, const ['/persistent/replacement.jpg']);
     expect(
       (await InMemoryListingRepository().all())
           .where((value) => value.id == 'store-product-edit')
@@ -296,6 +349,7 @@ void main() {
         price: 125,
         currency: 'THB',
         listingType: 'general',
+        video: _selectedVideo(),
         latitude: 19.123456,
         longitude: 97.654321,
         isLocationVisible: false,
@@ -309,6 +363,53 @@ void main() {
     },
   );
 
+  test('store listing always uses the store contact details', () async {
+    final profile = await SuikaiService.register(
+      name: 'Store contact owner',
+      phone: '0912345678',
+      email: 'store-contact-owner@suikai.local',
+      password: 'password123',
+      city: 'เมืองนาง',
+    );
+    await SuikaiService.login(profile.email, 'password123');
+    const storeId = 'store-contact-source';
+    await TestDatabase.stores.put(
+      storeId,
+      StoreRecord(
+        id: storeId,
+        ownerId: profile.id,
+        name: 'Store contact source',
+        logo: '',
+        description: '',
+        category: 'store_mobile',
+        phone: '099 111 2222',
+        viber: '099 333 4444',
+        city: 'เมืองนาง',
+        location: 'เมืองนาง',
+        openingHours: '09:00-18:00',
+        status: 'approved',
+        createdAt: DateTime(2026, 8, 16),
+      ).toJson(),
+    );
+
+    final saved = await SuikaiService.createListing(
+      title: 'Store contact product',
+      description: '',
+      category: 'listing_mobile',
+      city: 'เมืองอื่น',
+      phone: '088 000 0000',
+      viber: '088 999 9999',
+      price: 10,
+      currency: 'THB',
+      listingType: 'store',
+      storeId: storeId,
+      video: _selectedVideo(),
+    );
+
+    expect(saved?['phone'], '0991112222');
+    expect(saved?['viber_phone'], '0993334444');
+  });
+
   test('admin location text shows coordinates and missing-data fallback', () {
     expect(
       adminLocationText(13.1234567, 99.6543212),
@@ -317,9 +418,10 @@ void main() {
     expect(adminLocationText(null, null), 'ไม่มีข้อมูลตำแหน่ง');
   });
 
-  test('general listing rejects an empty free-text city', () async {
-    await expectLater(
-      SuikaiService.createListing(
+  test(
+    'general listing accepts an empty city when GPS/profile city is unavailable',
+    () async {
+      final saved = await SuikaiService.createListing(
         title: 'Invalid city product',
         description: '',
         category: 'listing_mobile',
@@ -329,11 +431,140 @@ void main() {
         price: 10,
         currency: 'THB',
         listingType: 'general',
+        video: _selectedVideo(),
         isLocationVisible: false,
-      ),
-      throwsA(isA<StateError>()),
-    );
-  });
+      );
+      expect(saved?['city'], isEmpty);
+      final id = '${saved?['id']}';
+      await SuikaiService.updateListingStatus(
+        listingId: id,
+        status: 'reserved',
+      );
+      expect(
+        (await InMemoryListingRepository().all())
+            .singleWhere((listing) => listing.id == id)
+            .status,
+        'reserved',
+      );
+      expect(
+        (await InMemoryListingRepository().publicListings()).map(
+          (listing) => listing.id,
+        ),
+        contains(id),
+      );
+      await SuikaiService.updateListingStatus(listingId: id, status: 'sold');
+      expect(
+        (await InMemoryListingRepository().all())
+            .singleWhere((listing) => listing.id == id)
+            .status,
+        'sold',
+      );
+      expect(
+        (await InMemoryListingRepository().publicListings()).map(
+          (listing) => listing.id,
+        ),
+        isNot(contains(id)),
+      );
+    },
+  );
+
+  test(
+    'status-only updates preserve video metadata and public visibility',
+    () async {
+      final profile = await SuikaiService.register(
+        name: 'Status owner',
+        phone: '',
+        email: 'status-owner@suikai.test',
+        password: 'password123',
+        city: '',
+      );
+      await SuikaiService.login(profile.email, 'password123');
+      const video = ListingVideoRecord(
+        id: 'video-status-only',
+        videoMediaId: 'video-media-status-only',
+        thumbnailMediaId: 'thumbnail-media-status-only',
+        videoPath: 'videos/status-only.mp4',
+        thumbnailPath: 'thumbnails/status-only.jpg',
+        durationMilliseconds: 1000,
+        sizeBytes: 100,
+      );
+      await InMemoryListingRepository().create(
+        ListingRecord(
+          id: 'general-status-only',
+          ownerId: profile.id,
+          title: 'General',
+          description: '',
+          category: 'listing_mobile',
+          price: 1,
+          currency: 'THB',
+          city: '',
+          status: 'available',
+          video: video,
+          phone: '',
+          viber: '',
+          createdAt: DateTime(2026, 8, 16),
+          updatedAt: DateTime(2026, 8, 16),
+        ),
+      );
+      await SuikaiService.updateListingStatus(
+        listingId: 'general-status-only',
+        status: 'reserved',
+      );
+      var saved = (await InMemoryListingRepository().all()).singleWhere(
+        (listing) => listing.id == 'general-status-only',
+      );
+      expect(saved.status, 'reserved');
+      expect(saved.video?.videoPath, video.videoPath);
+      await SuikaiService.updateListingStatus(
+        listingId: 'general-status-only',
+        status: 'sold',
+      );
+      expect(
+        (await InMemoryListingRepository().publicListings()).map(
+          (listing) => listing.id,
+        ),
+        isNot(contains('general-status-only')),
+      );
+
+      await InMemoryListingRepository().create(
+        ListingRecord(
+          id: 'store-status-only',
+          ownerId: profile.id,
+          storeId: 'store-status-only',
+          title: 'Store',
+          description: '',
+          category: 'listing_mobile',
+          price: 1,
+          currency: 'THB',
+          city: 'เมืองนาง',
+          status: 'available',
+          video: _listingVideo(),
+          phone: '',
+          viber: '',
+          createdAt: DateTime(2026, 8, 16),
+          updatedAt: DateTime(2026, 8, 16),
+        ),
+      );
+      await SuikaiService.updateListingStatus(
+        listingId: 'store-status-only',
+        status: 'reserved',
+      );
+      saved = (await InMemoryListingRepository().all()).singleWhere(
+        (listing) => listing.id == 'store-status-only',
+      );
+      expect(saved.status, 'reserved');
+      await SuikaiService.updateListingStatus(
+        listingId: 'store-status-only',
+        status: 'sold',
+      );
+      expect(
+        (await InMemoryListingRepository().publicListings()).map(
+          (listing) => listing.id,
+        ),
+        isNot(contains('store-status-only')),
+      );
+    },
+  );
 
   test(
     'map listings include only visible published active coordinates',
@@ -357,7 +588,7 @@ void main() {
           currency: 'THB',
           city: 'Map Test City',
           status: status,
-          images: const [],
+          video: _listingVideo(),
           phone: '',
           viber: '',
           latitude: 20,
@@ -398,7 +629,7 @@ void main() {
       currency: 'THB',
       city: 'Test city',
       status: 'available',
-      images: const [],
+      video: _listingVideo(),
       phone: '',
       viber: '',
       latitude: 19.0,
@@ -423,11 +654,16 @@ void main() {
       phone: '',
       email: 'avatar@suikai.local',
       avatar: '/persistent/avatar.jpg',
+      city: 'เมืองนาง',
+      cityId: 'city-1',
+      viber: '0912345678',
       createdAt: DateTime(2026, 6),
     );
     await TestDatabase.users.put(profile.id, profile.toJson());
-    await repository.save(profile);
+    final saved = await repository.save(profile);
     expect((await repository.get(profile.id))?.avatar, profile.avatar);
+    expect(saved.cityId, 'city-1');
+    expect(saved.viber, '0912345678');
     await repository.save(
       UserProfile(
         id: profile.id,
