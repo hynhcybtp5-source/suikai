@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart' as fmap;
 import 'package:latlong2/latlong.dart';
 import 'package:uuid/uuid.dart';
 import '../../core/theme/app_theme.dart';
@@ -6,6 +7,7 @@ import '../../core/category_icons.dart';
 import '../../data/models.dart';
 import '../../services/suikai_service.dart';
 import '../../widgets/location_picker_map.dart';
+import 'admin_ui.dart';
 
 double? _adminCoordinate(dynamic value) {
   if (value is num) return value.toDouble();
@@ -131,6 +133,8 @@ class _AdminPanel extends StatefulWidget {
 class _AdminPanelState extends State<_AdminPanel>
     with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   Map<String, int> summary = {};
+  Map<String, dynamic> analytics = {};
+  String analyticsPeriod = '30d';
   List<Map<String, dynamic>> users = [],
       listings = [],
       stores = [],
@@ -153,7 +157,7 @@ class _AdminPanelState extends State<_AdminPanel>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _tabs = TabController(length: 10, vsync: this)..addListener(_tabChanged);
+    _tabs = TabController(length: 12, vsync: this)..addListener(_tabChanged);
     load();
   }
 
@@ -266,6 +270,18 @@ class _AdminPanelState extends State<_AdminPanel>
     setState(() => _loadingTabs.add(index));
     try {
       switch (index) {
+        case 10:
+          analytics = await _timed(
+            'analytics.$analyticsPeriod',
+            () => SuikaiService.admin.analytics(analyticsPeriod),
+          );
+        case 11:
+          final values = await Future.wait([
+            _timed('listings.for_admin_map', SuikaiService.admin.listings),
+            _timed('stores.for_admin_map', SuikaiService.admin.stores),
+          ]);
+          listings = values[0];
+          stores = values[1];
         case 1:
           users = await _timed('profiles.page_1', SuikaiService.admin.users);
           _pages[1] = 0;
@@ -441,55 +457,28 @@ class _AdminPanelState extends State<_AdminPanel>
     if (mounted) Navigator.pushNamedAndRemoveUntil(context, '/', (_) => false);
   }
 
+  void _selectTab(int index) {
+    if (_tabs.index == index) return;
+    setState(() => _tabs.animateTo(index));
+  }
+
   @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(
-      title: const Text('Suikai Admin'),
-      actions: [
-        IconButton(onPressed: load, icon: const Icon(Icons.refresh_rounded)),
-        IconButton(onPressed: logout, icon: const Icon(Icons.logout_rounded)),
-      ],
-      bottom: TabBar(
-        controller: _tabs,
-        isScrollable: true,
-        tabs: [
-          const Tab(text: 'ภาพรวม'),
-          const Tab(text: 'สมาชิก'),
-          _AdminTabBadge(
-            text: 'ประกาศ',
-            count: _unreadCount('general_listing'),
-          ),
-          _AdminTabBadge(text: 'ร้าน', count: _unreadCount('shop_application')),
-          _AdminTabBadge(
-            text: 'สินค้าในร้าน',
-            count: _unreadCount('store_product'),
-          ),
-          const Tab(text: 'Reports'),
-          Tab(
-            child: Badge(
-              isLabelVisible: adminNotifications.any(
-                (value) =>
-                    value['type'] == 'shop_application' &&
-                    value['is_read'] != true,
-              ),
-              label: Text(
-                '${adminNotifications.where((value) => value['type'] == 'shop_application' && value['is_read'] != true).length}',
-              ),
-              child: const Text('คำร้องร้าน'),
-            ),
-          ),
-          const Tab(text: 'หมวดหมู่'),
-          const Tab(text: 'วิดีโอสั้น'),
-          const Tab(text: 'โฆษณา'),
-        ],
-      ),
-    ),
-    body: TabBarView(
+  Widget build(BuildContext context) => AdminShell(
+    selectedTab: _tabs.index,
+    onSelect: _selectTab,
+    onRefresh: load,
+    onLogout: logout,
+    notificationCount: adminNotifications
+        .where((row) => row['is_read'] != true)
+        .length,
+    pendingStores: summary['pending_stores'] ?? 0,
+    pendingReports: summary['pending_reports'] ?? 0,
+    child: TabBarView(
       controller: _tabs,
       children: [
         summaryLoading
             ? const Center(child: CircularProgressIndicator())
-            : _Summary(summary: summary),
+            : _Summary(summary: summary, openTab: _selectTab),
         _tabBody(1, _Users(rows: users, changed: () => _reloadTab(1))),
         _tabBody(
           2,
@@ -539,31 +528,296 @@ class _AdminPanelState extends State<_AdminPanel>
             changed: () => _reloadTab(9),
           ),
         ),
+        _tabBody(
+          10,
+          _Analytics(
+            values: analytics,
+            period: analyticsPeriod,
+            onPeriodChanged: (value) async {
+              setState(() => analyticsPeriod = value);
+              await _loadTab(10, refresh: true);
+            },
+          ),
+        ),
+        _tabBody(11, _AdminMap(listings: listings, stores: stores)),
       ],
     ),
   );
-
-  int _unreadCount(String type) => adminNotifications
-      .where((row) => row['type'] == type && row['is_read'] != true)
-      .length;
 }
 
-class _AdminTabBadge extends StatelessWidget {
-  final String text;
-  final int count;
-  const _AdminTabBadge({required this.text, required this.count});
+/// Admin-only map. General listings are intentionally limited to store_id ==
+/// null; shop inventory is managed from the store screens and is not mapped.
+class _AdminMap extends StatelessWidget {
+  const _AdminMap({required this.listings, required this.stores});
+  final List<Map<String, dynamic>> listings;
+  final List<Map<String, dynamic>> stores;
 
   @override
-  Widget build(BuildContext context) => Tab(
-    child: Badge(
-      isLabelVisible: count > 0,
-      label: Text('$count'),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 4),
-        child: Text(text),
+  Widget build(BuildContext context) {
+    final mapStores = stores.where(_hasCoordinates).toList();
+    final generalListings = listings
+        .where((row) => row['store_id'] == null && _hasCoordinates(row))
+        .toList();
+    final initialRow = mapStores.isNotEmpty
+        ? mapStores.first
+        : generalListings.isNotEmpty
+        ? generalListings.first
+        : null;
+    final initial = initialRow == null
+        ? const LatLng(20.8907, 97.1815)
+        : LatLng(
+            _adminCoordinate(initialRow['latitude'])!,
+            _adminCoordinate(initialRow['longitude'])!,
+          );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'แผนที่สินค้าและร้านค้า',
+                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+            IconButton(
+              tooltip: 'ขยายเต็มจอ',
+              onPressed: () => showDialog<void>(
+                context: context,
+                builder: (_) => Dialog.fullscreen(
+                  child: _AdminFullScreenMap(
+                    listings: listings,
+                    stores: stores,
+                  ),
+                ),
+              ),
+              icon: const Icon(Icons.fullscreen_rounded),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'สินค้า ${generalListings.length} รายการ · ร้านค้า ${mapStores.length} ร้าน · ไม่แสดงสินค้าในร้าน',
+          style: const TextStyle(color: AppTheme.textMuted),
+        ),
+        const SizedBox(height: 16),
+        Expanded(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(16),
+            child: fmap.FlutterMap(
+              options: fmap.MapOptions(initialCenter: initial, initialZoom: 10),
+              children: [
+                fmap.TileLayer(
+                  urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                  userAgentPackageName: 'com.suikai.suikai',
+                ),
+                fmap.MarkerLayer(
+                  markers: [
+                    for (final store in mapStores)
+                      _marker(context, store, isStore: true),
+                    for (final listing in generalListings)
+                      _marker(context, listing, isStore: false),
+                  ],
+                ),
+                const fmap.RichAttributionWidget(
+                  attributions: [
+                    fmap.TextSourceAttribution('OpenStreetMap contributors'),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  bool _hasCoordinates(Map<String, dynamic> row) =>
+      _adminCoordinate(row['latitude']) != null &&
+      _adminCoordinate(row['longitude']) != null;
+
+  fmap.Marker _marker(
+    BuildContext context,
+    Map<String, dynamic> row, {
+    required bool isStore,
+  }) {
+    final latitude = _adminCoordinate(row['latitude'])!;
+    final longitude = _adminCoordinate(row['longitude'])!;
+    final label = '${row[isStore ? 'name' : 'title'] ?? ''}'.trim();
+    return fmap.Marker(
+      point: LatLng(latitude, longitude),
+      width: 54,
+      height: 54,
+      child: Tooltip(
+        message: label.isEmpty ? (isStore ? 'ร้านค้า' : 'สินค้า') : label,
+        child: InkWell(
+          onTap: () => showDialog<void>(
+            context: context,
+            builder: (_) => AlertDialog(
+              title: Text(
+                label.isEmpty ? (isStore ? 'ร้านค้า' : 'สินค้า') : label,
+              ),
+              content: Text(
+                '${isStore ? 'ร้านค้า' : 'สินค้า'}\n${adminLocationText(latitude, longitude)}',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('ปิด'),
+                ),
+              ],
+            ),
+          ),
+          child: Icon(
+            isStore ? Icons.storefront_rounded : Icons.sell_rounded,
+            color: isStore ? Colors.blue.shade700 : AppTheme.orange,
+            size: 38,
+          ),
+        ),
       ),
-    ),
-  );
+    );
+  }
+}
+
+class _AdminFullScreenMap extends StatefulWidget {
+  const _AdminFullScreenMap({required this.listings, required this.stores});
+  final List<Map<String, dynamic>> listings, stores;
+  @override
+  State<_AdminFullScreenMap> createState() => _AdminFullScreenMapState();
+}
+
+class _AdminFullScreenMapState extends State<_AdminFullScreenMap> {
+  String _query = '', _category = 'all';
+  bool _hasCoordinates(Map<String, dynamic> row) =>
+      _adminCoordinate(row['latitude']) != null &&
+      _adminCoordinate(row['longitude']) != null;
+  bool _matches(Map<String, dynamic> row, bool isStore) {
+    final needle = _query.trim().toLowerCase();
+    final label = '${row[isStore ? 'name' : 'title'] ?? ''}'.toLowerCase();
+    final category = '${row['category_id'] ?? row['category'] ?? ''}';
+    return (_category == 'all' || category == _category) &&
+        (needle.isEmpty ||
+            label.contains(needle) ||
+            category.toLowerCase().contains(needle));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final stores = widget.stores
+        .where((row) => _hasCoordinates(row) && _matches(row, true))
+        .toList();
+    final listings = widget.listings
+        .where(
+          (row) =>
+              row['store_id'] == null &&
+              _hasCoordinates(row) &&
+              _matches(row, false),
+        )
+        .toList();
+    final first = stores.isNotEmpty
+        ? stores.first
+        : listings.isNotEmpty
+        ? listings.first
+        : null;
+    final initial = first == null
+        ? const LatLng(20.8907, 97.1815)
+        : LatLng(
+            _adminCoordinate(first['latitude'])!,
+            _adminCoordinate(first['longitude'])!,
+          );
+    final categories = <String>{
+      for (final row in [...widget.stores, ...widget.listings])
+        if ('${row['category_id'] ?? row['category'] ?? ''}'.isNotEmpty)
+          '${row['category_id'] ?? row['category']}',
+    }.toList()..sort();
+    final map = _AdminMap(listings: widget.listings, stores: widget.stores);
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('แผนที่สินค้าและร้านค้า'),
+        actions: [
+          IconButton(
+            onPressed: () => Navigator.pop(context),
+            icon: const Icon(Icons.close_rounded),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    onChanged: (value) => setState(() => _query = value),
+                    decoration: const InputDecoration(
+                      prefixIcon: Icon(Icons.search_rounded),
+                      hintText: 'ค้นหาสินค้าหรือร้านค้า',
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                DropdownButton<String>(
+                  value: _category,
+                  items: [
+                    const DropdownMenuItem(
+                      value: 'all',
+                      child: Text('ทุกหมวดหมู่'),
+                    ),
+                    ...categories.map(
+                      (value) => DropdownMenuItem(
+                        value: value,
+                        child: Text(value, overflow: TextOverflow.ellipsis),
+                      ),
+                    ),
+                  ],
+                  onChanged: (value) =>
+                      setState(() => _category = value ?? 'all'),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'สินค้า ${listings.length} · ร้านค้า ${stores.length} · ไม่แสดงสินค้าในร้าน',
+                style: const TextStyle(color: AppTheme.textMuted),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Expanded(
+            child: fmap.FlutterMap(
+              options: fmap.MapOptions(initialCenter: initial, initialZoom: 10),
+              children: [
+                fmap.TileLayer(
+                  urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                  userAgentPackageName: 'com.suikai.suikai',
+                ),
+                fmap.MarkerLayer(
+                  markers: [
+                    for (final row in stores)
+                      map._marker(context, row, isStore: true),
+                    for (final row in listings)
+                      map._marker(context, row, isStore: false),
+                  ],
+                ),
+                const fmap.RichAttributionWidget(
+                  attributions: [
+                    fmap.TextSourceAttribution('OpenStreetMap contributors'),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 String _shortVideoDate(DateTime value) {
@@ -1221,9 +1475,157 @@ class _ShortVideoDialogState extends State<_ShortVideoDialog> {
   );
 }
 
+class _Analytics extends StatelessWidget {
+  final Map<String, dynamic> values;
+  final String period;
+  final ValueChanged<String> onPeriodChanged;
+  const _Analytics({
+    required this.values,
+    required this.period,
+    required this.onPeriodChanged,
+  });
+
+  int _number(String key) => int.tryParse('${values[key] ?? 0}') ?? 0;
+  List<dynamic> _rows(String key) =>
+      values[key] is List ? values[key] as List : const [];
+
+  @override
+  Widget build(BuildContext context) {
+    const labels = {
+      'users_total': 'ผู้ใช้ทั้งหมด',
+      'users_new': 'ผู้ใช้ใหม่',
+      'stores_total': 'ร้านทั้งหมด',
+      'stores_new': 'ร้านใหม่',
+      'stores_pending': 'ร้านรออนุมัติ',
+      'listings_total': 'ประกาศทั้งหมด',
+      'listings_new': 'ประกาศใหม่',
+      'sold_total': 'ขายแล้ว',
+      'views_total': 'Views',
+      'likes_total': 'Likes',
+    };
+    return ListView(
+      children: [
+        const AdminPageTitle(
+          title: 'Analytics',
+          description: 'ข้อมูลสรุปจาก Supabase ตามช่วงเวลาที่เลือก',
+        ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: SegmentedButton<String>(
+            segments: const [
+              ButtonSegment(value: 'today', label: Text('วันนี้')),
+              ButtonSegment(value: '7d', label: Text('7 วัน')),
+              ButtonSegment(value: '30d', label: Text('30 วัน')),
+              ButtonSegment(value: 'all', label: Text('ทั้งหมด')),
+            ],
+            selected: {period},
+            onSelectionChanged: (value) => onPeriodChanged(value.first),
+          ),
+        ),
+        const SizedBox(height: 16),
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final columns = constraints.maxWidth >= 1000
+                ? 5
+                : constraints.maxWidth >= 620
+                ? 3
+                : 2;
+            return GridView.count(
+              crossAxisCount: columns,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              childAspectRatio: 1.45,
+              crossAxisSpacing: 12,
+              mainAxisSpacing: 12,
+              children: [
+                for (final entry in labels.entries)
+                  AdminStatCard(
+                    label: entry.value,
+                    value: '${_number(entry.key)}',
+                    icon: Icons.insights_outlined,
+                  ),
+              ],
+            );
+          },
+        ),
+        const SizedBox(height: 24),
+        _AnalyticsRows(
+          title: 'หมวดหมู่ยอดนิยม',
+          rows: _rows('categories'),
+          label: 'name',
+          metric: 'count',
+        ),
+        _AnalyticsRows(
+          title: 'พื้นที่ยอดนิยม',
+          rows: _rows('cities'),
+          label: 'name',
+          metric: 'count',
+        ),
+        _AnalyticsRows(
+          title: 'ร้านยอดนิยม',
+          rows: _rows('stores_top'),
+          label: 'name',
+          metric: 'count',
+        ),
+        _AnalyticsRows(
+          title: 'สินค้ายอดนิยม',
+          rows: _rows('listings_top'),
+          label: 'title',
+          metric: 'views',
+        ),
+      ],
+    );
+  }
+}
+
+class _AnalyticsRows extends StatelessWidget {
+  final String title, label, metric;
+  final List<dynamic> rows;
+  const _AnalyticsRows({
+    required this.title,
+    required this.rows,
+    required this.label,
+    required this.metric,
+  });
+  @override
+  Widget build(BuildContext context) => Card(
+    margin: const EdgeInsets.only(bottom: 14),
+    child: Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+          ),
+          const SizedBox(height: 8),
+          if (rows.isEmpty)
+            const Text(
+              'ยังไม่มีข้อมูล',
+              style: TextStyle(color: AppTheme.textMuted),
+            )
+          else
+            for (final item in rows.take(8))
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text('${item is Map ? item[label] ?? '-' : '-'}'),
+                trailing: Text(
+                  '${item is Map ? item[metric] ?? 0 : 0}',
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+              ),
+        ],
+      ),
+    ),
+  );
+}
+
 class _Summary extends StatelessWidget {
   final Map<String, int> summary;
-  const _Summary({required this.summary});
+  final ValueChanged<int> openTab;
+  const _Summary({required this.summary, required this.openTab});
   @override
   Widget build(BuildContext context) {
     const labels = {
@@ -1240,37 +1642,83 @@ class _Summary extends StatelessWidget {
       'store_products': Icons.inventory_2_outlined,
       'reports': Icons.flag_outlined,
     };
-    return GridView.count(
-      padding: const EdgeInsets.all(16),
-      crossAxisCount: MediaQuery.sizeOf(context).width > 700 ? 3 : 2,
-      childAspectRatio: MediaQuery.sizeOf(context).width > 700 ? 1.45 : 1.18,
-      crossAxisSpacing: 12,
-      mainAxisSpacing: 12,
+    final tabFor = {
+      'users': 1,
+      'listings': 2,
+      'stores': 3,
+      'store_products': 4,
+      'reports': 5,
+    };
+    return ListView(
       children: [
-        for (final key in labels.keys)
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(icons[key], color: AppTheme.orange, size: 32),
-                  const SizedBox(height: 8),
-                  Text(
-                    '${summary[key] ?? 0}',
-                    style: const TextStyle(
-                      fontSize: 28,
-                      fontWeight: FontWeight.w900,
+        const AdminPageTitle(
+          title: 'ภาพรวมระบบ',
+          description: 'ติดตามข้อมูลสำคัญและไปยังงานที่ต้องตรวจสอบได้ทันที',
+        ),
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final columns = constraints.maxWidth >= 1000
+                ? 5
+                : constraints.maxWidth >= 620
+                ? 3
+                : 2;
+            return GridView.count(
+              crossAxisCount: columns,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              childAspectRatio: columns >= 5 ? 1.15 : 1.35,
+              crossAxisSpacing: 12,
+              mainAxisSpacing: 12,
+              children: [
+                for (final key in labels.keys)
+                  InkWell(
+                    borderRadius: BorderRadius.circular(16),
+                    onTap: () => openTab(tabFor[key]!),
+                    child: AdminStatCard(
+                      label: labels[key]!,
+                      value: '${summary[key] ?? 0}',
+                      icon: icons[key]!,
                     ),
                   ),
-                  Text(
-                    labels[key]!,
-                    style: const TextStyle(color: AppTheme.textMuted),
-                  ),
-                ],
+              ],
+            );
+          },
+        ),
+        const SizedBox(height: 28),
+        const Text(
+          'ทางลัดสำหรับผู้ดูแล',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Column(
+            children: [
+              ListTile(
+                leading: const Icon(
+                  Icons.fact_check_outlined,
+                  color: AppTheme.orangeDark,
+                ),
+                title: const Text('ตรวจคำขอเปิดร้าน'),
+                subtitle: const Text(
+                  'ดูร้านที่รออนุมัติและคำร้องที่เกี่ยวข้อง',
+                ),
+                trailing: const Icon(Icons.chevron_right_rounded),
+                onTap: () => openTab(6),
               ),
-            ),
+              const Divider(height: 1),
+              ListTile(
+                leading: const Icon(
+                  Icons.flag_outlined,
+                  color: AppTheme.orangeDark,
+                ),
+                title: const Text('ตรวจสอบรายงาน'),
+                subtitle: const Text('จัดการรายงานสินค้าและร้านค้า'),
+                trailing: const Icon(Icons.chevron_right_rounded),
+                onTap: () => openTab(5),
+              ),
+            ],
           ),
+        ),
       ],
     );
   }
@@ -1293,45 +1741,74 @@ class _UsersState extends State<_Users> {
         .toList();
     return Column(
       children: [
-        _Search(
-          onChanged: (v) => setState(() => query = v),
-          hint: 'ค้นหาชื่อ อีเมล หรือเบอร์โทร',
+        AdminPageTitle(
+          title: 'ผู้ใช้งาน',
+          description: 'ค้นหาและจัดการสถานะบัญชีผู้ใช้',
         ),
-        Expanded(
-          child: ListView.builder(
-            itemCount: rows.length,
-            itemBuilder: (_, i) {
-              final u = rows[i];
-              return ListTile(
-                leading: _ProfileAvatar(user: u),
-                title: Text(
-                  '${u['name'] ?? ''}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                subtitle: Text('${u['email'] ?? ''}\n${u['id']}'),
-                isThreeLine: true,
-                trailing: PopupMenuButton<String>(
-                  onSelected: (v) => action(u, v),
-                  itemBuilder: (_) => [
-                    PopupMenuItem(
-                      value: u['status'] == 'suspended'
-                          ? 'active'
-                          : 'suspended',
-                      child: Text(
-                        u['status'] == 'suspended' ? 'เปิดใช้งาน' : 'ระงับ',
-                      ),
-                    ),
-                    const PopupMenuItem(
-                      value: 'details',
-                      child: Text('รายละเอียด'),
-                    ),
-                    const PopupMenuItem(value: 'delete', child: Text('ลบ')),
-                  ],
-                ),
-              );
-            },
+        AdminFilterBar(
+          search: _Search(
+            onChanged: (v) => setState(() => query = v),
+            hint: 'ค้นหาชื่อ อีเมล หรือเบอร์โทร',
           ),
+          onClear: query.isEmpty ? null : () => setState(() => query = ''),
+        ),
+        const SizedBox(height: 16),
+        Expanded(
+          child: rows.isEmpty
+              ? const AdminEmptyState(
+                  title: 'ไม่พบผู้ใช้งาน',
+                  message: 'ลองเปลี่ยนคำค้นหาแล้วลองอีกครั้ง',
+                )
+              : ListView.separated(
+                  itemCount: rows.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 8),
+                  itemBuilder: (_, i) {
+                    final u = rows[i];
+                    return Card(
+                      child: ListTile(
+                        leading: _ProfileAvatar(user: u),
+                        title: Text(
+                          '${u['name'] ?? ''}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: Text('${u['email'] ?? ''}'),
+                        isThreeLine: true,
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            AdminStatusChip(
+                              status: '${u['status'] ?? 'active'}',
+                            ),
+                            PopupMenuButton<String>(
+                              onSelected: (v) => action(u, v),
+                              itemBuilder: (_) => [
+                                PopupMenuItem(
+                                  value: u['status'] == 'suspended'
+                                      ? 'active'
+                                      : 'suspended',
+                                  child: Text(
+                                    u['status'] == 'suspended'
+                                        ? 'เปิดใช้งาน'
+                                        : 'ระงับ',
+                                  ),
+                                ),
+                                const PopupMenuItem(
+                                  value: 'details',
+                                  child: Text('รายละเอียด'),
+                                ),
+                                const PopupMenuItem(
+                                  value: 'delete',
+                                  child: Text('ลบ'),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
         ),
       ],
     );
@@ -1351,12 +1828,14 @@ class _UsersState extends State<_Users> {
       return;
     }
     if (value == 'delete' &&
-        !await _confirm(context, 'ลบสมาชิกและข้อมูลที่เป็นเจ้าของทั้งหมด?'))
+        !await _confirm(context, 'ลบสมาชิกและข้อมูลที่เป็นเจ้าของทั้งหมด?')) {
       return;
-    if (value == 'delete')
+    }
+    if (value == 'delete') {
       await SuikaiService.admin.deleteUser('${u['id']}');
-    else
+    } else {
       await SuikaiService.admin.setUserStatus('${u['id']}', value);
+    }
     await widget.changed();
   }
 }
@@ -1390,13 +1869,16 @@ class _ListingsState extends State<_Listings> {
         .toList();
     return Column(
       children: [
-        _Search(
-          onChanged: (v) => setState(() => query = v),
-          hint: 'ค้นหาชื่อ หมวดหมู่ หรือ ownerId',
+        AdminPageTitle(
+          title: 'ประกาศสินค้า',
+          description: 'ค้นหา ตรวจสอบ และอัปเดตสถานะประกาศ',
         ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: DropdownButtonFormField<String>(
+        AdminFilterBar(
+          search: _Search(
+            onChanged: (v) => setState(() => query = v),
+            hint: 'ค้นหาชื่อ หมวดหมู่ หรือ owner ID',
+          ),
+          filter: DropdownButtonFormField<String>(
             initialValue: filter,
             items: const [
               'all',
@@ -1410,39 +1892,67 @@ class _ListingsState extends State<_Listings> {
               isDense: true,
             ),
           ),
+          onClear: (query.isEmpty && filter == 'all')
+              ? null
+              : () => setState(() {
+                  query = '';
+                  filter = 'all';
+                }),
         ),
+        const SizedBox(height: 16),
         Expanded(
-          child: ListView.builder(
-            itemCount: rows.length,
-            itemBuilder: (_, i) {
-              final p = rows[i];
-              return ListTile(
-                leading: _VideoThumb(
-                  video: p['listing_video'],
-                  images: p['images'],
+          child: rows.isEmpty
+              ? const AdminEmptyState(
+                  title: 'ไม่พบประกาศ',
+                  message: 'ยังไม่มีรายการที่ตรงกับตัวกรองนี้',
+                )
+              : ListView.separated(
+                  itemCount: rows.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 8),
+                  itemBuilder: (_, i) {
+                    final p = rows[i];
+                    return Card(
+                      child: ListTile(
+                        leading: _VideoThumb(
+                          video: p['listing_video'],
+                          images: p['images'],
+                        ),
+                        title: Text(
+                          '${p['title'] ?? ''}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: Text(
+                          '${p['currency']} ${p['price']} • เจ้าของ: ${p['owner_id']}',
+                        ),
+                        isThreeLine: true,
+                        onTap: () => details(p),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            AdminStatusChip(status: '${p['status'] ?? ''}'),
+                            PopupMenuButton<String>(
+                              onSelected: (v) => action(p, v),
+                              itemBuilder: (_) => [
+                                for (final s in const [
+                                  'available',
+                                  'reserved',
+                                  'sold',
+                                ])
+                                  PopupMenuItem(value: s, child: Text(s)),
+                                const PopupMenuDivider(),
+                                const PopupMenuItem(
+                                  value: 'delete',
+                                  child: Text('ลบ'),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
                 ),
-                title: Text(
-                  '${p['title'] ?? ''}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                subtitle: Text(
-                  '${p['status']} • ${p['currency']} ${p['price']}\nOwner: ${p['owner_id']}',
-                ),
-                isThreeLine: true,
-                onTap: () => details(p),
-                trailing: PopupMenuButton<String>(
-                  onSelected: (v) => action(p, v),
-                  itemBuilder: (_) => [
-                    for (final s in const ['available', 'reserved', 'sold'])
-                      PopupMenuItem(value: s, child: Text(s)),
-                    const PopupMenuDivider(),
-                    const PopupMenuItem(value: 'delete', child: Text('ลบ')),
-                  ],
-                ),
-              );
-            },
-          ),
         ),
       ],
     );
@@ -1466,10 +1976,18 @@ class _ListingsState extends State<_Listings> {
     }).toList();
     return Column(
       children: [
-        _Search(
-          onChanged: (value) => setState(() => query = value),
-          hint: 'ค้นหาชื่อร้านหรือสินค้า',
+        AdminPageTitle(
+          title: 'สินค้าในร้าน',
+          description: 'ดูสินค้าที่เผยแพร่ภายใต้แต่ละร้านค้า',
         ),
+        AdminFilterBar(
+          search: _Search(
+            onChanged: (value) => setState(() => query = value),
+            hint: 'ค้นหาชื่อร้านหรือสินค้า',
+          ),
+          onClear: query.isEmpty ? null : () => setState(() => query = ''),
+        ),
+        const SizedBox(height: 16),
         Expanded(
           child: ListView.builder(
             itemCount: groups.length,
@@ -1515,7 +2033,7 @@ class _ListingsState extends State<_Listings> {
         child: ListView.separated(
           shrinkWrap: true,
           itemCount: products.length,
-          separatorBuilder: (_, __) => const Divider(),
+          separatorBuilder: (_, _) => const Divider(),
           itemBuilder: (_, index) {
             final product = products[index];
             return ListTile(
@@ -1592,12 +2110,14 @@ class _ListingsState extends State<_Listings> {
     },
   );
   Future<void> action(Map<String, dynamic> p, String value) async {
-    if (value == 'delete' && !await _confirm(context, 'ลบรายการนี้ถาวร?'))
+    if (value == 'delete' && !await _confirm(context, 'ลบรายการนี้ถาวร?')) {
       return;
-    if (value == 'delete')
+    }
+    if (value == 'delete') {
       await SuikaiService.admin.deleteListing('${p['id']}');
-    else
+    } else {
       await SuikaiService.admin.setListingStatus('${p['id']}', value);
+    }
     await widget.changed();
   }
 }
@@ -1619,46 +2139,73 @@ class _StoresState extends State<_Stores> {
         .toList();
     return Column(
       children: [
-        _Search(
-          onChanged: (v) => setState(() => query = v),
-          hint: 'ค้นหาร้าน เจ้าของ หรือหมวดหมู่',
+        AdminPageTitle(
+          title: 'ร้านค้าทั้งหมด',
+          description: 'ตรวจสอบข้อมูลร้าน สถานะ และการโปรโมต',
         ),
-        Expanded(
-          child: ListView.builder(
-            itemCount: rows.length,
-            itemBuilder: (_, i) {
-              final s = rows[i];
-              return ListTile(
-                leading: _StoreLogo(store: s),
-                title: Text(
-                  '${s['name']}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                subtitle: Text(
-                  '${s['status']} • ${s['category']} • Promote: ${s['is_promoted'] == true ? 'ON' : 'OFF'}\nOwner: ${s['owner_id']}',
-                ),
-                isThreeLine: true,
-                onTap: () => details(s),
-                trailing: PopupMenuButton<String>(
-                  onSelected: (v) => action(s, v),
-                  itemBuilder: (_) =>
-                      [
-                            s['is_promoted'] == true
-                                ? 'promote_off'
-                                : 'promote_on',
-                            'approved',
-                            'pending',
-                            'rejected',
-                            'hidden',
-                            'delete',
-                          ]
-                          .map((v) => PopupMenuItem(value: v, child: Text(v)))
-                          .toList(),
-                ),
-              );
-            },
+        AdminFilterBar(
+          search: _Search(
+            onChanged: (v) => setState(() => query = v),
+            hint: 'ค้นหาร้าน เจ้าของ หรือหมวดหมู่',
           ),
+          onClear: query.isEmpty ? null : () => setState(() => query = ''),
+        ),
+        const SizedBox(height: 16),
+        Expanded(
+          child: rows.isEmpty
+              ? const AdminEmptyState(
+                  title: 'ไม่พบร้านค้า',
+                  message: 'ยังไม่มีร้านที่ตรงกับคำค้นหา',
+                )
+              : ListView.separated(
+                  itemCount: rows.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 8),
+                  itemBuilder: (_, i) {
+                    final s = rows[i];
+                    return Card(
+                      child: ListTile(
+                        leading: _StoreLogo(store: s),
+                        title: Text(
+                          '${s['name']}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: Text(
+                          '${s['category']} • เจ้าของ: ${s['owner_id']}',
+                        ),
+                        isThreeLine: true,
+                        onTap: () => details(s),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            AdminStatusChip(status: '${s['status'] ?? ''}'),
+                            PopupMenuButton<String>(
+                              onSelected: (v) => action(s, v),
+                              itemBuilder: (_) =>
+                                  [
+                                        s['is_promoted'] == true
+                                            ? 'promote_off'
+                                            : 'promote_on',
+                                        'approved',
+                                        'pending',
+                                        'rejected',
+                                        'hidden',
+                                        'delete',
+                                      ]
+                                      .map(
+                                        (v) => PopupMenuItem(
+                                          value: v,
+                                          child: Text(v),
+                                        ),
+                                      )
+                                      .toList(),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
         ),
       ],
     );
@@ -1733,12 +2280,14 @@ class _StoresState extends State<_Stores> {
       return;
     }
     if (v == 'delete' &&
-        !await _confirm(context, 'ลบร้านและสินค้าในร้านทั้งหมด?'))
+        !await _confirm(context, 'ลบร้านและสินค้าในร้านทั้งหมด?')) {
       return;
-    if (v == 'delete')
+    }
+    if (v == 'delete') {
       await SuikaiService.admin.deleteStore('${s['id']}');
-    else
+    } else {
       await SuikaiService.admin.setStoreStatus('${s['id']}', v);
+    }
     await widget.changed();
   }
 }
@@ -1878,18 +2427,9 @@ class _StoreRequests extends StatelessWidget {
     ],
   );
 
-  bool _isApplication(Map<String, dynamic> store) =>
-      const {'pending', 'approved', 'rejected'}.contains(store['status']);
-
   List<Map<String, dynamic>> get _applications =>
-      stores.where(_isApplication).toList()..sort((a, b) {
-        final pending = (b['status'] == 'pending' ? 1 : 0).compareTo(
-          a['status'] == 'pending' ? 1 : 0,
-        );
-        return pending != 0
-            ? pending
-            : '${b['created_at']}'.compareTo('${a['created_at']}');
-      });
+      stores.where((store) => store['status'] == 'pending').toList()
+        ..sort((a, b) => '${b['created_at']}'.compareTo('${a['created_at']}'));
 
   String _category(Map<String, dynamic> store) {
     final value = '${store['category_id'] ?? store['category'] ?? ''}';
@@ -2056,29 +2596,63 @@ class _Reports extends StatelessWidget {
   final Future<void> Function() changed;
   const _Reports({required this.rows, required this.changed});
   @override
-  Widget build(BuildContext context) => ListView.builder(
-    itemCount: rows.length,
-    itemBuilder: (_, i) {
-      final r = rows[i];
-      return CheckboxListTile(
-        value: r['reviewed'] == true,
-        onChanged: (v) async {
-          await SuikaiService.admin.reviewReport('${r['id']}', v ?? false);
-          await changed();
-        },
-        title: Text('${r['reason']}'),
-        subtitle: Text('${r['type']} • ${r['target_id']}\n${r['created_at']}'),
-        isThreeLine: true,
-        secondary: IconButton(
-          icon: const Icon(Icons.open_in_new_rounded),
-          onPressed: () => Navigator.pushNamed(
-            context,
-            r['type'] == 'store' ? '/store-detail' : '/product-detail',
-            arguments: r['target_id'],
-          ),
+  Widget build(BuildContext context) => Column(
+    children: [
+      AdminPageTitle(
+        title: 'รายงาน',
+        description:
+            'ตรวจสอบรายงานจากผู้ใช้งานและทำเครื่องหมายเมื่อดำเนินการแล้ว',
+        action: IconButton(
+          tooltip: 'รีเฟรชรายงาน',
+          onPressed: changed,
+          icon: const Icon(Icons.refresh_rounded),
         ),
-      );
-    },
+      ),
+      Expanded(
+        child: rows.isEmpty
+            ? const AdminEmptyState(
+                icon: Icons.flag_outlined,
+                title: 'ไม่มีรายงานที่ต้องตรวจ',
+                message: 'ขณะนี้ไม่มีรายงานจากผู้ใช้งาน',
+              )
+            : ListView.separated(
+                itemCount: rows.length,
+                separatorBuilder: (_, _) => const SizedBox(height: 8),
+                itemBuilder: (_, i) {
+                  final r = rows[i];
+                  return Card(
+                    child: CheckboxListTile(
+                      value: r['reviewed'] == true,
+                      onChanged: (v) async {
+                        await SuikaiService.admin.reviewReport(
+                          '${r['id']}',
+                          v ?? false,
+                        );
+                        await changed();
+                      },
+                      title: Text('${r['reason']}'),
+                      subtitle: Text(
+                        '${r['type']} • ${r['target_id']}\n${r['created_at']}',
+                      ),
+                      isThreeLine: true,
+                      secondary: r['type'] == 'user'
+                          ? const Icon(Icons.person_outline_rounded)
+                          : IconButton(
+                              icon: const Icon(Icons.open_in_new_rounded),
+                              onPressed: () => Navigator.pushNamed(
+                                context,
+                                r['type'] == 'store'
+                                    ? '/store-detail'
+                                    : '/product-detail',
+                                arguments: r['target_id'],
+                              ),
+                            ),
+                    ),
+                  );
+                },
+              ),
+      ),
+    ],
   );
 }
 
@@ -2179,7 +2753,7 @@ class _CategoryList extends StatelessWidget {
       body: ListView.separated(
         padding: const EdgeInsets.fromLTRB(12, 12, 12, 88),
         itemCount: values.length,
-        separatorBuilder: (_, __) => const Divider(height: 1),
+        separatorBuilder: (_, _) => const Divider(height: 1),
         itemBuilder: (context, index) {
           final category = values[index];
           final details = Column(
@@ -2485,14 +3059,11 @@ class _Search extends StatelessWidget {
   final String hint;
   const _Search({required this.onChanged, required this.hint});
   @override
-  Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.all(16),
-    child: TextField(
-      onChanged: onChanged,
-      decoration: InputDecoration(
-        prefixIcon: const Icon(Icons.search),
-        hintText: hint,
-      ),
+  Widget build(BuildContext context) => TextField(
+    onChanged: onChanged,
+    decoration: InputDecoration(
+      prefixIcon: const Icon(Icons.search_rounded),
+      hintText: hint,
     ),
   );
 }
@@ -2507,7 +3078,7 @@ class _ProfileAvatar extends StatelessWidget {
     final url = '${user['avatar_url'] ?? user['avatar'] ?? ''}'.trim();
     return CircleAvatar(
       backgroundImage: url.isEmpty ? null : NetworkImage(url),
-      onBackgroundImageError: url.isEmpty ? null : (_, __) {},
+      onBackgroundImageError: url.isEmpty ? null : (_, _) {},
       child: url.isEmpty
           ? Text(name.isEmpty ? '?' : name.characters.first)
           : null,
@@ -2607,7 +3178,10 @@ class _LegacyListingImage extends StatelessWidget {
     if (url.isEmpty) {
       return ColoredBox(
         color: AppTheme.orangeSoft,
-        child: Icon(Icons.image_not_supported_outlined, size: compact ? 24 : 48),
+        child: Icon(
+          Icons.image_not_supported_outlined,
+          size: compact ? 24 : 48,
+        ),
       );
     }
     return Image.network(url, fit: BoxFit.cover);
