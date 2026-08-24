@@ -53,6 +53,10 @@ class AdminShell extends StatelessWidget {
   final int notificationCount;
   final int pendingStores;
   final int pendingReports;
+  final bool isBusy;
+  final String? statusMessage;
+  final String? errorMessage;
+  final VoidCallback? onDismissError;
   final Widget child;
   const AdminShell({
     super.key,
@@ -63,25 +67,67 @@ class AdminShell extends StatelessWidget {
     required this.notificationCount,
     this.pendingStores = 0,
     this.pendingReports = 0,
+    this.isBusy = false,
+    this.statusMessage,
+    this.errorMessage,
+    this.onDismissError,
     required this.child,
   });
 
   List<AdminDestination> get _destinations => [
-    const AdminDestination('ภาพรวม', Icons.dashboard_outlined, AdminSection.dashboard),
-    const AdminDestination('Analytics', Icons.insights_outlined, AdminSection.analytics),
-    const AdminDestination('ผู้ใช้งาน', Icons.people_outline_rounded, AdminSection.users),
+    const AdminDestination(
+      'ภาพรวม',
+      Icons.dashboard_outlined,
+      AdminSection.dashboard,
+    ),
+    const AdminDestination(
+      'Analytics',
+      Icons.insights_outlined,
+      AdminSection.analytics,
+    ),
+    const AdminDestination(
+      'ผู้ใช้งาน',
+      Icons.people_outline_rounded,
+      AdminSection.users,
+    ),
     AdminDestination(
       'ประกาศสินค้า',
       Icons.sell_outlined,
       AdminSection.listings,
       badgeCount: notificationCount,
     ),
-    const AdminDestination('ร้านค้าทั้งหมด', Icons.storefront_outlined, AdminSection.stores),
-    const AdminDestination('สินค้าในร้าน', Icons.inventory_2_outlined, AdminSection.storeProducts),
-    AdminDestination('รายงาน', Icons.flag_outlined, AdminSection.reports, badgeCount: pendingReports),
-    AdminDestination('ร้านรออนุมัติ', Icons.fact_check_outlined, AdminSection.storeApprovals, badgeCount: pendingStores),
-    const AdminDestination('หมวดหมู่', Icons.category_outlined, AdminSection.categories),
-    const AdminDestination('วิดีโอสั้น', Icons.smart_display_outlined, AdminSection.shortVideos),
+    const AdminDestination(
+      'ร้านค้าทั้งหมด',
+      Icons.storefront_outlined,
+      AdminSection.stores,
+    ),
+    const AdminDestination(
+      'สินค้าในร้าน',
+      Icons.inventory_2_outlined,
+      AdminSection.storeProducts,
+    ),
+    AdminDestination(
+      'รายงาน',
+      Icons.flag_outlined,
+      AdminSection.reports,
+      badgeCount: pendingReports,
+    ),
+    AdminDestination(
+      'ร้านรออนุมัติ',
+      Icons.fact_check_outlined,
+      AdminSection.storeApprovals,
+      badgeCount: pendingStores,
+    ),
+    const AdminDestination(
+      'หมวดหมู่',
+      Icons.category_outlined,
+      AdminSection.categories,
+    ),
+    const AdminDestination(
+      'วิดีโอสั้น',
+      Icons.smart_display_outlined,
+      AdminSection.shortVideos,
+    ),
     const AdminDestination('โฆษณา', Icons.campaign_outlined, AdminSection.ads),
     const AdminDestination('แผนที่', Icons.map_outlined, AdminSection.map),
   ];
@@ -115,7 +161,18 @@ class AdminShell extends StatelessWidget {
         top: false,
         child: Padding(
           padding: EdgeInsets.all(compact ? AdminTokens.lg : AdminTokens.xl),
-          child: child,
+          child: Column(
+            children: [
+              if (isBusy || errorMessage != null)
+                _AdminOperationStatus(
+                  isBusy: isBusy,
+                  message: errorMessage ?? statusMessage ?? 'กำลังดำเนินการ...',
+                  isError: errorMessage != null,
+                  onDismissError: onDismissError,
+                ),
+              Expanded(child: child),
+            ],
+          ),
         ),
       ),
     );
@@ -133,6 +190,50 @@ class AdminShell extends StatelessWidget {
         const VerticalDivider(width: 1),
         Expanded(child: body),
       ],
+    );
+  }
+}
+
+class _AdminOperationStatus extends StatelessWidget {
+  final bool isBusy, isError;
+  final String message;
+  final VoidCallback? onDismissError;
+  const _AdminOperationStatus({
+    required this.isBusy,
+    required this.isError,
+    required this.message,
+    this.onDismissError,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final color = isError
+        ? Theme.of(context).colorScheme.error
+        : AppTheme.orange;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: AdminTokens.md),
+      child: Material(
+        color: color.withValues(alpha: .10),
+        borderRadius: BorderRadius.circular(AdminTokens.sm),
+        child: ListTile(
+          dense: true,
+          leading: isError
+              ? Icon(Icons.error_outline_rounded, color: color)
+              : const SizedBox(
+                  height: 20,
+                  width: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+          title: Text(message, style: TextStyle(color: color)),
+          trailing: isError
+              ? IconButton(
+                  tooltip: 'ปิดข้อความ',
+                  onPressed: onDismissError,
+                  icon: const Icon(Icons.close_rounded),
+                )
+              : null,
+        ),
+      ),
     );
   }
 }

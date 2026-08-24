@@ -152,6 +152,7 @@ class _AdminPanelState extends State<_AdminPanel>
   final Map<int, bool> _hasMore = {};
   late final TabController _tabs;
   bool summaryLoading = true;
+  String? _loadError;
 
   @override
   void initState() {
@@ -267,7 +268,10 @@ class _AdminPanelState extends State<_AdminPanel>
         _loadingTabs.contains(index)) {
       return;
     }
-    setState(() => _loadingTabs.add(index));
+    setState(() {
+      _loadError = null;
+      _loadingTabs.add(index);
+    });
     try {
       switch (index) {
         case 10:
@@ -391,6 +395,11 @@ class _AdminPanelState extends State<_AdminPanel>
           ];
       }
       _loadedTabs.add(index);
+    } catch (error, stackTrace) {
+      debugPrint('Admin tab $index failed to load: $error\n$stackTrace');
+      if (mounted) {
+        setState(() => _loadError = 'โหลดข้อมูลไม่สำเร็จ: $error');
+      }
     } finally {
       if (mounted) setState(() => _loadingTabs.remove(index));
     }
@@ -473,6 +482,14 @@ class _AdminPanelState extends State<_AdminPanel>
         .length,
     pendingStores: summary['pending_stores'] ?? 0,
     pendingReports: summary['pending_reports'] ?? 0,
+    isBusy: summaryLoading || _loadingTabs.isNotEmpty,
+    statusMessage: summaryLoading
+        ? 'กำลังโหลดข้อมูลภาพรวม... กรุณารอ'
+        : 'กำลังโหลดข้อมูลเมนูนี้... กรุณารอ',
+    errorMessage: _loadError,
+    onDismissError: _loadError == null
+        ? null
+        : () => setState(() => _loadError = null),
     child: TabBarView(
       controller: _tabs,
       children: [
@@ -525,6 +542,7 @@ class _AdminPanelState extends State<_AdminPanel>
             stores: stores,
             listings: listings,
             categories: categories,
+            isLoading: _loadingTabs.contains(9),
             changed: () => _reloadTab(9),
           ),
         ),
@@ -826,18 +844,41 @@ String _shortVideoDate(DateTime value) {
   return '${two(local.day)}/${two(local.month)}/${local.year}';
 }
 
-class _Advertisements extends StatelessWidget {
+class _Advertisements extends StatefulWidget {
   final List<AdvertisementRecord> rows;
   final List<Map<String, dynamic>> stores, listings;
   final List<CategoryRecord> categories;
+  final bool isLoading;
   final Future<void> Function() changed;
   const _Advertisements({
     required this.rows,
     required this.stores,
     required this.listings,
     required this.categories,
+    required this.isLoading,
     required this.changed,
   });
+
+  @override
+  State<_Advertisements> createState() => _AdvertisementsState();
+}
+
+class _AdvertisementsState extends State<_Advertisements> {
+  bool _saving = false;
+  String? _error;
+
+  Future<void> _runMutation(Future<void> Function() action) async {
+    if (_saving) return;
+    setState(() => _saving = true);
+    try {
+      await action();
+    } catch (error, stackTrace) {
+      debugPrint('Advertisement update failed: $error\n$stackTrace');
+      if (mounted) setState(() => _error = 'บันทึกโฆษณาไม่สำเร็จ: $error');
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
 
   Future<void> _edit(
     BuildContext context, [
@@ -847,65 +888,80 @@ class _Advertisements extends StatelessWidget {
       context: context,
       builder: (_) => _AdvertisementDialog(
         current: current,
-        stores: stores,
-        listings: listings,
-        categories: categories,
+        stores: widget.stores,
+        listings: widget.listings,
+        categories: widget.categories,
       ),
     );
     if (value == null) return;
-    await SuikaiService.saveAdvertisement(value, create: current == null);
-    await changed();
+    await _runMutation(() async {
+      await SuikaiService.saveAdvertisement(value, create: current == null);
+      await widget.changed();
+    });
   }
 
   Future<void> _toggle(AdvertisementRecord value, bool active) async {
-    await SuikaiService.saveAdvertisement(
-      AdvertisementRecord(
-        id: value.id,
-        title: value.title,
-        imageUrl: value.imageUrl,
-        targetType: value.targetType,
-        targetId: value.targetId,
-        externalUrl: value.externalUrl,
-        startAt: value.startAt,
-        endAt: value.endAt,
-        displayOrder: value.displayOrder,
-        isActive: active,
-        createdAt: value.createdAt,
-        updatedAt: DateTime.now(),
-      ),
-      create: false,
-    );
-    await changed();
+    await _runMutation(() async {
+      await SuikaiService.saveAdvertisement(
+        AdvertisementRecord(
+          id: value.id,
+          title: value.title,
+          imageUrl: value.imageUrl,
+          targetType: value.targetType,
+          targetId: value.targetId,
+          externalUrl: value.externalUrl,
+          startAt: value.startAt,
+          endAt: value.endAt,
+          displayOrder: value.displayOrder,
+          isActive: active,
+          createdAt: value.createdAt,
+          updatedAt: DateTime.now(),
+        ),
+        create: false,
+      );
+      await widget.changed();
+    });
   }
 
   Future<void> _delete(BuildContext context, AdvertisementRecord value) async {
     if (!await _confirm(context, 'ลบโฆษณา “${value.title}” หรือไม่?')) return;
-    await SuikaiService.deleteAdvertisement(value.id);
-    await changed();
+    await _runMutation(() async {
+      await SuikaiService.deleteAdvertisement(value.id);
+      await widget.changed();
+    });
   }
 
   @override
   Widget build(BuildContext context) => Column(
     children: [
+      if (widget.isLoading || _saving || _error != null)
+        _AdvertisementStatus(
+          loading: widget.isLoading,
+          saving: _saving,
+          error: _error,
+          onDismissError: _error == null
+              ? null
+              : () => setState(() => _error = null),
+        ),
       Padding(
         padding: const EdgeInsets.all(16),
         child: Align(
           alignment: Alignment.centerRight,
           child: ElevatedButton.icon(
-            onPressed: () => _edit(context),
+            onPressed: _saving ? null : () => _edit(context),
             icon: const Icon(Icons.add_rounded),
             label: const Text('เพิ่มโฆษณา'),
           ),
         ),
       ),
       Expanded(
-        child: rows.isEmpty
+        child: widget.rows.isEmpty
             ? const Center(child: Text('ยังไม่มีโฆษณา'))
             : ListView.separated(
-                itemCount: rows.length,
+                itemCount: widget.rows.length,
                 separatorBuilder: (_, _) => const Divider(height: 1),
                 itemBuilder: (context, index) {
-                  final value = rows[index];
+                  final value = widget.rows[index];
                   return ListTile(
                     leading: ClipRRect(
                       borderRadius: BorderRadius.circular(8),
@@ -930,16 +986,22 @@ class _Advertisements extends StatelessWidget {
                       children: [
                         Switch(
                           value: value.isActive,
-                          onChanged: (active) => _toggle(value, active),
+                          onChanged: _saving
+                              ? null
+                              : (active) => _toggle(value, active),
                         ),
                         IconButton(
                           tooltip: 'แก้ไข',
-                          onPressed: () => _edit(context, value),
+                          onPressed: _saving
+                              ? null
+                              : () => _edit(context, value),
                           icon: const Icon(Icons.edit_outlined),
                         ),
                         IconButton(
                           tooltip: 'ลบ',
-                          onPressed: () => _delete(context, value),
+                          onPressed: _saving
+                              ? null
+                              : () => _delete(context, value),
                           icon: const Icon(Icons.delete_outline_rounded),
                         ),
                       ],
@@ -950,6 +1012,52 @@ class _Advertisements extends StatelessWidget {
       ),
     ],
   );
+}
+
+class _AdvertisementStatus extends StatelessWidget {
+  final bool loading, saving;
+  final String? error;
+  final VoidCallback? onDismissError;
+  const _AdvertisementStatus({
+    required this.loading,
+    required this.saving,
+    required this.error,
+    this.onDismissError,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final isError = error != null;
+    final text = isError
+        ? error!
+        : saving
+        ? 'กำลังบันทึกโฆษณา...'
+        : 'กำลังโหลดโฆษณา...';
+    final color = isError
+        ? Theme.of(context).colorScheme.error
+        : AppTheme.orange;
+    return Material(
+      color: color.withValues(alpha: 0.10),
+      child: ListTile(
+        dense: true,
+        leading: isError
+            ? Icon(Icons.error_outline_rounded, color: color)
+            : const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+        title: Text(text, style: TextStyle(color: color)),
+        trailing: isError
+            ? IconButton(
+                tooltip: 'ปิดข้อความ',
+                onPressed: onDismissError,
+                icon: const Icon(Icons.close_rounded),
+              )
+            : null,
+      ),
+    );
+  }
 }
 
 class _AdvertisementDialog extends StatefulWidget {
@@ -976,6 +1084,7 @@ class _AdvertisementDialogState extends State<_AdvertisementDialog> {
   late bool active;
   SelectedImage? selectedImage;
   bool saving = false;
+  String? errorMessage;
 
   @override
   void initState() {
@@ -1069,14 +1178,32 @@ class _AdvertisementDialogState extends State<_AdvertisementDialog> {
 
   Future<void> _save() async {
     if (!formKey.currentState!.validate()) return;
-    if (targetType != 'external' && targetId == null) return;
-    if (startAt != null && endAt != null && endAt!.isBefore(startAt!)) return;
-    setState(() => saving = true);
+    if (selectedImage == null && widget.current?.imageUrl.isEmpty != false) {
+      setState(() => errorMessage = 'กรุณาเลือกรูป Banner');
+      return;
+    }
+    if (targetType != 'external' && targetId == null) {
+      setState(() => errorMessage = 'กรุณาเลือกปลายทางโฆษณา');
+      return;
+    }
+    if (startAt != null && endAt != null && endAt!.isBefore(startAt!)) {
+      setState(() => errorMessage = 'วันสิ้นสุดต้องไม่ก่อนวันเริ่มต้น');
+      return;
+    }
+    setState(() {
+      saving = true;
+      errorMessage = null;
+    });
     try {
       final imageUrl = selectedImage == null
           ? widget.current?.imageUrl ?? ''
           : await SuikaiService.uploadAdvertisementImage(selectedImage!);
-      if (imageUrl.isEmpty) return;
+      if (imageUrl.isEmpty) {
+        if (mounted) {
+          setState(() => errorMessage = 'อัปโหลดรูป Banner ไม่สำเร็จ');
+        }
+        return;
+      }
       final now = DateTime.now();
       if (!mounted) return;
       Navigator.pop(
@@ -1096,6 +1223,11 @@ class _AdvertisementDialogState extends State<_AdvertisementDialog> {
           updatedAt: now,
         ),
       );
+    } catch (error, stackTrace) {
+      debugPrint('Advertisement image upload failed: $error\n$stackTrace');
+      if (mounted) {
+        setState(() => errorMessage = 'อัปโหลดรูป Banner ไม่สำเร็จ: $error');
+      }
     } finally {
       if (mounted) setState(() => saving = false);
     }
@@ -1130,10 +1262,20 @@ class _AdvertisementDialogState extends State<_AdvertisementDialog> {
                 ),
               ),
               TextButton.icon(
-                onPressed: _pickImage,
+                onPressed: saving ? null : _pickImage,
                 icon: const Icon(Icons.upload_outlined),
                 label: const Text('เลือกรูป Banner'),
               ),
+              if (errorMessage != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: Text(
+                    errorMessage!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ),
               TextFormField(
                 controller: title,
                 decoration: const InputDecoration(

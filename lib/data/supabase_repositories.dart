@@ -1128,14 +1128,15 @@ class SupabaseAdvertisementRepository implements AdvertisementRepository {
     'image_url': value.imageUrl,
     'target_type': value.targetType,
     'target_id': value.targetId,
-    'external_url': value.externalUrl,
+    // `target_url` is supported by both the original and current banners
+    // schema. Sending deprecated aliases (`active`, `sort_order`) or the
+    // optional `external_url` column makes inserts fail against deployments
+    // that use the current baseline schema.
     'target_url': value.externalUrl,
     'start_at': value.startAt?.toUtc().toIso8601String(),
     'end_at': value.endAt?.toUtc().toIso8601String(),
     'display_order': value.displayOrder,
-    'sort_order': value.displayOrder,
     'is_active': value.isActive,
-    'active': value.isActive,
   };
 
   @override
