@@ -1543,7 +1543,19 @@ class SupabaseAdminRepository implements AdminRepository {
       'store_products': values[2],
       'stores': values[3],
       'reports': values[4],
+      'pending_stores': values[5],
+      'pending_reports': values[6],
     };
+  }
+
+  @override
+  Future<Map<String, dynamic>> analytics(String period) async {
+    _guard();
+    final value = await _timed(
+      'analytics.$period',
+      () => client.rpc('admin_analytics', params: {'p_period': period}),
+    );
+    return _json(value);
   }
 
   @override
