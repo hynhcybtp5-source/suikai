@@ -612,6 +612,36 @@ class InMemoryAdminRepository implements AdminRepository {
       'stores': TestDatabase.stores.length,
       'store_products': rows.where((e) => e['store_id'] != null).length,
       'reports': TestDatabase.reports.length,
+      'pending_stores': TestDatabase.stores.values
+          .map(_map)
+          .where((row) => row['status'] == 'pending')
+          .length,
+      'pending_reports': TestDatabase.reports.values
+          .map(_map)
+          .where((row) => row['workflow_status'] == 'pending')
+          .length,
+    };
+  }
+
+  @override
+  Future<Map<String, dynamic>> analytics(String period) async {
+    _guard();
+    return {
+      'period': period,
+      'users_total': TestDatabase.users.length,
+      'users_new': 0,
+      'stores_total': TestDatabase.stores.length,
+      'stores_new': 0,
+      'stores_pending': 0,
+      'listings_total': TestDatabase.listings.length,
+      'listings_new': 0,
+      'sold_total': 0,
+      'views_total': 0,
+      'likes_total': 0,
+      'categories': const [],
+      'cities': const [],
+      'stores_top': const [],
+      'listings_top': const [],
     };
   }
 

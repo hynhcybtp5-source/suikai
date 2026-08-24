@@ -1522,6 +1522,20 @@ class SupabaseAdminRepository implements AdminRepository {
         'summary.reports',
         () => client.from('reports').count(CountOption.exact),
       ),
+      _timed(
+        'summary.pending_stores',
+        () => client
+            .from('stores')
+            .count(CountOption.exact)
+            .eq('status', 'pending'),
+      ),
+      _timed(
+        'summary.pending_reports',
+        () => client
+            .from('reports')
+            .count(CountOption.exact)
+            .eq('workflow_status', 'pending'),
+      ),
     ]);
     return {
       'users': values[0],

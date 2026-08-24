@@ -138,6 +138,7 @@ abstract interface class AdminRepository {
   Future<bool> login(String email, String password);
   Future<void> logout();
   Future<Map<String, int>> summary();
+  Future<Map<String, dynamic>> analytics(String period);
   Future<List<Map<String, dynamic>>> users({int page = 0, int pageSize = 50});
   Future<List<Map<String, dynamic>>> listings({
     int page = 0,
