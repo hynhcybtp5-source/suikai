@@ -8,12 +8,9 @@ import 'l10n/app_localizations.dart';
 import 'l10n/mobile_localizations.dart';
 import 'core/locale_controller.dart';
 import 'core/app_route_observer.dart';
-import 'core/telegram_callback_uri.dart';
 import 'core/theme/app_theme.dart';
 import 'data/supabase_repositories.dart';
 import 'features/home/home_page.dart';
-import 'features/startup/network_blocked_screen.dart';
-import 'features/demo/screenshot_demo.dart';
 import 'services/suikai_service.dart';
 
 final _navigatorKey = GlobalKey<NavigatorState>();
@@ -21,7 +18,7 @@ final _telegramLoginLoading = ValueNotifier(false);
 bool _telegramCallbackInProgress = false;
 
 Future<void> _completeTelegramCallback(Uri uri) async {
-  if (!kIsWeb && !isTelegramOAuthCallbackUri(uri)) return;
+  if (uri.scheme != 'suikai' && !kIsWeb) return;
   debugPrint(
     'CALLBACK RECEIVED hasCode=${uri.queryParameters['code']?.isNotEmpty == true} '
     'hasError=${uri.queryParameters['error']?.isNotEmpty == true}',
@@ -68,17 +65,15 @@ Future<void> main() async {
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     AndroidCamera.registerWith();
   }
-  await localeController.load();
-  // This local presentation build bypasses all services and is compiled only
-  // when explicitly requested for Google Play screenshot capture.
-  if (screenshotDemoMode) {
-    runApp(const ScreenshotDemoApp());
+  debugPrint('MAIN 1 start');
+  try {
+    await SuikaiService.initialize();
+  } catch (error, stackTrace) {
+    debugPrint('Suikai startup failed: $error');
+    debugPrintStack(stackTrace: stackTrace);
+    runApp(const _StartupErrorApp());
     return;
   }
-  runApp(const SuikaiBootstrapApp());
-}
-
-Future<void> _completeStartup() async {
   // Telegram redirects to the app root, which normally builds HomePage rather
   // than LoginPage. Consume the OAuth callback before building routes so the
   // token_hash is exchanged for a persisted Supabase session on every return.
@@ -104,95 +99,9 @@ Future<void> _completeStartup() async {
       },
     );
   }
-  await _openSharedProductIfNeeded();
-}
-
-enum _BootstrapState { starting, ready, networkBlocked, failed }
-
-class SuikaiBootstrapApp extends StatefulWidget {
-  const SuikaiBootstrapApp({
-    super.key,
-    this.initializeService,
-    this.afterInitialize,
-    this.readyBuilder,
-  });
-
-  final Future<void> Function()? initializeService;
-  final Future<void> Function()? afterInitialize;
-  final WidgetBuilder? readyBuilder;
-
-  @override
-  State<SuikaiBootstrapApp> createState() => _SuikaiBootstrapAppState();
-}
-
-class _SuikaiBootstrapAppState extends State<SuikaiBootstrapApp> {
-  _BootstrapState _state = _BootstrapState.starting;
-
-  @override
-  void initState() {
-    super.initState();
-    _bootstrap();
-  }
-
-  Future<void> _bootstrap() async {
-    if (mounted) setState(() => _state = _BootstrapState.starting);
-    try {
-      await (widget.initializeService ?? SuikaiService.initialize)();
-      await (widget.afterInitialize ?? _completeStartup)();
-      if (mounted) setState(() => _state = _BootstrapState.ready);
-    } on SupabaseEndpointsUnreachableException {
-      if (mounted) setState(() => _state = _BootstrapState.networkBlocked);
-    } catch (error, stackTrace) {
-      debugPrint('Suikai startup failed: $error');
-      debugPrintStack(stackTrace: stackTrace);
-      if (mounted) setState(() => _state = _BootstrapState.failed);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) => switch (_state) {
-    _BootstrapState.ready =>
-      widget.readyBuilder?.call(context) ?? const SuikaiApp(),
-    _BootstrapState.networkBlocked => _NetworkBlockedApp(onRetry: _bootstrap),
-    _BootstrapState.failed => const _StartupErrorApp(),
-    _BootstrapState.starting => const _StartupLoadingApp(),
-  };
-}
-
-class _StartupLoadingApp extends StatelessWidget {
-  const _StartupLoadingApp();
-
-  @override
-  Widget build(BuildContext context) => const MaterialApp(
-    home: Scaffold(body: Center(child: CircularProgressIndicator())),
-  );
-}
-
-class _NetworkBlockedApp extends StatelessWidget {
-  const _NetworkBlockedApp({required this.onRetry});
-
-  final Future<void> Function() onRetry;
-
-  @override
-  Widget build(BuildContext context) => ListenableBuilder(
-    listenable: localeController,
-    builder: (context, _) => MaterialApp(
-      debugShowCheckedModeBanner: false,
-      theme: AppTheme.light,
-      locale: localeController.locale,
-      supportedLocales: AppLocalizations.supportedLocales,
-      localizationsDelegates: const [
-        ...AppLocalizations.localizationsDelegates,
-        ShanMaterialLocalizationsDelegate(),
-        ShanWidgetsLocalizationsDelegate(),
-        ShanCupertinoLocalizationsDelegate(),
-      ],
-      home: NetworkBlockedScreen(onRetry: onRetry),
-    ),
-  );
-}
-
-Future<void> _openSharedProductIfNeeded() async {
+  debugPrint('MAIN 2 service initialized');
+  debugPrint('MAIN 3 before runApp');
+  runApp(const SuikaiApp());
   final sharedProductId = kIsWeb ? Uri.base.queryParameters['product'] : null;
   if (sharedProductId != null && sharedProductId.isNotEmpty) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -202,6 +111,7 @@ Future<void> _openSharedProductIfNeeded() async {
       );
     });
   }
+  debugPrint('MAIN 4 runApp called');
 }
 
 class _StartupErrorApp extends StatelessWidget {
@@ -246,25 +156,10 @@ class SuikaiApp extends StatelessWidget {
 
   String get _initialRoute {
     if (!kIsWeb) return SuikaiRoutes.home;
-    if (Uri.base.queryParameters['screen'] == 'admin' ||
-        Uri.base.path == SuikaiRoutes.admin ||
-        Uri.base.fragment == SuikaiRoutes.admin) {
-      return SuikaiRoutes.admin;
-    }
-
-    // Keep legal pages accessible as public Flutter Web URLs. Hash routes work
-    // on static hosting without server-side rewrite rules; a path route works
-    // too when the host is configured to serve Flutter's index.html.
-    final requestedPath = Uri.base.fragment.isNotEmpty
-        ? Uri.base.fragment
-        : Uri.base.path;
-    const publicLegalRoutes = {
-      SuikaiRoutes.privacy,
-      SuikaiRoutes.terms,
-      SuikaiRoutes.communityGuidelines,
-    };
-    return publicLegalRoutes.contains(requestedPath)
-        ? requestedPath
+    return Uri.base.queryParameters['screen'] == 'admin' ||
+            Uri.base.path == SuikaiRoutes.admin ||
+            Uri.base.fragment == SuikaiRoutes.admin
+        ? SuikaiRoutes.admin
         : SuikaiRoutes.home;
   }
 
