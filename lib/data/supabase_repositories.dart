@@ -1426,6 +1426,9 @@ class SupabaseAdminRepository implements AdminRepository {
           // Admin deletion is a soft delete. Keep deleted listings out of the
           // management lists too, so the dashboard immediately matches the
           // public app after a successful delete.
+          // Some existing deployments only mark `is_hidden` in the moderation
+          // RPC, so this must remain part of the filter as well.
+          .eq('is_hidden', false)
           .isFilter('deleted_at', null)
           .order('created_at', ascending: false)
           .range(page * pageSize, (page + 1) * pageSize - 1),

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart' as fmap;
 import 'package:latlong2/latlong.dart';
 import 'package:uuid/uuid.dart';
+import 'package:video_player/video_player.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/category_icons.dart';
 import '../../data/models.dart';
@@ -1999,12 +2000,14 @@ class _Listings extends StatefulWidget {
 
 class _ListingsState extends State<_Listings> {
   String query = '', filter = 'all';
+  final Set<String> _deletedIds = <String>{};
   @override
   Widget build(BuildContext context) {
     if (widget.storeProducts) return _buildStoreGroups(context);
     final rows = widget.rows
         .where(
           (e) =>
+              !_deletedIds.contains('${e['id']}') &&
               (filter == 'all' || e['status'] == filter) &&
               '$e'.toLowerCase().contains(query.toLowerCase()),
         )
@@ -2257,6 +2260,7 @@ class _ListingsState extends State<_Listings> {
     }
     if (value == 'delete') {
       await SuikaiService.admin.deleteListing('${p['id']}');
+      if (mounted) setState(() => _deletedIds.add('${p['id']}'));
     } else {
       await SuikaiService.admin.setListingStatus('${p['id']}', value);
     }
@@ -3289,21 +3293,112 @@ class _VideoThumb extends StatelessWidget {
   }
 }
 
-class _AdminVideoPreview extends StatelessWidget {
+class _AdminVideoPreview extends StatefulWidget {
   final dynamic video;
   final dynamic images;
   const _AdminVideoPreview({required this.video, this.images});
+
+  @override
+  State<_AdminVideoPreview> createState() => _AdminVideoPreviewState();
+}
+
+class _AdminVideoPreviewState extends State<_AdminVideoPreview> {
+  VideoPlayerController? _controller;
+  Object? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    final record = widget.video is Map
+        ? ListingVideoRecord.fromJson(
+            Map<String, dynamic>.from(widget.video as Map),
+          )
+        : null;
+    if (record != null) _load(record);
+  }
+
+  Future<void> _load(ListingVideoRecord record) async {
+    try {
+      final controller = VideoPlayerController.networkUrl(
+        Uri.parse(await SuikaiService.signedVideoUrl(record)),
+      );
+      await controller.initialize();
+      await controller.setLooping(true);
+      if (!mounted) {
+        await controller.dispose();
+        return;
+      }
+      setState(() => _controller = controller);
+    } catch (error) {
+      if (mounted) setState(() => _error = error);
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
-    final record = video is Map
-        ? ListingVideoRecord.fromJson(Map<String, dynamic>.from(video as Map))
+    final record = widget.video is Map
+        ? ListingVideoRecord.fromJson(
+            Map<String, dynamic>.from(widget.video as Map),
+          )
         : null;
-    if (record == null) return _LegacyListingImage(images: images);
-    return FutureBuilder<String>(
-      future: SuikaiService.signedThumbnailUrl(record),
-      builder: (_, snapshot) => snapshot.hasData
-          ? Image.network(snapshot.data!, fit: BoxFit.contain)
-          : const Center(child: Icon(Icons.videocam_outlined, size: 48)),
+    if (record == null) return _LegacyListingImage(images: widget.images);
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) {
+      return Center(
+        child: _error == null
+            ? const CircularProgressIndicator()
+            : const Icon(Icons.video_file_outlined, size: 48),
+      );
+    }
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        AspectRatio(
+          aspectRatio: controller.value.aspectRatio,
+          child: VideoPlayer(controller),
+        ),
+        Positioned.fill(
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
+              onTap: () => setState(() {
+                controller.value.isPlaying
+                    ? controller.pause()
+                    : controller.play();
+              }),
+              child: Center(
+                child: Icon(
+                  controller.value.isPlaying
+                      ? Icons.pause_circle_filled_rounded
+                      : Icons.play_circle_fill_rounded,
+                  size: 52,
+                  color: Colors.white.withValues(alpha: .88),
+                ),
+              ),
+            ),
+          ),
+        ),
+        Positioned(
+          left: 8,
+          right: 8,
+          bottom: 2,
+          child: VideoProgressIndicator(
+            controller,
+            allowScrubbing: true,
+            colors: const VideoProgressColors(
+              playedColor: AppTheme.orange,
+              bufferedColor: Colors.white54,
+              backgroundColor: Colors.white24,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
