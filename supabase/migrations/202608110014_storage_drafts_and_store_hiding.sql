@@ -1,5 +1,4 @@
 begin;
-
 alter policy "owners upload listing media"
 on storage.objects
 with check (
@@ -19,7 +18,6 @@ with check (
     )
   )
 );
-
 alter policy "owners upload store media"
 on storage.objects
 with check (
@@ -39,7 +37,6 @@ with check (
     )
   )
 );
-
 create or replace function public.admin_set_store_status(
   p_store_id uuid,
   p_status text
@@ -87,10 +84,8 @@ begin
   if not found then raise exception 'Store not found or invalid status'; end if;
 end;
 $$;
-
 revoke execute on function public.admin_set_store_status(uuid, text)
 from public, anon;
 grant execute on function public.admin_set_store_status(uuid, text)
 to authenticated, service_role;
-
 commit;

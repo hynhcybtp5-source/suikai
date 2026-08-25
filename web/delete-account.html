@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Delete your Suikai account</title>
+    <style>
+      body { font-family: system-ui, sans-serif; line-height: 1.55; margin: 0; color: #27211f; background: #fff8f4; }
+      main { max-width: 720px; margin: 40px auto; padding: 28px; background: white; border-radius: 16px; box-shadow: 0 4px 20px #0001; }
+      h1 { color: #d74a10; } h2 { margin-top: 28px; font-size: 1.1rem; } li { margin: 6px 0; }
+      .notice { padding: 12px 14px; border-left: 4px solid #d74a10; background: #fff0e8; }
+    </style>
+    <script src="delete-account-config.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>Delete your Suikai account</h1>
+      <p>The fastest way is in the Suikai app: <strong>Profile → Edit profile → Delete account</strong>. Confirm the deletion when prompted.</p>
+      <h2>Unable to access the app?</h2>
+      <p>Use the monitored support channel below to request deletion. Include the email address or phone number used for the account and the profile display name. We verify account ownership before acting on a web request.</p>
+      <h2>Data deleted</h2>
+      <ul>
+        <li>Your account and profile information.</li>
+        <li>Shops, listings, photos, and videos you own.</li>
+        <li>Account-linked likes, notifications, blocks, reports, and related requests.</li>
+      </ul>
+      <h2>Data that may be retained</h2>
+      <p>De-identified view or security information, and information required for legal, fraud-prevention, or security purposes, may be retained only as necessary.</p>
+      <h2>Timing</h2>
+      <p>In-app deletion is processed when the service is available. Support requests are processed after ownership verification; we do not promise a fixed period that cannot be guaranteed.</p>
+      <p id="support" class="notice">Loading support contact…</p>
+    </main>
+    <script>
+      const configuredEmail = window.SUIKAI_LEGAL_CONFIG && window.SUIKAI_LEGAL_CONFIG.supportEmail;
+      const isUsableEmail = typeof configuredEmail === 'string'
+        && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(configuredEmail.trim())
+        && !/(example\.|your[-_]email|placeholder|todo)/i.test(configuredEmail);
+      const support = document.getElementById('support');
+      if (isUsableEmail) {
+        const address = configuredEmail.trim();
+        const link = document.createElement('a');
+        link.href = `mailto:${address}`;
+        link.textContent = address;
+        support.textContent = 'Contact support: ';
+        support.appendChild(link);
+      } else {
+        support.textContent = 'Contact Suikai support at suikai.app@gmail.com.';
+      }
+    </script>
+  </body>
+</html>

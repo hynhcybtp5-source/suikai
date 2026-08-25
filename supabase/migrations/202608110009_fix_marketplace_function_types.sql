@@ -1,5 +1,4 @@
 begin;
-
 create or replace function public.review_store_application(
   p_store_id uuid,
   p_approved boolean,
@@ -52,7 +51,6 @@ begin
   );
 end;
 $$;
-
 create or replace function public.review_store_edit_request(
   p_request_id uuid,
   p_approved boolean,
@@ -148,7 +146,6 @@ begin
   );
 end;
 $$;
-
 create or replace function public.review_promotion_request(
   p_request_id uuid,
   p_approved boolean,
@@ -207,7 +204,6 @@ begin
   );
 end;
 $$;
-
 create or replace function public.toggle_listing_like(
   p_listing_id uuid,
   p_device_id text
@@ -247,7 +243,6 @@ begin
   return true;
 end;
 $$;
-
 create or replace function public.record_listing_view(
   p_listing_id uuid,
   p_device_id text default null
@@ -275,13 +270,11 @@ begin
   on conflict (listing_id, view_key) where view_key is not null do nothing;
 end;
 $$;
-
 revoke all on function public.review_store_application(uuid, boolean, text) from public;
 revoke all on function public.review_store_edit_request(uuid, boolean, text) from public;
 revoke all on function public.review_promotion_request(uuid, boolean, text) from public;
 revoke all on function public.toggle_listing_like(uuid, text) from public;
 revoke all on function public.record_listing_view(uuid, text) from public;
-
 grant execute on function public.review_store_application(uuid, boolean, text)
 to authenticated, service_role;
 grant execute on function public.review_store_edit_request(uuid, boolean, text)
@@ -292,5 +285,4 @@ grant execute on function public.toggle_listing_like(uuid, text)
 to anon, authenticated, service_role;
 grant execute on function public.record_listing_view(uuid, text)
 to anon, authenticated, service_role;
-
 commit;

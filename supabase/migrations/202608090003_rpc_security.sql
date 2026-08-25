@@ -1,5 +1,4 @@
 begin;
-
 -- =========================================================
 -- 1. ปิดการ DELETE Like โดยตรง
 --    การยกเลิก Like จะทำผ่าน RPC เท่านั้น
@@ -7,8 +6,6 @@ begin;
 
 drop policy if exists "public remove own device like"
 on public.listing_likes;
-
-
 -- =========================================================
 -- 2. RPC: Toggle Like
 --    device เดียวกดสินค้าเดียวได้เพียง 1 Like
@@ -75,8 +72,6 @@ begin
 
 end;
 $$;
-
-
 -- =========================================================
 -- 3. RPC: นับ Like
 -- =========================================================
@@ -94,8 +89,6 @@ as $$
   from public.listing_likes
   where listing_id = p_listing_id;
 $$;
-
-
 -- =========================================================
 -- 4. RPC: บันทึก View
 -- =========================================================
@@ -132,8 +125,6 @@ begin
 
 end;
 $$;
-
-
 -- =========================================================
 -- 5. RPC: จำนวน View
 -- =========================================================
@@ -151,14 +142,11 @@ as $$
   from public.listing_views
   where listing_id = p_listing_id;
 $$;
-
-
 -- =========================================================
 -- 6. ปรับ View สถิติให้ใช้ RLS ของผู้เรียก
 -- =========================================================
 
 drop view if exists public.listing_stats;
-
 create view public.listing_stats
 with (security_invoker = true)
 as
@@ -178,8 +166,6 @@ select
   ) as view_count
 
 from public.listings l;
-
-
 -- =========================================================
 -- 7. สิทธิ์ RPC
 -- =========================================================
@@ -187,34 +173,25 @@ from public.listings l;
 revoke all
 on function public.toggle_listing_like(uuid, text)
 from public;
-
 revoke all
 on function public.record_listing_view(uuid, text)
 from public;
-
 revoke all
 on function public.get_listing_like_count(uuid)
 from public;
-
 revoke all
 on function public.get_listing_view_count(uuid)
 from public;
-
-
 grant execute
 on function public.toggle_listing_like(uuid, text)
 to anon, authenticated;
-
 grant execute
 on function public.record_listing_view(uuid, text)
 to anon, authenticated;
-
 grant execute
 on function public.get_listing_like_count(uuid)
 to anon, authenticated;
-
 grant execute
 on function public.get_listing_view_count(uuid)
 to anon, authenticated;
-
 commit;

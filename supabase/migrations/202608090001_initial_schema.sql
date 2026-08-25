@@ -1,40 +1,33 @@
 begin;
-
 create extension if not exists "pgcrypto";
-
 create type public.listing_type as enum (
   'general',
   'store'
 );
-
 create type public.listing_status as enum (
   'available',
   'reserved',
   'sold',
   'out_of_stock'
 );
-
 create type public.store_status as enum (
   'pending',
   'approved',
   'rejected',
   'suspended'
 );
-
 create type public.report_status as enum (
   'open',
   'reviewing',
   'resolved',
   'dismissed'
 );
-
 create table public.admin_profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   display_name text,
   phone text,
   created_at timestamptz not null default now()
 );
-
 create table public.stores (
   id uuid primary key default gen_random_uuid(),
   owner_id uuid not null references auth.users(id) on delete cascade,
@@ -62,7 +55,6 @@ create table public.stores (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
-
 create table public.listings (
   id uuid primary key default gen_random_uuid(),
 
@@ -99,7 +91,6 @@ create table public.listings (
     (listing_type = 'store' and store_id is not null)
   )
 );
-
 create table public.listing_images (
   id uuid primary key default gen_random_uuid(),
 
@@ -113,7 +104,6 @@ create table public.listing_images (
 
   created_at timestamptz not null default now()
 );
-
 create table public.listing_likes (
   id uuid primary key default gen_random_uuid(),
 
@@ -127,7 +117,6 @@ create table public.listing_likes (
 
   unique (listing_id, device_id)
 );
-
 create table public.listing_views (
   id uuid primary key default gen_random_uuid(),
 
@@ -139,7 +128,6 @@ create table public.listing_views (
 
   created_at timestamptz not null default now()
 );
-
 create table public.reports (
   id uuid primary key default gen_random_uuid(),
 
@@ -168,46 +156,32 @@ create table public.reports (
     or store_id is not null
   )
 );
-
 create index idx_stores_owner_id
   on public.stores(owner_id);
-
 create index idx_stores_status
   on public.stores(status);
-
 create index idx_stores_city
   on public.stores(city);
-
 create index idx_listings_owner_id
   on public.listings(owner_id);
-
 create index idx_listings_store_id
   on public.listings(store_id);
-
 create index idx_listings_type
   on public.listings(listing_type);
-
 create index idx_listings_status
   on public.listings(status);
-
 create index idx_listings_city
   on public.listings(city);
-
 create index idx_listings_price
   on public.listings(price);
-
 create index idx_listing_images_listing_id
   on public.listing_images(listing_id);
-
 create index idx_listing_likes_listing_id
   on public.listing_likes(listing_id);
-
 create index idx_listing_views_listing_id
   on public.listing_views(listing_id);
-
 create index idx_reports_status
   on public.reports(status);
-
 create or replace function public.set_updated_at()
 returns trigger
 language plpgsql
@@ -217,17 +191,14 @@ begin
   return new;
 end;
 $$;
-
 create trigger stores_set_updated_at
 before update on public.stores
 for each row
 execute function public.set_updated_at();
-
 create trigger listings_set_updated_at
 before update on public.listings
 for each row
 execute function public.set_updated_at();
-
 create or replace function public.enforce_store_listing_publish()
 returns trigger
 language plpgsql
@@ -258,13 +229,11 @@ begin
   return new;
 end;
 $$;
-
 create trigger listings_publish_rules
 before insert or update
 on public.listings
 for each row
 execute function public.enforce_store_listing_publish();
-
 create or replace view public.listing_stats
 as
 select
@@ -283,6 +252,4 @@ left join public.listing_views vw
   on vw.listing_id = l.id
 
 group by l.id;
-
 commit;
-

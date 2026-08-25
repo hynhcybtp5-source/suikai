@@ -28,9 +28,12 @@
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>com.suikai.suikai</string>
+				<string>suikai</string>
 			</array>
 		</dict>
 	</array>
+	<key>FlutterDeepLinkingEnabled</key>
+	<false/>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>

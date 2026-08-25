@@ -1,14 +1,10 @@
 begin;
-
 alter table public.profiles
   add column if not exists city_id uuid references public.cities(id) on delete set null;
-
 alter table public.stores
   add column if not exists city_id uuid references public.cities(id) on delete set null;
-
 create index if not exists profiles_city_id_idx on public.profiles(city_id);
 create index if not exists stores_city_id_idx on public.stores(city_id);
-
 create or replace function public.handle_new_auth_user_profile()
 returns trigger
 language plpgsql
@@ -45,7 +41,6 @@ begin
   return new;
 end;
 $$;
-
 create or replace function public.get_public_stores()
 returns jsonb
 language sql
@@ -92,9 +87,7 @@ as $$
     and s.is_hidden = false
     and s.deleted_at is null;
 $$;
-
 revoke all on function public.get_public_stores() from public;
 grant execute on function public.get_public_stores()
 to anon, authenticated, service_role;
-
 commit;

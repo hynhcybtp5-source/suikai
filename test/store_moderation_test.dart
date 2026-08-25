@@ -50,7 +50,11 @@ void main() {
     TestDatabase.adminNotifications = await Hive.openBox('admin_notifications');
     TestDatabase.notifications = await Hive.openBox('notifications');
     TestDatabase.shortVideos = await Hive.openBox('short_videos');
-    SuikaiService.auth = InMemoryAuthRepository();
+    final auth = InMemoryAuthRepository();
+    SuikaiService.auth = auth;
+    SuikaiService.legalConsents = InMemoryLegalConsentRepository(
+      () => auth.currentUserId,
+    );
     SuikaiService.profiles = InMemoryProfileRepository();
     SuikaiService.listings = InMemoryListingRepository();
     SuikaiService.stores = InMemoryStoreRepository();
@@ -63,6 +67,7 @@ void main() {
     SuikaiService.advertisements = InMemoryAdvertisementRepository();
     SuikaiService.storage = InMemoryStorageService();
     SuikaiService.admin = InMemoryAdminRepository();
+    SuikaiService.deviceId = 'test-device-id';
   });
 
   tearDownAll(() async {
@@ -77,6 +82,7 @@ void main() {
       email: 'video-required@suikai.local',
       password: 'password123',
       city: '',
+      acceptedUgcTerms: true,
     );
     await SuikaiService.login(profile.email, 'password123');
     await expectLater(
@@ -99,6 +105,72 @@ void main() {
       ),
     );
   });
+
+  test(
+    'UGC publishing requires the current server-backed legal acceptance',
+    () async {
+      await expectLater(
+        SuikaiService.register(
+          name: 'Missing consent',
+          phone: '',
+          email: 'missing-consent@suikai.local',
+          password: 'password123',
+          city: 'Muang Nge',
+          acceptedUgcTerms: false,
+        ),
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            'ugc_legal_acceptance_required',
+          ),
+        ),
+      );
+
+      final profile = await SuikaiService.register(
+        name: 'Legal consent user',
+        phone: '0910000001',
+        email: 'legal-consent@suikai.local',
+        password: 'password123',
+        city: 'Muang Nge',
+        acceptedUgcTerms: true,
+      );
+      await SuikaiService.login(profile.email, 'password123');
+      final consent =
+          SuikaiService.legalConsents as InMemoryLegalConsentRepository;
+      await consent.clearCurrentAcceptance();
+
+      await expectLater(
+        SuikaiService.createListing(
+          title: 'Blocked until accepted',
+          description: '',
+          category: 'listing_mobile',
+          city: 'Muang Nge',
+          phone: profile.phone,
+          viber: '',
+          price: 1,
+          currency: 'MMK',
+          listingType: 'general',
+          video: _selectedVideo(),
+        ),
+        throwsA(isA<UgcLegalAcceptanceRequired>()),
+      );
+
+      expect(
+        await SuikaiService.fetchListings(),
+        isA<List<Map<String, dynamic>>>(),
+      );
+      await SuikaiService.acceptCurrentUgcLegalTerms();
+      expect(await SuikaiService.hasAcceptedCurrentUgcLegalTerms(), isTrue);
+      expect(
+        await SuikaiService.legalConsents.hasAccepted(
+          termsVersion: '2.0',
+          communityGuidelinesVersion: '1.0',
+        ),
+        isFalse,
+      );
+    },
+  );
 
   test('store changes and promotion require admin approval', () async {
     final storeRepository = InMemoryStoreRepository();
@@ -246,6 +318,7 @@ void main() {
       email: 'owner@suikai.local',
       password: 'password123',
       city: 'Test City',
+      acceptedUgcTerms: true,
     );
     await SuikaiService.login(profile.email, 'password123');
     final createdAt = DateTime(2026, 4);
@@ -335,6 +408,7 @@ void main() {
         email: 'general-city@suikai.local',
         password: 'password123',
         city: 'Profile City',
+        acceptedUgcTerms: true,
       );
       await SuikaiService.login(profile.email, 'password123');
 
@@ -370,6 +444,7 @@ void main() {
       email: 'store-contact-owner@suikai.local',
       password: 'password123',
       city: 'เมืองนาง',
+      acceptedUgcTerms: true,
     );
     await SuikaiService.login(profile.email, 'password123');
     const storeId = 'store-contact-source';
@@ -477,6 +552,7 @@ void main() {
         email: 'status-owner@suikai.test',
         password: 'password123',
         city: '',
+        acceptedUgcTerms: true,
       );
       await SuikaiService.login(profile.email, 'password123');
       const video = ListingVideoRecord(
@@ -676,6 +752,84 @@ void main() {
     expect((await repository.get(profile.id))?.avatar, isEmpty);
   });
 
+  test('account deletion only deletes the authenticated account', () async {
+    final userA = await SuikaiService.register(
+      name: 'Delete A',
+      phone: '',
+      email: 'delete-a@suikai.local',
+      password: 'password123',
+      city: 'เมืองนาง',
+      acceptedUgcTerms: true,
+    );
+    final userB = await SuikaiService.register(
+      name: 'Keep B',
+      phone: '',
+      email: 'keep-b@suikai.local',
+      password: 'password123',
+      city: 'เมืองนาง',
+      acceptedUgcTerms: true,
+    );
+
+    await SuikaiService.logout();
+    await expectLater(
+      SuikaiService.deleteOwnAccount(),
+      throwsA(isA<StateError>()),
+    );
+
+    await SuikaiService.login(userA.email, 'password123');
+    await SuikaiService.deleteOwnAccount();
+
+    expect(TestDatabase.users.containsKey(userA.id), isFalse);
+    expect(TestDatabase.users.containsKey(userB.id), isTrue);
+    expect(SuikaiService.currentUserId, isNull);
+  });
+
+  test(
+    'listing reports retain their target and blocked sellers can be unblocked',
+    () async {
+      final seller = await SuikaiService.register(
+        name: 'Blocked seller',
+        phone: '',
+        email: 'blocked-seller@suikai.local',
+        password: 'password123',
+        city: 'เมืองนาง',
+        acceptedUgcTerms: true,
+      );
+      final reporter = await SuikaiService.register(
+        name: 'Reporter',
+        phone: '',
+        email: 'reporter@suikai.local',
+        password: 'password123',
+        city: 'เมืองนาง',
+        acceptedUgcTerms: true,
+      );
+      await SuikaiService.login(reporter.email, 'password123');
+
+      await SuikaiService.submitReport(
+        reason: 'ข้อมูลไม่ถูกต้อง',
+        details: '',
+        listingId: 'listing-to-report',
+      );
+      final report = Map<String, dynamic>.from(
+        TestDatabase.reports.values.last as Map,
+      );
+      expect(report['type'], 'listing');
+      expect(report['target_id'], 'listing-to-report');
+      expect(report['device_id'], 'test-device-id');
+
+      expect(await SuikaiService.blockSeller(seller.id), isTrue);
+      expect(
+        (await SuikaiService.getBlockedUsers()).map((user) => user.id),
+        contains(seller.id),
+      );
+      await SuikaiService.unblockUser(seller.id);
+      expect(
+        (await SuikaiService.getBlockedUsers()).map((user) => user.id),
+        isNot(contains(seller.id)),
+      );
+    },
+  );
+
   test('logout clears only session and preserves Hive data', () async {
     final profile = await SuikaiService.register(
       name: 'Logout Owner',
@@ -683,6 +837,7 @@ void main() {
       email: 'logout@suikai.local',
       password: 'password123',
       city: 'Test City',
+      acceptedUgcTerms: true,
     );
     await SuikaiService.login(profile.email, 'password123');
     final usersBefore = TestDatabase.users.length;

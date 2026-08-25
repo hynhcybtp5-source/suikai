@@ -1,6 +1,4 @@
 import 'dart:io';
-import 'package:ffmpeg_kit_flutter_new_min_gpl/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new_min_gpl/return_code.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
@@ -13,7 +11,9 @@ import 'package:uuid/uuid.dart';
 import '../data/models.dart';
 import '../data/repositories.dart';
 import '../data/supabase_repositories.dart';
+import '../core/legal_versions.dart';
 import 'video_post_processor.dart';
+import 'video_watermark_processor.dart';
 
 class SelectedImage {
   final XFile file;
@@ -58,9 +58,17 @@ class LocationFailure implements Exception {
   String toString() => 'LocationFailure($reason, cause: $cause)';
 }
 
+class UgcLegalAcceptanceRequired implements Exception {
+  const UgcLegalAcceptanceRequired();
+
+  @override
+  String toString() => 'ugc_legal_acceptance_required';
+}
+
 class SuikaiService {
   static late AuthRepository auth;
   static late ProfileRepository profiles;
+  static late LegalConsentRepository legalConsents;
   static late ListingRepository listings;
   static late StoreRepository stores;
   static late StoreRequestRepository storeRequests;
@@ -104,6 +112,7 @@ class SuikaiService {
       final client = SupabaseBackend.client;
       auth = SupabaseAuthRepository(client);
       profiles = SupabaseProfileRepository(client);
+      legalConsents = SupabaseLegalConsentRepository(client);
       listings = SupabaseListingRepository(client);
       stores = SupabaseStoreRepository(client);
       storeRequests = SupabaseStoreRequestRepository(client);
@@ -273,19 +282,49 @@ class SuikaiService {
     required String email,
     required String password,
     required String city,
+    required bool acceptedUgcTerms,
   }) => auth.register(
     name: name,
     phone: phone,
     email: email,
     password: password,
     city: city.trim(),
+    acceptedUgcTerms: acceptedUgcTerms,
   );
+
+  static Future<bool> hasAcceptedCurrentUgcLegalTerms() {
+    if (currentUserId == null) return Future.value(false);
+    return legalConsents.hasAccepted(
+      termsVersion: LegalVersions.termsOfService,
+      communityGuidelinesVersion: LegalVersions.communityGuidelines,
+    );
+  }
+
+  static Future<void> acceptCurrentUgcLegalTerms() => legalConsents.accept(
+    termsVersion: LegalVersions.termsOfService,
+    communityGuidelinesVersion: LegalVersions.communityGuidelines,
+  );
+
+  static Future<void> requireCurrentUgcLegalTerms() async {
+    _requireUser();
+    if (!await hasAcceptedCurrentUgcLegalTerms()) {
+      throw const UgcLegalAcceptanceRequired();
+    }
+  }
+
   static Future<UserProfile> login(String email, String password) =>
       auth.login(email, password);
   static Future<void> loginWithTelegram() => auth.loginWithTelegram();
   static Future<void> logout() => auth.logout();
+  static Future<void> deleteOwnAccount() => auth.deleteOwnAccount();
   static Future<UserProfile?> currentProfile() =>
       currentUserId == null ? Future.value(null) : profiles.get(currentUserId!);
+  static Future<bool> blockSeller(String sellerId) =>
+      profiles.blockSeller(sellerId);
+  static Future<List<UserProfile>> getBlockedUsers() =>
+      profiles.getBlockedUsers();
+  static Future<void> unblockUser(String sellerId) =>
+      profiles.unblockUser(sellerId);
 
   static String _normalizePhone(String? value) =>
       (value ?? '').trim().replaceAll(RegExp(r'[^0-9+]'), '');
@@ -351,7 +390,7 @@ class SuikaiService {
         expiresInSeconds: 5 * 60,
       );
   static Future<UserProfile> updateProfile(UserProfile profile) =>
-      profiles.save(profile);
+      requireCurrentUgcLegalTerms().then((_) => profiles.save(profile));
 
   static Future<List<ShortVideoRecord>> fetchActiveShortVideos() =>
       shortVideos.active();
@@ -366,8 +405,8 @@ class SuikaiService {
     required bool create,
   }) {
     if (!admin.isAuthenticated) throw StateError('admin_required');
-    if (!ShortVideoRecord.isValidTikTokUrl(value.tiktokUrl)) {
-      throw const FormatException('invalid_tiktok_url');
+    if (!ShortVideoRecord.isValidYouTubeUrl(value.youtubeUrl)) {
+      throw const FormatException('invalid_youtube_url');
     }
     return create ? shortVideos.create(value) : shortVideos.update(value);
   }
@@ -460,44 +499,12 @@ class SuikaiService {
       () => _downloadVideoForShare(video),
     );
     final logo = await _shareWatermarkLogoFile();
-    final command = [
-      '-y',
-      '-i',
-      source.path,
-      '-loop',
-      '1',
-      '-i',
-      logo.path,
-      '-filter_complex',
-      '[1:v][0:v]scale2ref=w=iw*0.08:h=ow/mdar[watermark][base];'
-          '[watermark]setsar=1,format=rgba,'
-          'colorchannelmixer=aa=0.33[watermarkAlpha];'
-          '[base][watermarkAlpha]overlay='
-          'x=main_w-overlay_w-main_w*0.03:y=main_w*0.03:format=auto[output]',
-      '-map',
-      '[output]',
-      '-map',
-      '0:a?',
-      '-c:v',
-      'libx264',
-      '-preset',
-      'veryfast',
-      '-crf',
-      '20',
-      '-pix_fmt',
-      'yuv420p',
-      '-c:a',
-      'copy',
-      '-movflags',
-      '+faststart',
-      '-shortest',
-      output.path,
-    ];
-    final session = await FFmpegKit.executeWithArguments(command);
-    final returnCode = await session.getReturnCode();
-    if (!ReturnCode.isSuccess(returnCode) ||
-        !await output.exists() ||
-        await output.length() == 0) {
+    await VideoWatermarkProcessor.apply(
+      sourcePath: source.path,
+      logoPath: logo.path,
+      outputPath: output.path,
+    );
+    if (!await output.exists() || await output.length() == 0) {
       if (await output.exists()) await output.delete();
       throw StateError('video_watermark_failed');
     }
@@ -600,6 +607,7 @@ class SuikaiService {
     List<SelectedImage> images, {
     String? listingId,
   }) async {
+    await requireCurrentUgcLegalTerms();
     final prefix = listingId == null ? null : 'listings/$listingId';
     return Future.wait(
       images.map(
@@ -628,6 +636,7 @@ class SuikaiService {
     required String phone,
     required String viber,
     required double price,
+    double? originalPrice,
     required String currency,
     required String listingType,
     String? storeId,
@@ -640,8 +649,19 @@ class SuikaiService {
     bool isLocationVisible = true,
   }) async {
     final ownerId = _requireUser();
+    await requireCurrentUgcLegalTerms();
     if (title.trim().isEmpty || category.trim().isEmpty || price < 0) {
       throw StateError('listing_required_fields_missing');
+    }
+    // Reject an invalid video-only listing before checking optional profile
+    // completion, giving callers a stable and actionable validation result.
+    if (video == null) throw StateError('listing_video_required');
+    // Existing clients and listings did not have an original price. Keep that
+    // flow compatible while validating a discount whenever it is provided.
+    if (listingType == 'general' &&
+        originalPrice != null &&
+        originalPrice < price) {
+      throw StateError('listing_original_price_invalid');
     }
     final normalizedStatus = status;
     var listingPhone = phone;
@@ -700,6 +720,7 @@ class SuikaiService {
       description: description,
       category: category,
       price: price,
+      originalPrice: originalPrice,
       currency: currency,
       city: city?.trim() ?? '',
       cityId: cityId,
@@ -736,6 +757,7 @@ class SuikaiService {
     required String phone,
     required String viber,
     required double price,
+    double? originalPrice,
     required String currency,
     required String status,
     String? category,
@@ -747,6 +769,7 @@ class SuikaiService {
     bool? isLocationVisible,
   }) async {
     try {
+      await requireCurrentUgcLegalTerms();
       final all = await listings.all();
       final old = all.where((e) => e.id == listingId).firstOrNull;
       if (old == null) throw StateError('not_found');
@@ -776,6 +799,7 @@ class SuikaiService {
           description: description,
           category: category ?? old.category,
           price: price,
+          originalPrice: originalPrice ?? old.originalPrice,
           currency: currency,
           city: city,
           cityId: cityId ?? old.cityId,
@@ -858,6 +882,7 @@ class SuikaiService {
     if (city.trim().isEmpty) throw StateError('store_city_required');
     final id = const Uuid().v4();
     final ownerId = _requireUser();
+    await requireCurrentUgcLegalTerms();
     final logoPath = await storage.persistImage(
       logo.file.path,
       logo.extension,
@@ -902,6 +927,7 @@ class SuikaiService {
     SelectedImage? logo,
     SelectedImage? cover,
   }) async {
+    await requireCurrentUgcLegalTerms();
     final all = await stores.all();
     final old = all.where((e) => e.id == storeId).firstOrNull;
     if (old == null) throw StateError('not_found');
@@ -952,6 +978,7 @@ class SuikaiService {
     SelectedImage? cover,
   }) async {
     final ownerId = _requireUser();
+    await requireCurrentUgcLegalTerms();
     final proposed = Map<String, dynamic>.from(values);
     if (logo != null) {
       proposed['logo_url'] = await storage.persistImage(
@@ -1014,8 +1041,11 @@ class SuikaiService {
           .where((e) => e.ownerId == currentUserId)
           .map((e) => e.toJson())
           .toList();
-  static Future<List<Map<String, dynamic>>> fetchListings() async =>
-      (await listings.publicListings())
+  static Future<List<Map<String, dynamic>>> fetchListings({
+    double? latitude,
+    double? longitude,
+  }) async =>
+      (await listings.publicListings(latitude: latitude, longitude: longitude))
           .where((e) => e.status != 'deleted' && e.status != 'hidden')
           .map(_listingMap)
           .toList();
@@ -1064,15 +1094,34 @@ class SuikaiService {
     required String details,
     String? listingId,
     String? storeId,
-  }) => reports.create(
-    ReportRecord(
-      id: const Uuid().v4(),
-      reason: details.trim().isEmpty ? reason : '$reason: ${details.trim()}',
-      targetId: listingId ?? storeId ?? '',
-      type: listingId == null ? 'store' : 'listing',
-      createdAt: DateTime.now(),
-    ),
-  );
+    String? userId,
+  }) async {
+    final targets = [
+      listingId,
+      storeId,
+      userId,
+    ].whereType<String>().where((value) => value.trim().isNotEmpty).toList();
+    if (targets.length != 1) throw StateError('report_target_required');
+    final cleanReason = reason.trim();
+    if (cleanReason.isEmpty) throw StateError('report_reason_required');
+    await reports.create(
+      ReportRecord(
+        id: const Uuid().v4(),
+        reason: details.trim().isEmpty
+            ? cleanReason
+            : '$cleanReason: ${details.trim()}',
+        targetId: targets.single,
+        type: listingId != null
+            ? 'listing'
+            : storeId != null
+            ? 'store'
+            : 'user',
+        deviceId: deviceId,
+        createdAt: DateTime.now(),
+      ),
+    );
+  }
+
   static Future<List<NotificationRecord>> fetchNotifications() =>
       isLoggedIn ? notifications.all() : Future.value(const []);
   static Future<int> unreadNotificationCount() =>

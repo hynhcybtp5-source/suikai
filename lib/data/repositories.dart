@@ -9,22 +9,42 @@ abstract interface class AuthRepository {
     required String email,
     required String password,
     required String city,
+    required bool acceptedUgcTerms,
   });
   Future<UserProfile> login(String email, String password);
   Future<void> loginWithTelegram();
   Future<void> completeTelegramWebLogin();
   Future<void> syncCurrentProfile();
   Future<void> logout();
+  Future<void> deleteOwnAccount();
 }
 
 abstract interface class ProfileRepository {
   Future<UserProfile?> get(String id);
   Future<UserProfile> save(UserProfile profile);
+  Future<bool> blockSeller(String sellerId);
+  Future<List<UserProfile>> getBlockedUsers();
+  Future<void> unblockUser(String sellerId);
+}
+
+abstract interface class LegalConsentRepository {
+  Future<bool> hasAccepted({
+    required String termsVersion,
+    required String communityGuidelinesVersion,
+  });
+
+  Future<void> accept({
+    required String termsVersion,
+    required String communityGuidelinesVersion,
+  });
 }
 
 abstract interface class ListingRepository {
   Future<List<ListingRecord>> all();
-  Future<List<ListingRecord>> publicListings();
+  Future<List<ListingRecord>> publicListings({
+    double? latitude,
+    double? longitude,
+  });
   Future<ListingRecord> create(ListingRecord value);
   Future<void> update(ListingRecord value);
   Future<void> updateStatus({

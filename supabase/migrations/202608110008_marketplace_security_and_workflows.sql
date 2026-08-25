@@ -1,5 +1,4 @@
 begin;
-
 -- Canonical helpers use the new active admin role. The legacy helper remains
 -- as a compatibility wrapper because migrations 0002 and 0005 reference it.
 create or replace function public.is_admin()
@@ -11,10 +10,8 @@ set search_path = ''
 as $$
   select public.is_active_admin();
 $$;
-
 revoke all on function public.is_admin() from public;
 grant execute on function public.is_admin() to anon, authenticated, service_role;
-
 create or replace function public.is_active_user()
 returns boolean
 language sql
@@ -29,11 +26,9 @@ as $$
       and p.status = 'active'
   );
 $$;
-
 revoke all on function public.is_active_user() from public;
 grant execute on function public.is_active_user()
 to authenticated, service_role;
-
 create or replace function public.is_listing_public(p_listing_id uuid)
 returns boolean
 language sql
@@ -65,11 +60,9 @@ as $$
       )
   );
 $$;
-
 revoke all on function public.is_listing_public(uuid) from public;
 grant execute on function public.is_listing_public(uuid)
 to anon, authenticated, service_role;
-
 -- Keep both legacy and canonical store statuses consistent. Owners submit
 -- requests; only an active admin may change approval-controlled fields.
 create or replace function public.guard_store_admin_fields()
@@ -92,9 +85,7 @@ begin
   return new;
 end;
 $$;
-
 revoke all on function public.guard_store_admin_fields() from public;
-
 create or replace function public.enforce_store_listing_publish()
 returns trigger
 language plpgsql
@@ -140,7 +131,6 @@ begin
   return new;
 end;
 $$;
-
 create or replace function public.publish_store_listings_after_approval()
 returns trigger
 language plpgsql
@@ -164,7 +154,6 @@ begin
   return new;
 end;
 $$;
-
 -- Harden existing policies. ALTER POLICY avoids dropping schema objects.
 alter policy "public read approved stores"
 on public.stores
@@ -177,7 +166,6 @@ using (
   or owner_id = (select auth.uid())
   or public.is_active_admin()
 );
-
 alter policy "authenticated create own store"
 on public.stores
 with check (
@@ -190,16 +178,13 @@ with check (
   and category_id is not null
   and is_promoted = false
 );
-
 alter policy "owner update own store"
 on public.stores
 using (public.is_active_admin())
 with check (public.is_active_admin());
-
 alter policy "admin delete stores"
 on public.stores
 using (false);
-
 alter policy "public read published listings"
 on public.listings
 using (
@@ -207,7 +192,6 @@ using (
   or owner_id = (select auth.uid())
   or public.is_active_admin()
 );
-
 alter policy "authenticated create own listings"
 on public.listings
 with check (
@@ -231,7 +215,6 @@ with check (
     )
   )
 );
-
 alter policy "owner update own listings"
 on public.listings
 using (
@@ -263,11 +246,9 @@ with check (
     )
   )
 );
-
 alter policy "owner delete own listings"
 on public.listings
 using (false);
-
 alter policy "public read listing images"
 on public.listing_images
 using (
@@ -282,7 +263,6 @@ using (
       )
   )
 );
-
 alter policy "owner manage listing images"
 on public.listing_images
 using (
@@ -313,23 +293,18 @@ with check (
       )
   )
 );
-
 alter policy "public read likes"
 on public.listing_likes
 using (false);
-
 alter policy "public create like"
 on public.listing_likes
 with check (false);
-
 alter policy "public read views"
 on public.listing_views
 using (false);
-
 alter policy "public create views"
 on public.listing_views
 with check (false);
-
 alter policy "public create reports"
 on public.reports
 with check (
@@ -340,41 +315,33 @@ with check (
   and (reporter_id is null or reporter_id = (select auth.uid()))
   and ((listing_id is not null) <> (store_id is not null))
 );
-
 alter policy "admin read reports"
 on public.reports
 using (public.is_active_admin());
-
 alter policy "admin update reports"
 on public.reports
 using (public.is_active_admin())
 with check (public.is_active_admin());
-
 alter policy "admin delete reports"
 on public.reports
 using (false);
-
 alter policy "public read active categories"
 on public.categories
 using (true);
-
 alter policy "admin manage categories"
 on public.categories
 using (public.is_active_admin())
 with check (public.is_active_admin());
-
 -- New marketplace tables.
 alter table public.media_assets enable row level security;
 alter table public.store_edit_requests enable row level security;
 alter table public.promotion_requests enable row level security;
 alter table public.notifications enable row level security;
 alter table public.admin_audit_logs enable row level security;
-
 create policy "owners read media metadata"
 on public.media_assets
 for select to authenticated
 using (owner_id = (select auth.uid()) or public.is_active_admin());
-
 create policy "active users create media metadata"
 on public.media_assets
 for insert to authenticated
@@ -382,7 +349,6 @@ with check (
   owner_id = (select auth.uid())
   and public.is_active_user()
 );
-
 create policy "owners manage media metadata"
 on public.media_assets
 for update to authenticated
@@ -400,7 +366,6 @@ with check (
   )
   or public.is_active_admin()
 );
-
 create policy "owners delete media metadata"
 on public.media_assets
 for delete to authenticated
@@ -411,7 +376,6 @@ using (
   )
   or public.is_active_admin()
 );
-
 create or replace function public.prepare_store_edit_request()
 returns trigger
 language plpgsql
@@ -444,18 +408,14 @@ begin
   return new;
 end;
 $$;
-
 revoke all on function public.prepare_store_edit_request() from public;
-
 create trigger store_edit_requests_prepare
 before insert on public.store_edit_requests
 for each row execute function public.prepare_store_edit_request();
-
 create policy "owners read store edit requests"
 on public.store_edit_requests
 for select to authenticated
 using (owner_id = (select auth.uid()) or public.is_active_admin());
-
 create policy "owners create store edit requests"
 on public.store_edit_requests
 for insert to authenticated
@@ -464,7 +424,6 @@ with check (
   and public.is_active_user()
   and status = 'pending'
 );
-
 create or replace function public.prepare_promotion_request()
 returns trigger
 language plpgsql
@@ -491,18 +450,14 @@ begin
   return new;
 end;
 $$;
-
 revoke all on function public.prepare_promotion_request() from public;
-
 create trigger promotion_requests_prepare
 before insert on public.promotion_requests
 for each row execute function public.prepare_promotion_request();
-
 create policy "owners read promotion requests"
 on public.promotion_requests
 for select to authenticated
 using (owner_id = (select auth.uid()) or public.is_active_admin());
-
 create policy "owners create promotion requests"
 on public.promotion_requests
 for insert to authenticated
@@ -511,23 +466,19 @@ with check (
   and public.is_active_user()
   and status = 'pending'
 );
-
 create policy "users read own notifications"
 on public.notifications
 for select to authenticated
 using (recipient_id = (select auth.uid()) or public.is_active_admin());
-
 create policy "users mark own notifications read"
 on public.notifications
 for update to authenticated
 using (recipient_id = (select auth.uid()))
 with check (recipient_id = (select auth.uid()));
-
 create policy "active admins read audit logs"
 on public.admin_audit_logs
 for select to authenticated
 using (public.is_active_admin());
-
 -- Audit all admin mutations on marketplace moderation tables.
 create or replace function public.audit_admin_mutation()
 returns trigger
@@ -573,9 +524,7 @@ begin
   return new;
 end;
 $$;
-
 revoke all on function public.audit_admin_mutation() from public;
-
 create trigger stores_admin_audit
 after insert or update or delete on public.stores
 for each row execute function public.audit_admin_mutation();
@@ -594,7 +543,6 @@ for each row execute function public.audit_admin_mutation();
 create trigger promotion_requests_admin_audit
 after update on public.promotion_requests
 for each row execute function public.audit_admin_mutation();
-
 -- Admin workflows are RPC-only and verify the caller on the server.
 create or replace function public.review_store_application(
   p_store_id uuid,
@@ -645,7 +593,6 @@ begin
   );
 end;
 $$;
-
 create or replace function public.review_store_edit_request(
   p_request_id uuid,
   p_approved boolean,
@@ -746,7 +693,6 @@ begin
   );
 end;
 $$;
-
 create or replace function public.review_promotion_request(
   p_request_id uuid,
   p_approved boolean,
@@ -802,7 +748,6 @@ begin
   );
 end;
 $$;
-
 create or replace function public.review_report(
   p_report_id uuid,
   p_status public.canonical_report_status,
@@ -840,12 +785,10 @@ begin
   end if;
 end;
 $$;
-
 revoke all on function public.review_store_application(uuid, boolean, text) from public;
 revoke all on function public.review_store_edit_request(uuid, boolean, text) from public;
 revoke all on function public.review_promotion_request(uuid, boolean, text) from public;
 revoke all on function public.review_report(uuid, public.canonical_report_status, text) from public;
-
 grant execute on function public.review_store_application(uuid, boolean, text)
 to authenticated, service_role;
 grant execute on function public.review_store_edit_request(uuid, boolean, text)
@@ -854,7 +797,6 @@ grant execute on function public.review_promotion_request(uuid, boolean, text)
 to authenticated, service_role;
 grant execute on function public.review_report(uuid, public.canonical_report_status, text)
 to authenticated, service_role;
-
 -- Device identifiers are hashed server-side. Direct table writes are blocked.
 create or replace function public.toggle_listing_like(
   p_listing_id uuid,
@@ -895,7 +837,6 @@ begin
   return true;
 end;
 $$;
-
 create or replace function public.record_listing_view(
   p_listing_id uuid,
   p_device_id text default null
@@ -923,65 +864,50 @@ begin
   on conflict (listing_id, view_key) where view_key is not null do nothing;
 end;
 $$;
-
 revoke all on function public.toggle_listing_like(uuid, text) from public;
 revoke all on function public.record_listing_view(uuid, text) from public;
 grant execute on function public.toggle_listing_like(uuid, text)
 to anon, authenticated, service_role;
 grant execute on function public.record_listing_view(uuid, text)
 to anon, authenticated, service_role;
-
 -- Explicit API privileges: public reads, owner writes, and RPC-only admin work.
 revoke all on table public.stores from public, anon, authenticated;
 grant select on table public.stores to anon, authenticated;
 grant insert on table public.stores to authenticated;
-
 revoke all on table public.listings from public, anon, authenticated;
 grant select on table public.listings to anon, authenticated;
 grant insert, update on table public.listings to authenticated;
-
 revoke all on table public.listing_images from public, anon, authenticated;
 grant select on table public.listing_images to anon, authenticated;
 grant insert, update, delete on table public.listing_images to authenticated;
-
 revoke all on table public.listing_likes from public, anon, authenticated;
 revoke all on table public.listing_views from public, anon, authenticated;
-
 revoke all on table public.reports from public, anon, authenticated;
 grant insert on table public.reports to anon, authenticated;
 grant select, update on table public.reports to authenticated;
-
 revoke all on table public.categories from public, anon, authenticated;
 grant select on table public.categories to anon, authenticated;
 grant insert, update on table public.categories to authenticated;
-
 revoke all on table public.media_assets from public, anon, authenticated;
 grant select, insert, update, delete on table public.media_assets to authenticated;
-
 revoke all on table public.store_edit_requests from public, anon, authenticated;
 grant select, insert on table public.store_edit_requests to authenticated;
-
 revoke all on table public.promotion_requests from public, anon, authenticated;
 grant select, insert on table public.promotion_requests to authenticated;
-
 revoke all on table public.notifications from public, anon, authenticated;
 grant select on table public.notifications to authenticated;
 grant update (is_read, read_at) on table public.notifications to authenticated;
-
 revoke all on table public.admin_audit_logs from public, anon, authenticated;
 grant select on table public.admin_audit_logs to authenticated;
-
 grant all on table public.stores, public.listings, public.listing_images,
   public.listing_likes, public.listing_views, public.reports,
   public.categories, public.media_assets, public.store_edit_requests,
   public.promotion_requests, public.notifications, public.admin_audit_logs
 to service_role;
-
 -- Storage paths are listing/store/profile scoped. Existing public reads remain.
 insert into storage.buckets (id, name, public)
 values ('profile-images', 'profile-images', true)
 on conflict (id) do nothing;
-
 alter policy "owners upload listing media"
 on storage.objects
 with check (
@@ -995,7 +921,6 @@ with check (
       and public.is_active_user()
   )
 );
-
 alter policy "owners upload store media"
 on storage.objects
 with check (
@@ -1009,11 +934,9 @@ with check (
       and public.is_active_user()
   )
 );
-
 create policy "public read profile media"
 on storage.objects for select
 using (bucket_id = 'profile-images');
-
 create policy "users upload own profile media"
 on storage.objects for insert to authenticated
 with check (
@@ -1022,7 +945,6 @@ with check (
   and (storage.foldername(name))[2] = (select auth.uid())::text
   and public.is_active_user()
 );
-
 create policy "owners update listing media"
 on storage.objects for update to authenticated
 using (
@@ -1043,7 +965,6 @@ with check (
       and (l.owner_id = (select auth.uid()) or public.is_active_admin())
   )
 );
-
 create policy "owners delete listing media"
 on storage.objects for delete to authenticated
 using (
@@ -1055,7 +976,6 @@ using (
       and (l.owner_id = (select auth.uid()) or public.is_active_admin())
   )
 );
-
 create policy "owners update store media"
 on storage.objects for update to authenticated
 using (
@@ -1076,7 +996,6 @@ with check (
       and (s.owner_id = (select auth.uid()) or public.is_active_admin())
   )
 );
-
 create policy "owners delete store media"
 on storage.objects for delete to authenticated
 using (
@@ -1088,7 +1007,6 @@ using (
       and (s.owner_id = (select auth.uid()) or public.is_active_admin())
   )
 );
-
 create policy "users update own profile media"
 on storage.objects for update to authenticated
 using (
@@ -1099,7 +1017,6 @@ with check (
   bucket_id = 'profile-images'
   and (storage.foldername(name))[2] = (select auth.uid())::text
 );
-
 create policy "users delete own profile media"
 on storage.objects for delete to authenticated
 using (
@@ -1109,5 +1026,4 @@ using (
     or public.is_active_admin()
   )
 );
-
 commit;

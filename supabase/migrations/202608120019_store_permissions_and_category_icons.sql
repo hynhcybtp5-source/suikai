@@ -1,10 +1,8 @@
 begin;
-
 -- Existing category schema has no icon field. Keep one stable identifier that
 -- both Admin and mobile/web clients can render without storing Flutter codes.
 alter table public.categories
   add column if not exists icon_key text not null default 'category';
-
 create or replace function public.owner_delete_unapproved_store(p_store_id uuid)
 returns void
 language plpgsql
@@ -21,11 +19,9 @@ begin
   end if;
 end;
 $$;
-
 revoke all on function public.owner_delete_unapproved_store(uuid) from public;
 grant execute on function public.owner_delete_unapproved_store(uuid)
 to authenticated, service_role;
-
 create or replace function public.owner_resubmit_rejected_store(p_store_id uuid)
 returns void
 language plpgsql
@@ -43,11 +39,9 @@ begin
   end if;
 end;
 $$;
-
 revoke all on function public.owner_resubmit_rejected_store(uuid) from public;
 grant execute on function public.owner_resubmit_rejected_store(uuid)
 to authenticated, service_role;
-
 -- Enforce approved-store permission in Postgres as well as Flutter UI/repository.
 create or replace function public.enforce_store_listing_publish()
 returns trigger
@@ -91,5 +85,4 @@ begin
   return new;
 end;
 $$;
-
 commit;

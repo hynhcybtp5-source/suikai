@@ -2,6 +2,7 @@ class UserProfile {
   final String id, name, phone, email, avatar, city, viber;
   final String? cityId;
   final DateTime createdAt;
+  final bool isVerified;
   const UserProfile({
     required this.id,
     required this.name,
@@ -11,6 +12,7 @@ class UserProfile {
     this.city = '',
     this.viber = '',
     this.cityId,
+    this.isVerified = false,
     required this.createdAt,
   });
   Map<String, dynamic> toJson() => {
@@ -23,6 +25,7 @@ class UserProfile {
     'city_id': cityId,
     'viber_phone': viber,
     'created_at': createdAt.toIso8601String(),
+    'is_verified': isVerified,
   };
   factory UserProfile.fromJson(Map<String, dynamic> j) => UserProfile(
     id: '${j['id']}',
@@ -33,6 +36,7 @@ class UserProfile {
     city: '${j['city'] ?? ''}',
     cityId: j['city_id']?.toString(),
     viber: '${j['viber_phone'] ?? ''}',
+    isVerified: j['is_verified'] == true,
     createdAt: DateTime.tryParse('${j['created_at']}') ?? DateTime.now(),
   );
 }
@@ -167,10 +171,14 @@ class ListingRecord {
   final bool isPublished, isHidden;
   final DateTime? deletedAt;
   final double price;
+  final double? originalPrice;
 
   final ListingVideoRecord? video;
   final List<String> images;
   final int likes, views;
+  final bool sellerVerified, storeVerified;
+  final int soldCount;
+  final double rankingScore;
   final DateTime createdAt, updatedAt;
   const ListingRecord({
     required this.id,
@@ -179,6 +187,7 @@ class ListingRecord {
     required this.description,
     required this.category,
     required this.price,
+    this.originalPrice,
     required this.currency,
     required this.city,
     required this.status,
@@ -199,6 +208,10 @@ class ListingRecord {
     this.deletedAt,
     this.likes = 0,
     this.views = 0,
+    this.sellerVerified = false,
+    this.storeVerified = false,
+    this.soldCount = 0,
+    this.rankingScore = 0,
   });
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -208,6 +221,7 @@ class ListingRecord {
     'description': description,
     'category': category,
     'price': price,
+    'original_price': originalPrice,
     'currency': currency,
     'city': city,
     'city_id': cityId,
@@ -219,6 +233,10 @@ class ListingRecord {
     'viber_phone': viber,
     'likes': likes,
     'views': views,
+    'seller_verified': sellerVerified,
+    'store_verified': storeVerified,
+    'sold_count': soldCount,
+    'ranking_score': rankingScore,
     'latitude': latitude,
     'longitude': longitude,
     'is_location_visible': isLocationVisible,
@@ -240,6 +258,7 @@ class ListingRecord {
     description: '${j['description'] ?? ''}',
     category: '${j['category'] ?? ''}',
     price: (j['price'] as num?)?.toDouble() ?? 0,
+    originalPrice: (j['original_price'] as num?)?.toDouble(),
     currency: '${j['currency'] ?? 'MMK'}',
     city: '${j['city'] ?? ''}',
     status: '${j['status'] ?? 'available'}',
@@ -253,6 +272,10 @@ class ListingRecord {
     viber: '${j['viber_phone'] ?? ''}',
     likes: (j['likes'] as num?)?.toInt() ?? 0,
     views: (j['views'] as num?)?.toInt() ?? 0,
+    sellerVerified: j['seller_verified'] == true,
+    storeVerified: j['store_verified'] == true,
+    soldCount: (j['sold_count'] as num?)?.toInt() ?? 0,
+    rankingScore: (j['ranking_score'] as num?)?.toDouble() ?? 0,
     latitude: (j['latitude'] as num?)?.toDouble(),
     longitude: (j['longitude'] as num?)?.toDouble(),
     isLocationVisible: j['is_location_visible'] != false,
@@ -329,6 +352,7 @@ class StoreRecord {
   final double? latitude, longitude;
   final DateTime createdAt;
   final bool isPromoted;
+  final bool isVerified;
   final String lifecycleStatus;
   final bool isHidden;
   final DateTime? deletedAt;
@@ -354,6 +378,7 @@ class StoreRecord {
     this.longitude,
     required this.createdAt,
     this.isPromoted = false,
+    this.isVerified = false,
     this.lifecycleStatus = 'active',
     this.isHidden = false,
     this.deletedAt,
@@ -383,6 +408,7 @@ class StoreRecord {
     'longitude': longitude,
     'created_at': createdAt.toIso8601String(),
     'is_promoted': isPromoted,
+    'is_verified': isVerified,
     'lifecycle_status': lifecycleStatus,
     'is_hidden': isHidden,
     'deleted_at': deletedAt?.toIso8601String(),
@@ -413,6 +439,7 @@ class StoreRecord {
     longitude: (j['longitude'] as num?)?.toDouble(),
     createdAt: DateTime.tryParse('${j['created_at']}') ?? DateTime.now(),
     isPromoted: j['is_promoted'] == true,
+    isVerified: j['is_verified'] == true,
     lifecycleStatus: '${j['lifecycle_status'] ?? ''}',
     isHidden: j['is_hidden'] == true,
     deletedAt: DateTime.tryParse('${j['deleted_at']}'),
@@ -474,6 +501,7 @@ class PromotionRequestRecord {
 
 class ReportRecord {
   final String id, reason, targetId, type;
+  final String? deviceId;
   final DateTime createdAt;
   const ReportRecord({
     required this.id,
@@ -481,6 +509,7 @@ class ReportRecord {
     required this.targetId,
     required this.type,
     required this.createdAt,
+    this.deviceId,
   });
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -488,6 +517,7 @@ class ReportRecord {
     'target_id': targetId,
     'type': type,
     'created_at': createdAt.toIso8601String(),
+    'device_id': deviceId,
   };
 }
 
@@ -593,7 +623,8 @@ class AdvertisementRecord {
 }
 
 class ShortVideoRecord {
-  final String id, tiktokUrl, title;
+  /// Stored in the legacy `tiktok_url` column; the app now accepts YouTube.
+  final String id, youtubeUrl, title;
   final int displayOrder;
   final bool isActive;
   final String? createdBy;
@@ -601,7 +632,7 @@ class ShortVideoRecord {
 
   const ShortVideoRecord({
     required this.id,
-    required this.tiktokUrl,
+    required this.youtubeUrl,
     this.title = '',
     this.displayOrder = 0,
     this.isActive = true,
@@ -610,17 +641,33 @@ class ShortVideoRecord {
     required this.updatedAt,
   });
 
-  static bool isValidTikTokUrl(String value) {
+  static String? youtubeVideoId(String value) {
     final uri = Uri.tryParse(value.trim());
-    final host = uri?.host.toLowerCase() ?? '';
-    return uri?.scheme == 'https' &&
-        (host == 'tiktok.com' || host.endsWith('.tiktok.com'));
+    if (uri == null || uri.scheme != 'https') return null;
+    final host = uri.host.toLowerCase();
+    String? id;
+    if (host == 'youtu.be') {
+      id = uri.pathSegments.isEmpty ? null : uri.pathSegments.first;
+    } else if (host == 'youtube.com' ||
+        host == 'www.youtube.com' ||
+        host == 'm.youtube.com') {
+      if (uri.pathSegments.length >= 2 && uri.pathSegments.first == 'shorts') {
+        id = uri.pathSegments[1];
+      } else if (uri.path == '/watch') {
+        id = uri.queryParameters['v'];
+      }
+    }
+    return id != null && RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(id)
+        ? id
+        : null;
   }
+
+  static bool isValidYouTubeUrl(String value) => youtubeVideoId(value) != null;
 
   factory ShortVideoRecord.fromJson(Map<String, dynamic> json) =>
       ShortVideoRecord(
         id: '${json['id']}',
-        tiktokUrl: '${json['tiktok_url'] ?? ''}',
+        youtubeUrl: '${json['tiktok_url'] ?? ''}',
         title: '${json['title'] ?? ''}',
         displayOrder:
             (json['sort_order'] as num?)?.toInt() ??
@@ -634,7 +681,7 @@ class ShortVideoRecord {
 
   Map<String, dynamic> toJson() => {
     'id': id,
-    'tiktok_url': tiktokUrl,
+    'tiktok_url': youtubeUrl,
     'title': title,
     'sort_order': displayOrder,
     'is_active': isActive,

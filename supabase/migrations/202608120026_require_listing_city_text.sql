@@ -1,5 +1,4 @@
 begin;
-
 create or replace function public.require_listing_city_text()
 returns trigger
 language plpgsql
@@ -15,10 +14,8 @@ begin
   return new;
 end;
 $$;
-
 drop trigger if exists require_listing_city_text on public.listings;
 create trigger require_listing_city_text
 before insert or update of city on public.listings
 for each row execute function public.require_listing_city_text();
-
 commit;

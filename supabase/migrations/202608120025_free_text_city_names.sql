@@ -1,8 +1,6 @@
 begin;
-
 alter table public.profiles
   add column if not exists city text;
-
 create or replace function public.handle_new_auth_user_profile()
 returns trigger
 language plpgsql
@@ -28,5 +26,4 @@ begin
   return new;
 end;
 $$;
-
 commit;

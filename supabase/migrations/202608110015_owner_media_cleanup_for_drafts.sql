@@ -1,5 +1,4 @@
 begin;
-
 alter policy "owners delete listing media"
 on storage.objects
 using (
@@ -20,7 +19,6 @@ using (
     )
   )
 );
-
 alter policy "owners delete store media"
 on storage.objects
 using (
@@ -41,5 +39,4 @@ using (
     )
   )
 );
-
 commit;

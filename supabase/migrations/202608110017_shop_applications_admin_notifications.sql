@@ -1,5 +1,4 @@
 begin;
-
 -- Store rows with status=pending are the canonical shop applications.
 -- This table is deliberately separate from user notifications so no client
 -- can choose an admin recipient or manufacture a privileged alert.
@@ -12,36 +11,28 @@ create table public.admin_notifications (
   is_read boolean not null default false,
   created_at timestamptz not null default now()
 );
-
 create index admin_notifications_unread_idx
 on public.admin_notifications (is_read, created_at desc);
-
 create index admin_notifications_shop_idx
 on public.admin_notifications (shop_id, created_at desc);
-
 create unique index admin_notifications_shop_application_unique
 on public.admin_notifications (shop_id, type)
 where type = 'shop_application' and shop_id is not null;
-
 alter table public.admin_notifications enable row level security;
-
 create policy "active admins read admin notifications"
 on public.admin_notifications
 for select to authenticated
 using (public.is_active_admin());
-
 create policy "active admins mark admin notifications read"
 on public.admin_notifications
 for update to authenticated
 using (public.is_active_admin())
 with check (public.is_active_admin());
-
 revoke all on table public.admin_notifications
 from public, anon, authenticated;
 grant select on table public.admin_notifications to authenticated;
 grant update (is_read) on table public.admin_notifications to authenticated;
 grant all on table public.admin_notifications to service_role;
-
 create or replace function public.notify_admin_on_shop_application()
 returns trigger
 language plpgsql
@@ -63,16 +54,13 @@ begin
   return new;
 end;
 $$;
-
 revoke execute on function public.notify_admin_on_shop_application()
 from public, anon, authenticated;
-
 create trigger stores_notify_admin_on_application
 after insert on public.stores
 for each row
 when (new.status = 'pending')
 execute function public.notify_admin_on_shop_application();
-
 -- Preserve visibility for owners/admins while requiring both legacy and
 -- canonical approval fields for public reads.
 alter policy "public read approved stores"
@@ -87,7 +75,6 @@ using (
   or owner_id = (select auth.uid())
   or public.is_active_admin()
 );
-
 -- Existing real pending applications should not be invisible to the badge.
 insert into public.admin_notifications (type, shop_id, title, message, created_at)
 select
@@ -99,5 +86,4 @@ select
 from public.stores s
 where s.status = 'pending'
 on conflict do nothing;
-
 commit;

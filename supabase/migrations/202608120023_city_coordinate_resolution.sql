@@ -1,16 +1,13 @@
 begin;
-
 alter table public.cities
   add column if not exists latitude double precision,
   add column if not exists longitude double precision;
-
 alter table public.cities drop constraint if exists cities_latitude_check;
 alter table public.cities add constraint cities_latitude_check
   check (latitude is null or latitude between -90 and 90);
 alter table public.cities drop constraint if exists cities_longitude_check;
 alter table public.cities add constraint cities_longitude_check
   check (longitude is null or longitude between -180 and 180);
-
 create or replace function public.resolve_city_for_coordinates(
   p_latitude double precision,
   p_longitude double precision
@@ -51,10 +48,8 @@ as $$
     limit 1
   ) candidate;
 $$;
-
 revoke all on function public.resolve_city_for_coordinates(double precision, double precision)
 from public;
 grant execute on function public.resolve_city_for_coordinates(double precision, double precision)
 to anon, authenticated, service_role;
-
 commit;

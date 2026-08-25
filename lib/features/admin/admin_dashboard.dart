@@ -1430,7 +1430,7 @@ class _ShortVideos extends StatelessWidget {
     await SuikaiService.saveShortVideo(
       ShortVideoRecord(
         id: value.id,
-        tiktokUrl: value.tiktokUrl,
+        youtubeUrl: value.youtubeUrl,
         title: value.title,
         displayOrder: value.displayOrder,
         isActive: active,
@@ -1463,7 +1463,7 @@ class _ShortVideos extends StatelessWidget {
           child: ElevatedButton.icon(
             onPressed: () => _edit(context),
             icon: const Icon(Icons.add_rounded),
-            label: const Text('เพิ่ม TikTok'),
+            label: const Text('เพิ่ม YouTube'),
           ),
         ),
       ),
@@ -1487,7 +1487,7 @@ class _ShortVideos extends StatelessWidget {
                       overflow: TextOverflow.ellipsis,
                     ),
                     subtitle: Text(
-                      value.tiktokUrl,
+                      value.youtubeUrl,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
@@ -1536,7 +1536,7 @@ class _ShortVideoDialogState extends State<_ShortVideoDialog> {
   @override
   void initState() {
     super.initState();
-    url = TextEditingController(text: widget.current?.tiktokUrl ?? '');
+    url = TextEditingController(text: widget.current?.youtubeUrl ?? '');
     createdAt = widget.current?.createdAt ?? DateTime.now();
     order = TextEditingController(text: '${widget.current?.displayOrder ?? 0}');
     active = widget.current?.isActive ?? true;
@@ -1551,7 +1551,7 @@ class _ShortVideoDialogState extends State<_ShortVideoDialog> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-    title: Text(widget.current == null ? 'เพิ่ม TikTok' : 'แก้ไข TikTok'),
+    title: Text(widget.current == null ? 'เพิ่ม YouTube' : 'แก้ไข YouTube'),
     content: SizedBox(
       width: 520,
       child: Form(
@@ -1561,11 +1561,11 @@ class _ShortVideoDialogState extends State<_ShortVideoDialog> {
           children: [
             TextFormField(
               controller: url,
-              decoration: const InputDecoration(labelText: 'TikTok URL *'),
+              decoration: const InputDecoration(labelText: 'YouTube URL *'),
               validator: (value) =>
-                  ShortVideoRecord.isValidTikTokUrl(value ?? '')
+                  ShortVideoRecord.isValidYouTubeUrl(value ?? '')
                   ? null
-                  : 'กรุณาใส่ HTTPS TikTok URL ที่ถูกต้อง',
+                  : 'กรุณาใส่ YouTube Shorts, watch หรือ youtu.be URL ที่ถูกต้อง',
             ),
             const SizedBox(height: 12),
             InputDecorator(
@@ -1603,7 +1603,7 @@ class _ShortVideoDialogState extends State<_ShortVideoDialog> {
             context,
             ShortVideoRecord(
               id: widget.current?.id ?? const Uuid().v4(),
-              tiktokUrl: url.text.trim(),
+              youtubeUrl: url.text.trim(),
               title: widget.current?.title ?? '',
               displayOrder: int.parse(order.text),
               isActive: active,

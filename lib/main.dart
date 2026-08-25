@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:app_links/app_links.dart';
 import 'package:camera_android/camera_android.dart';
 import 'package:flutter/foundation.dart';
@@ -8,9 +10,11 @@ import 'l10n/app_localizations.dart';
 import 'l10n/mobile_localizations.dart';
 import 'core/locale_controller.dart';
 import 'core/app_route_observer.dart';
+import 'core/operation_status.dart';
 import 'core/theme/app_theme.dart';
 import 'data/supabase_repositories.dart';
 import 'features/home/home_page.dart';
+import 'features/startup/network_blocked_screen.dart';
 import 'services/suikai_service.dart';
 
 final _navigatorKey = GlobalKey<NavigatorState>();
@@ -65,15 +69,14 @@ Future<void> main() async {
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     AndroidCamera.registerWith();
   }
+  runApp(const _BootstrapApp());
+}
+
+Future<void> _initializeApplication(ValueChanged<String> updateStatus) async {
   debugPrint('MAIN 1 start');
-  try {
-    await SuikaiService.initialize();
-  } catch (error, stackTrace) {
-    debugPrint('Suikai startup failed: $error');
-    debugPrintStack(stackTrace: stackTrace);
-    runApp(const _StartupErrorApp());
-    return;
-  }
+  updateStatus('กำลังตรวจสอบการเชื่อมต่อ...');
+  await SuikaiService.initialize();
+  updateStatus('กำลังโหลดข้อมูลเริ่มต้น...');
   // Telegram redirects to the app root, which normally builds HomePage rather
   // than LoginPage. Consume the OAuth callback before building routes so the
   // token_hash is exchanged for a persisted Supabase session on every return.
@@ -88,6 +91,7 @@ Future<void> main() async {
     }
   }
   if (!kIsWeb) {
+    updateStatus('กำลังเตรียมการเข้าสู่ระบบ...');
     final appLinks = AppLinks();
     final initialLink = await appLinks.getInitialLink();
     if (initialLink != null) await _completeTelegramCallback(initialLink);
@@ -100,55 +104,109 @@ Future<void> main() async {
     );
   }
   debugPrint('MAIN 2 service initialized');
-  debugPrint('MAIN 3 before runApp');
-  runApp(const SuikaiApp());
-  final sharedProductId = kIsWeb ? Uri.base.queryParameters['product'] : null;
-  if (sharedProductId != null && sharedProductId.isNotEmpty) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _navigatorKey.currentState?.pushNamed(
-        SuikaiRoutes.productDetail,
-        arguments: sharedProductId,
-      );
-    });
-  }
-  debugPrint('MAIN 4 runApp called');
 }
 
-class _StartupErrorApp extends StatelessWidget {
-  const _StartupErrorApp();
+class _BootstrapApp extends StatefulWidget {
+  const _BootstrapApp();
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    debugShowCheckedModeBanner: false,
-    theme: AppTheme.light,
-    home: Scaffold(
-      body: SafeArea(
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(28),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: const [
-                Icon(Icons.cloud_off_rounded, size: 48, color: AppTheme.orange),
-                SizedBox(height: 18),
-                Text(
-                  'ไม่สามารถเปิด Suikai ได้',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
-                ),
-                SizedBox(height: 8),
-                Text(
-                  'ยังไม่ได้ตั้งค่าการเชื่อมต่อบริการ กรุณาเพิ่ม SUPABASE_URL และ SUPABASE_PUBLISHABLE_KEY ก่อนรันเว็บ',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: AppTheme.textMuted, height: 1.45),
-                ),
-              ],
+  State<_BootstrapApp> createState() => _BootstrapAppState();
+}
+
+class _BootstrapAppState extends State<_BootstrapApp> {
+  String _message = 'กำลังเริ่มแอป...';
+  Object? _error;
+  var _ready = false;
+  Timer? _slowConnectionTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _slowConnectionTimer = Timer(const Duration(seconds: 8), () {
+      if (mounted && !_ready) {
+        setState(
+          () => _message = 'การเชื่อมต่อใช้เวลานานกว่าปกติ กรุณารอสักครู่',
+        );
+      }
+    });
+    _start();
+  }
+
+  @override
+  void dispose() {
+    _slowConnectionTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _start() async {
+    if (mounted) {
+      setState(() {
+        _error = null;
+        _message = 'กำลังเริ่มแอป...';
+      });
+    }
+    try {
+      await _initializeApplication((message) {
+        if (mounted) setState(() => _message = message);
+      });
+      if (!mounted) return;
+      setState(() {
+        _message = 'กำลังเตรียมหน้าแรก...';
+        _ready = true;
+      });
+      _slowConnectionTimer?.cancel();
+      final sharedProductId = kIsWeb
+          ? Uri.base.queryParameters['product']
+          : null;
+      if (sharedProductId != null && sharedProductId.isNotEmpty) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _navigatorKey.currentState?.pushNamed(
+            SuikaiRoutes.productDetail,
+            arguments: sharedProductId,
+          );
+        });
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Suikai startup failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (mounted) setState(() => _error = error);
+      _slowConnectionTimer?.cancel();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_ready) return const SuikaiApp();
+    if (_error != null) {
+      return MaterialApp(
+        debugShowCheckedModeBanner: false,
+        theme: AppTheme.light,
+        locale: localeController.locale,
+        supportedLocales: AppLocalizations.supportedLocales,
+        localizationsDelegates: const [
+          ...AppLocalizations.localizationsDelegates,
+          ShanMaterialLocalizationsDelegate(),
+          ShanWidgetsLocalizationsDelegate(),
+          ShanCupertinoLocalizationsDelegate(),
+        ],
+        home: NetworkBlockedScreen(onRetry: _start),
+      );
+    }
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: AppTheme.light,
+      home: Scaffold(
+        body: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(28),
+              child: LoadingStatusView(message: _message),
             ),
           ),
         ),
       ),
-    ),
-  );
+    );
+  }
 }
 
 class SuikaiApp extends StatelessWidget {

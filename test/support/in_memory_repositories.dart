@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:suikai/data/models.dart';
 import 'package:suikai/data/repositories.dart';
+import 'package:suikai/core/legal_versions.dart';
 import 'package:suikai/data/store_categories.dart';
 
 Map<String, dynamic> _map(dynamic value) =>
@@ -137,7 +138,9 @@ class InMemoryAuthRepository implements AuthRepository {
     required String email,
     required String password,
     required String city,
+    required bool acceptedUgcTerms,
   }) async {
+    if (!acceptedUgcTerms) throw StateError('ugc_legal_acceptance_required');
     final normalized = email.trim().toLowerCase();
     if (TestDatabase.users.values.any((v) => _map(v)['email'] == normalized))
       throw StateError('email_exists');
@@ -152,6 +155,9 @@ class InMemoryAuthRepository implements AuthRepository {
     await TestDatabase.users.put(p.id, {
       ...p.toJson(),
       'password_hash': _hash(password),
+      'legal_terms_version': LegalVersions.termsOfService,
+      'legal_community_guidelines_version': LegalVersions.communityGuidelines,
+      'legal_accepted_at': DateTime.now().toIso8601String(),
     });
     return p;
   }
@@ -181,6 +187,15 @@ class InMemoryAuthRepository implements AuthRepository {
   }
 
   @override
+  Future<void> deleteOwnAccount() async {
+    final userId = currentUserId;
+    if (userId == null) throw StateError('login_required');
+    await TestDatabase.users.delete(userId);
+    _current = null;
+    await (await SharedPreferences.getInstance()).remove(_session);
+  }
+
+  @override
   Future<void> loginWithTelegram() async {}
 
   @override
@@ -190,7 +205,60 @@ class InMemoryAuthRepository implements AuthRepository {
   Future<void> syncCurrentProfile() async {}
 }
 
+class InMemoryLegalConsentRepository implements LegalConsentRepository {
+  InMemoryLegalConsentRepository(this.currentUserId);
+
+  final String? Function() currentUserId;
+
+  @override
+  Future<bool> hasAccepted({
+    required String termsVersion,
+    required String communityGuidelinesVersion,
+  }) async {
+    final userId = currentUserId();
+    if (userId == null) return false;
+    final row = TestDatabase.users.get(userId);
+    if (row == null) return false;
+    final values = _map(row);
+    return values['legal_terms_version'] == termsVersion &&
+        values['legal_community_guidelines_version'] ==
+            communityGuidelinesVersion &&
+        values['legal_accepted_at'] != null;
+  }
+
+  @override
+  Future<void> accept({
+    required String termsVersion,
+    required String communityGuidelinesVersion,
+  }) async {
+    final userId = currentUserId();
+    if (userId == null) throw StateError('login_required');
+    final row = TestDatabase.users.get(userId);
+    if (row == null) throw StateError('login_required');
+    await TestDatabase.users.put(userId, {
+      ..._map(row),
+      'legal_terms_version': termsVersion,
+      'legal_community_guidelines_version': communityGuidelinesVersion,
+      'legal_accepted_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  Future<void> clearCurrentAcceptance() async {
+    final userId = currentUserId();
+    if (userId == null) return;
+    final row = TestDatabase.users.get(userId);
+    if (row == null) return;
+    final values = _map(row)
+      ..remove('legal_terms_version')
+      ..remove('legal_community_guidelines_version')
+      ..remove('legal_accepted_at');
+    await TestDatabase.users.put(userId, values);
+  }
+}
+
 class InMemoryProfileRepository implements ProfileRepository {
+  final Set<String> _blockedUserIds = <String>{};
+
   @override
   Future<UserProfile?> get(String id) async {
     final v = TestDatabase.users.get(id);
@@ -203,6 +271,25 @@ class InMemoryProfileRepository implements ProfileRepository {
     await TestDatabase.users.put(p.id, {...old, ...p.toJson()});
     return UserProfile.fromJson(_map(TestDatabase.users.get(p.id)));
   }
+
+  @override
+  Future<bool> blockSeller(String sellerId) async {
+    if (sellerId.isEmpty || _blockedUserIds.contains(sellerId)) return false;
+    _blockedUserIds.add(sellerId);
+    return true;
+  }
+
+  @override
+  Future<List<UserProfile>> getBlockedUsers() async => _blockedUserIds
+      .map((id) => TestDatabase.users.get(id))
+      .whereType<Map>()
+      .map((row) => UserProfile.fromJson(_map(row)))
+      .toList();
+
+  @override
+  Future<void> unblockUser(String sellerId) async {
+    _blockedUserIds.remove(sellerId);
+  }
 }
 
 class InMemoryListingRepository implements ListingRepository {
@@ -214,7 +301,10 @@ class InMemoryListingRepository implements ListingRepository {
         ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
 
   @override
-  Future<List<ListingRecord>> publicListings() async => (await all())
+  Future<List<ListingRecord>> publicListings({
+    double? latitude,
+    double? longitude,
+  }) async => (await all())
       .where(
         (value) =>
             value.isPublished &&

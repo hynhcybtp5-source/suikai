@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:image_picker/image_picker.dart';
@@ -10,47 +9,75 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../core/telegram_callback_uri.dart';
+import '../core/legal_versions.dart';
 import 'models.dart';
 import 'repositories.dart';
+
+class SupabaseEndpointUnreachableException implements Exception {
+  const SupabaseEndpointUnreachableException();
+
+  @override
+  String toString() => 'supabase_endpoint_unreachable';
+}
 
 class SupabaseBackend {
   static const url = String.fromEnvironment('SUPABASE_URL');
   static const publishableKey = String.fromEnvironment(
     'SUPABASE_PUBLISHABLE_KEY',
   );
-  static const legacyAnonKey = String.fromEnvironment('SUPABASE_ANON_KEY');
-  static String get clientKey =>
-      publishableKey.isNotEmpty ? publishableKey : legacyAnonKey;
+  static String get clientKey => publishableKey;
 
   static bool get enabled => url.isNotEmpty && clientKey.isNotEmpty;
+  static late final Uri selectedEndpoint;
+  static final authOptions = FlutterAuthClientOptions(
+    authFlowType: AuthFlowType.pkce,
+    detectSessionInUriPredicate: shouldSupabaseHandleAuthDeepLink,
+  );
 
   static Future<void> initialize() async {
     if (!enabled) return;
-    final endpoint = Uri.tryParse(url);
-    if (endpoint == null ||
-        !endpoint.hasScheme ||
-        !endpoint.hasAuthority ||
-        (endpoint.scheme != 'https' && endpoint.scheme != 'http')) {
-      throw StateError('invalid_supabase_url');
-    }
+    selectedEndpoint = endpointForConfiguration(url);
+    debugPrint('SUPABASE ENDPOINT: PRODUCTION');
     debugPrint(
-      'Supabase initialize: scheme=${endpoint.scheme} host=${endpoint.host}',
+      'Supabase initialize: scheme=${selectedEndpoint.scheme} '
+      'host=${selectedEndpoint.host}',
     );
     try {
       await Supabase.initialize(
-        url: url,
+        url: selectedEndpoint.toString(),
         publishableKey: clientKey,
-        authOptions: const FlutterAuthClientOptions(
-          authFlowType: AuthFlowType.pkce,
-        ),
+        authOptions: authOptions,
       );
-      debugPrint('Supabase initialize: complete host=${endpoint.host}');
+      debugPrint('Supabase initialize: complete host=${selectedEndpoint.host}');
     } catch (error, stackTrace) {
       debugPrint('Supabase initialize failed: $error');
       debugPrintStack(stackTrace: stackTrace);
-      rethrow;
+      throw const SupabaseEndpointUnreachableException();
     }
   }
+
+  static Uri _validatedEndpoint(String value) {
+    final endpoint = Uri.tryParse(value);
+    if (endpoint == null || !endpoint.hasScheme || !endpoint.hasAuthority) {
+      throw StateError('invalid_supabase_url');
+    }
+    final isSecureEndpoint = endpoint.scheme == 'https';
+    final isLocalDebugEndpoint =
+        kDebugMode &&
+        endpoint.scheme == 'http' &&
+        (endpoint.host == 'localhost' ||
+            endpoint.host == '127.0.0.1' ||
+            endpoint.host == '::1');
+    if (!isSecureEndpoint && !isLocalDebugEndpoint) {
+      throw StateError('supabase_url_must_use_https_in_production');
+    }
+    return endpoint;
+  }
+
+  /// The app has exactly one configured Supabase production endpoint.
+  static Uri endpointForConfiguration(String value) =>
+      _validatedEndpoint(value);
 
   static SupabaseClient get client => Supabase.instance.client;
 }
@@ -63,16 +90,12 @@ Map<String, dynamic> _json(dynamic value) =>
 /// Normalize the response shape before relation consumers inspect it.
 List<dynamic> _relationRows(dynamic value) => switch (value) {
   List<dynamic> rows => rows,
-  List rows => rows,
   Map<String, dynamic> row => [row],
   Map row => [Map<String, dynamic>.from(row)],
   _ => const [],
 };
 
-List<String> _listingImageUrls(
-  SupabaseClient client,
-  dynamic relation,
-) {
+List<String> _listingImageUrls(SupabaseClient client, dynamic relation) {
   final rows = _relationRows(relation).map(_json).toList()
     ..sort(
       (a, b) => ((a['sort_order'] as num?)?.toInt() ?? 0).compareTo(
@@ -193,11 +216,23 @@ class SupabaseAuthRepository implements AuthRepository {
     required String email,
     required String password,
     required String city,
+    required bool acceptedUgcTerms,
   }) async {
+    if (!acceptedUgcTerms) throw StateError('ugc_legal_acceptance_required');
     final response = await client.auth.signUp(
       email: email.trim().toLowerCase(),
       password: password,
-      data: {'name': name.trim(), 'phone': phone.trim(), 'city': city.trim()},
+      data: {
+        'name': name.trim(),
+        'phone': phone.trim(),
+        'city': city.trim(),
+        // The database trigger records this only for the newly-created Auth
+        // user. It lets consent survive email-confirmation flows that do not
+        // create a client session immediately after sign-up.
+        'legal_terms_version': LegalVersions.termsOfService,
+        'legal_community_guidelines_version': LegalVersions.communityGuidelines,
+        'legal_terms_accepted': acceptedUgcTerms,
+      },
     );
     final user = response.user;
     if (user == null) throw StateError('signup_failed');
@@ -302,7 +337,8 @@ class SupabaseAuthRepository implements AuthRepository {
     await preferences.remove(_telegramStatePreference);
     await preferences.remove(_telegramVerifierPreference);
 
-    final stateValid = expectedState != null &&
+    final stateValid =
+        expectedState != null &&
         verifier != null &&
         receivedState != null &&
         _constantTimeEquals(expectedState, receivedState);
@@ -370,6 +406,57 @@ class SupabaseAuthRepository implements AuthRepository {
 
   @override
   Future<void> logout() => client.auth.signOut();
+
+  @override
+  Future<void> deleteOwnAccount() async {
+    if (client.auth.currentUser == null) {
+      throw StateError('login_required');
+    }
+    try {
+      await client.functions.invoke('delete-account');
+    } catch (error, stackTrace) {
+      debugPrint('Delete own account request failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      rethrow;
+    }
+    await client.auth.signOut();
+  }
+}
+
+class SupabaseLegalConsentRepository implements LegalConsentRepository {
+  SupabaseLegalConsentRepository(this.client);
+
+  final SupabaseClient client;
+
+  @override
+  Future<bool> hasAccepted({
+    required String termsVersion,
+    required String communityGuidelinesVersion,
+  }) async {
+    if (client.auth.currentUser == null) return false;
+    final row = await client
+        .from('legal_acceptances')
+        .select('user_id')
+        .eq('terms_version', termsVersion)
+        .eq('community_guidelines_version', communityGuidelinesVersion)
+        .maybeSingle();
+    return row != null;
+  }
+
+  @override
+  Future<void> accept({
+    required String termsVersion,
+    required String communityGuidelinesVersion,
+  }) async {
+    if (client.auth.currentUser == null) throw StateError('login_required');
+    await client.rpc(
+      'accept_current_legal_versions',
+      params: {
+        'p_terms_version': termsVersion,
+        'p_community_guidelines_version': communityGuidelinesVersion,
+      },
+    );
+  }
 }
 
 String _randomUrlSafeValue(int byteCount) {
@@ -419,10 +506,10 @@ class SupabaseProfileRepository implements ProfileRepository {
           bucket.isNotEmpty &&
           path != null &&
           path.isNotEmpty) {
-        data['avatar'] = _mediaUrl(
-          client,
-          {'bucket': bucket, 'object_path': path},
-        );
+        data['avatar'] = _mediaUrl(client, {
+          'bucket': bucket,
+          'object_path': path,
+        });
       }
       final profile = _profileFromRow(data);
       return UserProfile(
@@ -514,6 +601,75 @@ class SupabaseProfileRepository implements ProfileRepository {
       createdAt: saved.createdAt,
     );
   }
+
+  @override
+  Future<bool> blockSeller(String sellerId) async {
+    final userId = client.auth.currentUser?.id;
+    if (userId == null) throw StateError('login_required');
+    if (sellerId.isEmpty || sellerId == userId) {
+      throw StateError('invalid_block_target');
+    }
+    final existing = await client
+        .from('user_blocks')
+        .select('blocker_id')
+        .eq('blocker_id', userId)
+        .eq('blocked_user_id', sellerId)
+        .maybeSingle();
+    if (existing != null) return false;
+    await client.from('user_blocks').insert({
+      'blocker_id': userId,
+      'blocked_user_id': sellerId,
+    });
+    return true;
+  }
+
+  @override
+  Future<List<UserProfile>> getBlockedUsers() async {
+    final userId = client.auth.currentUser?.id;
+    if (userId == null) throw StateError('login_required');
+    final rows = await client
+        .from('user_blocks')
+        .select('blocked_user_id,created_at')
+        .eq('blocker_id', userId)
+        .order('created_at', ascending: false);
+    return Future.wait(
+      rows.map((row) async {
+        final id = '${row['blocked_user_id']}';
+        try {
+          final publicProfile = await client.rpc(
+            'get_public_seller_profile',
+            params: {'p_owner_id': id},
+          );
+          if (publicProfile is Map)
+            return _profileFromRow(_json(publicProfile));
+        } catch (error, stackTrace) {
+          debugPrint('Blocked seller profile unavailable: id=$id error=$error');
+          debugPrintStack(stackTrace: stackTrace);
+        }
+        // RLS deliberately keeps private profiles private; retain an actionable
+        // fallback row so users can always unblock an account they blocked.
+        return UserProfile(
+          id: id,
+          name: 'ผู้ขาย',
+          phone: '',
+          email: '',
+          createdAt:
+              DateTime.tryParse('${row['created_at']}') ?? DateTime.now(),
+        );
+      }),
+    );
+  }
+
+  @override
+  Future<void> unblockUser(String sellerId) async {
+    final userId = client.auth.currentUser?.id;
+    if (userId == null) throw StateError('login_required');
+    await client
+        .from('user_blocks')
+        .delete()
+        .eq('blocker_id', userId)
+        .eq('blocked_user_id', sellerId);
+  }
 }
 
 class SupabaseCategoryRepository implements CategoryRepository {
@@ -557,11 +713,10 @@ class SupabaseCategoryRepository implements CategoryRepository {
       .eq('id', value.id);
 
   @override
-  Future<void> setActive(String id, bool active) =>
-      client
-          .from('categories')
-          .update({'is_active': active, 'active': active})
-          .eq('id', id);
+  Future<void> setActive(String id, bool active) => client
+      .from('categories')
+      .update({'is_active': active, 'active': active})
+      .eq('id', id);
 
   @override
   Future<void> reorder(String type, List<String> orderedIds) async {
@@ -650,11 +805,31 @@ class SupabaseListingRepository implements ListingRepository {
   }
 
   @override
-  Future<List<ListingRecord>> publicListings() async {
-    final response = await client.rpc('get_public_listings');
+  Future<List<ListingRecord>> publicListings({
+    double? latitude,
+    double? longitude,
+  }) async {
+    final response = await client.rpc(
+      'get_ranked_public_listings',
+      params: {'p_latitude': latitude, 'p_longitude': longitude},
+    );
     final rows = (response as List? ?? const [])
         .map((row) => _json(row))
         .toList();
+    if (rows.isNotEmpty) {
+      final videos = await client.rpc(
+        'get_public_listing_videos',
+        params: {'p_listing_ids': rows.map((row) => row['id']).toList()},
+      );
+      final byListingId = <String, Map<String, dynamic>>{
+        for (final value in (videos as List? ?? const []))
+          '${_json(value)['listing_id']}': _json(value),
+      };
+      for (final row in rows) {
+        final video = byListingId['${row['id']}'];
+        if (video != null) row['listing_video'] = video;
+      }
+    }
     return Future.wait(rows.map(_record));
   }
 
@@ -682,6 +857,7 @@ class SupabaseListingRepository implements ListingRepository {
     'description': value.description,
     'category_id': value.category,
     'price': value.price,
+    'original_price': value.originalPrice,
     'currency': value.currency,
     'city': value.city.trim(),
     if (value.cityId != null && value.cityId!.trim().isNotEmpty)
@@ -719,7 +895,8 @@ class SupabaseListingRepository implements ListingRepository {
     final retained = mediaIds.whereType<String>().toSet();
     for (final row in oldRows) {
       final mediaId = row['media_id']?.toString();
-      if (!retained.contains(mediaId)) await _deleteMediaIfOrphan(client, mediaId);
+      if (!retained.contains(mediaId))
+        await _deleteMediaIfOrphan(client, mediaId);
     }
   }
 
@@ -1012,13 +1189,26 @@ class SupabaseReportRepository implements ReportRepository {
   SupabaseReportRepository(this.client);
 
   @override
-  Future<void> create(ReportRecord report) => client.from('reports').insert({
-    'id': report.id,
-    if (report.type == 'listing') 'listing_id': report.targetId,
-    if (report.type == 'store') 'store_id': report.targetId,
-    'reason': report.reason,
-    'status': 'pending',
-  });
+  Future<void> create(ReportRecord report) async {
+    try {
+      await client.rpc(
+        'create_report',
+        params: {
+          'p_reason': report.reason,
+          'p_device_id': report.deviceId,
+          if (report.type == 'listing') 'p_listing_id': report.targetId,
+          if (report.type == 'store') 'p_store_id': report.targetId,
+          if (report.type == 'user') 'p_user_id': report.targetId,
+        },
+      );
+    } catch (error, stackTrace) {
+      debugPrint(
+        'Create report RPC failed: type=${report.type} target=${report.targetId} error=$error',
+      );
+      debugPrintStack(stackTrace: stackTrace);
+      rethrow;
+    }
+  }
 }
 
 class SupabaseNotificationRepository implements NotificationRepository {
@@ -1096,7 +1286,7 @@ class SupabaseShortVideoRepository implements ShortVideoRepository {
 
   Map<String, dynamic> _payload(ShortVideoRecord value) => {
     'id': value.id,
-    'tiktok_url': value.tiktokUrl,
+    'tiktok_url': value.youtubeUrl,
     'title': value.title.trim(),
     'sort_order': value.displayOrder,
     'is_active': value.isActive,
@@ -1416,7 +1606,7 @@ class SupabaseAdminRepository implements AdminRepository {
           .from('listings')
           .select(
             'id,owner_id,store_id,title,description,category,category_id,'
-            'price,currency,city,status,created_at,latitude,longitude,'
+            'price,original_price,currency,city,status,created_at,latitude,longitude,'
             'is_location_visible,listing_videos(id,video_media_id,thumbnail_media_id,'
             'duration_milliseconds,size_bytes,'
             'video_media_assets:media_assets!listing_videos_video_media_id_fkey(object_path),'
@@ -1487,14 +1677,26 @@ class SupabaseAdminRepository implements AdminRepository {
       'reports.page_1',
       () => client
           .from('reports')
-          .select('id,listing_id,store_id,reason,status,created_at')
+          .select(
+            'id,listing_id,store_id,reported_user_id,reason,status,'
+            'workflow_status,created_at,reviewed_at',
+          )
           .order('created_at', ascending: false)
           .range(page * pageSize, (page + 1) * pageSize - 1),
     )).map((row) {
       final value = _json(row);
-      value['target_id'] = value['listing_id'] ?? value['store_id'];
-      value['type'] = value['listing_id'] == null ? 'store' : 'listing';
-      value['reviewed'] = value['status'] != 'pending';
+      value['target_id'] =
+          value['listing_id'] ?? value['store_id'] ?? value['reported_user_id'];
+      value['type'] = value['listing_id'] != null
+          ? 'listing'
+          : value['store_id'] != null
+          ? 'store'
+          : 'user';
+      // New reports use canonical workflow_status=pending while the legacy
+      // status remains open; honour both formats so no pending row disappears.
+      value['reviewed'] =
+          (value['workflow_status'] ?? value['status']) != 'pending' &&
+          value['status'] != 'open';
       return value;
     }).toList();
   }

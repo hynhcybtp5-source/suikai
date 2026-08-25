@@ -1,5 +1,4 @@
 begin;
-
 insert into public.categories (
   id, kind, name, active, sort_order, type, legacy_key,
   name_th, name_shn, name_en, name_my, is_active
@@ -36,5 +35,4 @@ on conflict (id) do update set
   name_my = excluded.name_my,
   sort_order = excluded.sort_order,
   updated_at = now();
-
 commit;

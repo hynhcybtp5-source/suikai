@@ -1,5 +1,4 @@
 begin;
-
 create or replace function public.admin_set_profile_status(
   p_user_id uuid,
   p_status public.profile_status
@@ -31,7 +30,6 @@ begin
   );
 end;
 $$;
-
 create or replace function public.admin_moderate_listing(
   p_listing_id uuid,
   p_status text
@@ -82,7 +80,6 @@ begin
   end if;
 end;
 $$;
-
 create or replace function public.admin_set_store_status(
   p_store_id uuid,
   p_status text
@@ -125,7 +122,6 @@ begin
   if not found then raise exception 'Store not found or invalid status'; end if;
 end;
 $$;
-
 create or replace function public.admin_set_store_promoted(
   p_store_id uuid,
   p_promoted boolean
@@ -149,7 +145,6 @@ begin
   if not found then raise exception 'Active store not found'; end if;
 end;
 $$;
-
 revoke execute on function public.admin_set_profile_status(
   uuid, public.profile_status
 ) from public, anon;
@@ -159,7 +154,6 @@ revoke execute on function public.admin_set_store_status(uuid, text)
 from public, anon;
 revoke execute on function public.admin_set_store_promoted(uuid, boolean)
 from public, anon;
-
 grant execute on function public.admin_set_profile_status(
   uuid, public.profile_status
 ) to authenticated, service_role;
@@ -169,5 +163,4 @@ grant execute on function public.admin_set_store_status(uuid, text)
 to authenticated, service_role;
 grant execute on function public.admin_set_store_promoted(uuid, boolean)
 to authenticated, service_role;
-
 commit;

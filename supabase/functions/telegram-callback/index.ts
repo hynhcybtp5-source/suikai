@@ -8,9 +8,10 @@ Deno.serve((req) => {
   const error = url.searchParams.get("error");
   const errorDescription = url.searchParams.get("error_description");
 
-  const redirectUrl = state?.startsWith("mobile.")
-    ? "suikai://login-callback"
-    : Deno.env.get("TELEGRAM_APP_REDIRECT_URL") || "http://localhost:3000/";
+  const redirectUrl = Deno.env.get("TELEGRAM_APP_REDIRECT_URL");
+  if (!redirectUrl) {
+    return new Response("Missing TELEGRAM_APP_REDIRECT_URL", { status: 500 });
+  }
   let target: URL;
 
   try {

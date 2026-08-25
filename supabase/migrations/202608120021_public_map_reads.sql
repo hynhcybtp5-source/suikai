@@ -1,12 +1,10 @@
 begin;
-
 -- Privacy is also enforced at rest, so authenticated public users cannot read
 -- stale coordinates from an older client that only toggled the visibility flag.
 update public.listings
 set latitude = null, longitude = null
 where is_location_visible = false
   and (latitude is not null or longitude is not null);
-
 create or replace function public.clear_private_listing_coordinates()
 returns trigger
 language plpgsql
@@ -20,13 +18,11 @@ begin
   return new;
 end;
 $$;
-
 drop trigger if exists clear_private_listing_coordinates on public.listings;
 create trigger clear_private_listing_coordinates
 before insert or update of is_location_visible, latitude, longitude
 on public.listings
 for each row execute function public.clear_private_listing_coordinates();
-
 -- Anonymous clients read only these deliberately projected payloads. This is
 -- required because RLS filters rows, not individual latitude/longitude fields.
 create or replace function public.get_public_listings()
@@ -102,7 +98,6 @@ as $$
       )
   ) public_rows;
 $$;
-
 create or replace function public.get_public_stores()
 returns jsonb
 language sql
@@ -142,15 +137,12 @@ as $$
     and s.is_hidden = false
     and s.deleted_at is null;
 $$;
-
 revoke all on function public.get_public_listings() from public;
 revoke all on function public.get_public_stores() from public;
 grant execute on function public.get_public_listings() to anon, authenticated, service_role;
 grant execute on function public.get_public_stores() to anon, authenticated, service_role;
-
 -- Anonymous users must not bypass the sanitized projection with PostgREST.
 revoke select on table public.listings from anon;
 revoke select on table public.listing_images from anon;
 revoke select on table public.stores from anon;
-
 commit;

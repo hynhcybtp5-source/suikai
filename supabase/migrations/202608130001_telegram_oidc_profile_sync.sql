@@ -1,12 +1,9 @@
 begin;
-
 alter table public.profiles
   add column if not exists telegram_id text;
-
 create unique index if not exists profiles_telegram_id_unique
 on public.profiles (telegram_id)
 where telegram_id is not null;
-
 create or replace function public.sync_profile_from_auth_user(p_user_id uuid)
 returns public.profiles
 language plpgsql
@@ -132,11 +129,9 @@ identity_data := coalesce(telegram_identity -> 'identity_data', '{}'::jsonb);
   return synced_profile;
 end;
 $$;
-
 revoke all on function public.sync_profile_from_auth_user(uuid) from public;
 grant execute on function public.sync_profile_from_auth_user(uuid)
 to service_role;
-
 create or replace function public.handle_new_auth_user_profile()
 returns trigger
 language plpgsql
@@ -148,19 +143,15 @@ begin
   return new;
 end;
 $$;
-
 revoke all on function public.handle_new_auth_user_profile() from public;
-
 drop trigger if exists on_auth_user_created_create_profile on auth.users;
 create trigger on_auth_user_created_create_profile
 after insert on auth.users
 for each row execute function public.handle_new_auth_user_profile();
-
 drop trigger if exists on_auth_user_updated_sync_profile on auth.users;
 create trigger on_auth_user_updated_sync_profile
 after update of email, phone, raw_user_meta_data on auth.users
 for each row execute function public.handle_new_auth_user_profile();
-
 create or replace function public.sync_current_profile_from_auth()
 returns public.profiles
 language sql
@@ -169,9 +160,7 @@ set search_path = ''
 as $$
   select public.sync_profile_from_auth_user((select auth.uid()));
 $$;
-
 revoke all on function public.sync_current_profile_from_auth() from public;
 grant execute on function public.sync_current_profile_from_auth()
 to authenticated, service_role;
-
 commit;

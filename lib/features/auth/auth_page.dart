@@ -10,6 +10,7 @@ import '../../services/suikai_service.dart';
 import '../../data/models.dart';
 import '../../l10n/app_localizations.dart';
 import '../../l10n/mobile_localizations.dart';
+import '../legal/legal_pages.dart';
 
 class LoginPage extends StatefulWidget {
   final String pendingRoute;
@@ -168,7 +169,7 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
     try {
       if (kDebugMode) {
         debugPrint(
-          'Completing login callback: currentSessionIsNull=${session == null} lastAuthEvent=${_lastAuthEvent ?? 'none'}',
+          'Completing login callback: lastAuthEvent=${_lastAuthEvent ?? 'none'}',
         );
       }
       await SuikaiService.auth.syncCurrentProfile();
@@ -275,6 +276,34 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
             ),
             child: Text(l10n.ui('register')),
           ),
+          Wrap(
+            alignment: WrapAlignment.center,
+            children: [
+              TextButton(
+                onPressed: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const PrivacyPolicyPage()),
+                ),
+                child: Text(l10n.ui('privacyPolicy')),
+              ),
+              TextButton(
+                onPressed: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const TermsOfServicePage()),
+                ),
+                child: Text(l10n.ui('termsOfService')),
+              ),
+              TextButton(
+                onPressed: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => const CommunityGuidelinesPage(),
+                  ),
+                ),
+                child: Text(l10n.ui('communityGuidelines')),
+              ),
+            ],
+          ),
         ],
       ),
     );
@@ -295,6 +324,7 @@ class _RegisterPageState extends State<RegisterPage> {
       email = TextEditingController(),
       password = TextEditingController();
   bool busy = false;
+  bool _acceptedUgcTerms = false;
   @override
   void dispose() {
     for (final c in [name, phone, city, email, password]) c.dispose();
@@ -302,6 +332,14 @@ class _RegisterPageState extends State<RegisterPage> {
   }
 
   Future<void> register() async {
+    if (!_acceptedUgcTerms) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(AppLocalizations.of(context).ui('ugcConsentRequired')),
+        ),
+      );
+      return;
+    }
     if (city.text.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -332,6 +370,7 @@ class _RegisterPageState extends State<RegisterPage> {
         email: email.text,
         password: password.text,
         city: city.text.trim(),
+        acceptedUgcTerms: _acceptedUgcTerms,
       );
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -356,6 +395,14 @@ class _RegisterPageState extends State<RegisterPage> {
   }
 
   Future<void> _loginWithTelegram() async {
+    if (!_acceptedUgcTerms) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(AppLocalizations.of(context).ui('ugcConsentRequired')),
+        ),
+      );
+      return;
+    }
     setState(() => busy = true);
     try {
       await SuikaiService.loginWithTelegram();
@@ -420,6 +467,50 @@ class _RegisterPageState extends State<RegisterPage> {
             controller: password,
             obscureText: true,
             decoration: InputDecoration(labelText: l10n.ui('password')),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Checkbox(
+                value: _acceptedUgcTerms,
+                onChanged: busy
+                    ? null
+                    : (value) =>
+                          setState(() => _acceptedUgcTerms = value ?? false),
+              ),
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 10),
+                  child: Wrap(
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Text(l10n.ui('ugcConsentPrefix')),
+                      TextButton(
+                        onPressed: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => const TermsOfServicePage(),
+                          ),
+                        ),
+                        child: Text(l10n.ui('termsOfService')),
+                      ),
+                      Text(l10n.ui('ugcConsentAnd')),
+                      TextButton(
+                        onPressed: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => const CommunityGuidelinesPage(),
+                          ),
+                        ),
+                        child: Text(l10n.ui('communityGuidelines')),
+                      ),
+                      const Text('.'),
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ),
           const SizedBox(height: 20),
           ElevatedButton(
@@ -496,6 +587,7 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
   }
 
   Future<void> pick() async {
+    if (!await ensureUgcLegalAcceptance(context)) return;
     final image = await SuikaiService.pickImage();
     if (image != null) {
       final path = await SuikaiService.storage.persistImage(
@@ -509,6 +601,7 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
   Future<void> save() async {
     final p = profile;
     if (p == null || _saving) return;
+    if (!await ensureUgcLegalAcceptance(context)) return;
     final cityText = city.text.trim();
     CityRecord? matchedCity;
     if (cityText.isNotEmpty) {
@@ -619,15 +712,77 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
           const SizedBox(height: 12),
           TextField(
             controller: city,
-            decoration: InputDecoration(
-              labelText: l10n.source('เมืองที่อยู่'),
-            ),
+            decoration: InputDecoration(labelText: l10n.source('เมืองที่อยู่')),
           ),
           const SizedBox(height: 12),
           TextField(
             controller: email,
             readOnly: true,
             decoration: InputDecoration(labelText: l10n.ui('email')),
+          ),
+          const SizedBox(height: 8),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.block_rounded),
+            title: Text(l10n.ui('blockedUsers')),
+            subtitle: Text(l10n.ui('blockedUsersDescription')),
+            trailing: const Icon(Icons.chevron_right_rounded),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const BlockedUsersPage()),
+            ),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.privacy_tip_outlined),
+            title: Text(l10n.ui('privacyPolicy')),
+            trailing: const Icon(Icons.chevron_right_rounded),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const PrivacyPolicyPage()),
+            ),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.description_outlined),
+            title: Text(l10n.ui('termsOfService')),
+            trailing: const Icon(Icons.chevron_right_rounded),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const TermsOfServicePage()),
+            ),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.people_outline_rounded),
+            title: Text(l10n.ui('communityGuidelines')),
+            trailing: const Icon(Icons.chevron_right_rounded),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => const CommunityGuidelinesPage(),
+              ),
+            ),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(
+              Icons.delete_forever_outlined,
+              color: Colors.red,
+            ),
+            title: Text(
+              l10n.ui('deleteAccount'),
+              style: const TextStyle(color: Colors.red),
+            ),
+            subtitle: Text(l10n.ui('deleteAccountDescription')),
+            trailing: const Icon(
+              Icons.chevron_right_rounded,
+              color: Colors.red,
+            ),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const DeleteAccountPage()),
+            ),
           ),
           const SizedBox(height: 20),
           if (_saveError != null) ...[
@@ -636,11 +791,121 @@ class _ProfileSettingsPageState extends State<ProfileSettingsPage> {
           ],
           ElevatedButton(
             onPressed: _saving ? null : save,
-            child: Text(
-              _saving ? l10n.source('กำลังบันทึก...') : l10n.save,
-            ),
+            child: Text(_saving ? l10n.source('กำลังบันทึก...') : l10n.save),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class BlockedUsersPage extends StatefulWidget {
+  const BlockedUsersPage({super.key});
+
+  @override
+  State<BlockedUsersPage> createState() => _BlockedUsersPageState();
+}
+
+class _BlockedUsersPageState extends State<BlockedUsersPage> {
+  late Future<List<UserProfile>> _users = SuikaiService.getBlockedUsers();
+  String? _busyId;
+
+  Future<void> _unblock(UserProfile user) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(AppLocalizations.of(context).ui('unblockSellerQuestion')),
+        content: Text(
+          AppLocalizations.of(
+            context,
+          ).ui('unblockSellerConfirm').replaceFirst('{name}', user.name),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(AppLocalizations.of(context).source('ยกเลิก')),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(AppLocalizations.of(context).ui('unblockSeller')),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _busyId = user.id);
+    try {
+      await SuikaiService.unblockUser(user.id);
+      if (!mounted) return;
+      setState(() => _users = SuikaiService.getBlockedUsers());
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            AppLocalizations.of(context).ui('unblockSellerSuccess'),
+          ),
+        ),
+      );
+    } catch (error, stackTrace) {
+      debugPrint('Unblock seller failed: id=${user.id} error=$error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '${AppLocalizations.of(context).ui('unblockSellerFailed')}: $error',
+            ),
+          ),
+        );
+    } finally {
+      if (mounted) setState(() => _busyId = null);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context);
+    return Scaffold(
+      appBar: AppBar(title: Text(l10n.ui('blockedUsers'))),
+      body: FutureBuilder<List<UserProfile>>(
+        future: _users,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snapshot.hasError) {
+            return Center(
+              child: Text('${l10n.ui('loadFailed')}: ${snapshot.error}'),
+            );
+          }
+          final users = snapshot.data ?? const [];
+          if (users.isEmpty) {
+            return Center(child: Text(l10n.ui('blockedUsersEmpty')));
+          }
+          return ListView.separated(
+            itemCount: users.length,
+            separatorBuilder: (_, _) => const Divider(height: 1),
+            itemBuilder: (_, index) {
+              final user = users[index];
+              return ListTile(
+                leading: CircleAvatar(
+                  child: Text(
+                    user.name.isEmpty ? '?' : user.name.substring(0, 1),
+                  ),
+                ),
+                title: Text(user.name.isEmpty ? l10n.ui('seller') : user.name),
+                subtitle: Text(user.city),
+                trailing: TextButton(
+                  onPressed: _busyId == user.id ? null : () => _unblock(user),
+                  child: Text(
+                    _busyId == user.id
+                        ? l10n.source('กำลังบันทึก...')
+                        : l10n.ui('unblockSeller'),
+                  ),
+                ),
+              );
+            },
+          );
+        },
       ),
     );
   }

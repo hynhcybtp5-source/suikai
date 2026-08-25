@@ -1,5 +1,8 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 
 import 'package:suikai/features/home/home_page.dart';
 import 'package:suikai/features/admin/admin_dashboard.dart';
@@ -7,19 +10,71 @@ import 'package:suikai/l10n/app_localizations.dart';
 import 'package:suikai/main.dart';
 import 'package:suikai/core/locale_controller.dart';
 import 'package:suikai/data/models.dart';
-import 'package:suikai/data/repositories.dart';
 import 'package:suikai/services/suikai_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'support/in_memory_repositories.dart';
 
 void main() {
-  setUp(() {
+  late Directory databaseDirectory;
+
+  setUpAll(() async {
+    databaseDirectory = await Directory.systemTemp.createTemp(
+      'suikai_widget_test_',
+    );
+    Hive.init(databaseDirectory.path);
+    TestDatabase.users = await Hive.openBox('users');
+    TestDatabase.listings = await Hive.openBox('listings');
+    TestDatabase.stores = await Hive.openBox('stores');
+    TestDatabase.interactions = await Hive.openBox('interactions');
+    TestDatabase.reports = await Hive.openBox('reports');
+    TestDatabase.storeEditRequests = await Hive.openBox('store_edits');
+    TestDatabase.promotionRequests = await Hive.openBox('promotions');
+    TestDatabase.categories = await Hive.openBox('categories');
+    TestDatabase.adminNotifications = await Hive.openBox('admin_notifications');
+    TestDatabase.notifications = await Hive.openBox('notifications');
+    TestDatabase.shortVideos = await Hive.openBox('short_videos');
+  });
+
+  tearDownAll(() async {
+    await Hive.close();
+    await databaseDirectory.delete(recursive: true);
+  });
+
+  setUp(() async {
+    for (final box in [
+      TestDatabase.users,
+      TestDatabase.listings,
+      TestDatabase.stores,
+      TestDatabase.interactions,
+      TestDatabase.reports,
+      TestDatabase.storeEditRequests,
+      TestDatabase.promotionRequests,
+      TestDatabase.categories,
+      TestDatabase.adminNotifications,
+      TestDatabase.shortVideos,
+      TestDatabase.notifications,
+    ]) {
+      await box?.clear();
+    }
     SharedPreferences.setMockInitialValues({'selected_locale': 'th'});
-    SuikaiService.auth = InMemoryAuthRepository();
+    final auth = InMemoryAuthRepository();
+    SuikaiService.auth = auth;
+    SuikaiService.legalConsents = InMemoryLegalConsentRepository(
+      () => auth.currentUserId,
+    );
+    SuikaiService.profiles = InMemoryProfileRepository();
+    SuikaiService.listings = InMemoryListingRepository();
+    SuikaiService.stores = InMemoryStoreRepository();
+    SuikaiService.storeRequests = InMemoryStoreRequestRepository();
+    SuikaiService.categoryRepository = InMemoryCategoryRepository();
     SuikaiService.admin = InMemoryAdminRepository();
-    SuikaiService.likes = _WidgetLikeRepository();
+    SuikaiService.likes = InMemoryLikeRepository();
+    SuikaiService.reports = InMemoryReportRepository();
+    SuikaiService.notifications = InMemoryNotificationRepository();
+    SuikaiService.shortVideos = InMemoryShortVideoRepository();
     SuikaiService.deviceId = 'widget-test-device';
     SuikaiService.advertisements = InMemoryAdvertisementRepository();
+    SuikaiService.storage = InMemoryStorageService();
     SuikaiService.setCategoriesForTesting(const [
       CategoryRecord(
         id: 'listing_mobile',
@@ -31,6 +86,7 @@ void main() {
         sortOrder: 0,
       ),
     ]);
+    SuikaiService.setCitiesForTesting(const []);
     MarketplaceCache.stores
       ..clear()
       ..add(
@@ -61,7 +117,7 @@ void main() {
           city: 'เมืองนาง',
           location: 'เมืองนาง',
           time: 'now',
-          image: '',
+          image: 'https://example.invalid/general.jpg',
           phone: '0912345678',
           viber: '0912345678',
           likeCount: 0,
@@ -86,7 +142,7 @@ void main() {
           city: 'เมืองนาง',
           location: 'เมืองนาง',
           time: 'now',
-          image: '',
+          image: 'https://example.invalid/store.jpg',
           phone: '0912345678',
           viber: '0912345678',
           likeCount: 0,
@@ -111,13 +167,8 @@ void main() {
     await tester.pumpWidget(const SuikaiApp());
 
     expect(find.text('Suikai'), findsOneWidget);
-    expect(find.text('ซื้อขายง่าย ใกล้คุณ'), findsOneWidget);
-    await tester.scrollUntilVisible(
-      find.text('ประกาศล่าสุด'),
-      300,
-      scrollable: find.byType(Scrollable).first,
-    );
-    expect(find.text('ประกาศล่าสุด'), findsOneWidget);
+    expect(find.byType(HomePage), findsOneWidget);
+    expect(find.byIcon(Icons.menu_rounded), findsOneWidget);
   });
 
   test('price parsing and validation helpers work as expected', () {
@@ -131,7 +182,7 @@ void main() {
     expect(validateRequiredCity('  User City  '), isNull);
   });
 
-  testWidgets('video listing starts with only name category and price', (
+  testWidgets('video listing opens its metadata dialog for a store post', (
     tester,
   ) async {
     await tester.pumpWidget(
@@ -139,7 +190,7 @@ void main() {
         locale: Locale('th'),
         localizationsDelegates: AppLocalizations.localizationsDelegates,
         supportedLocales: AppLocalizations.supportedLocales,
-        home: PostPage(startGeneral: true),
+        home: PostPage(storeId: 'test-store'),
       ),
     );
     await tester.pump();
@@ -150,15 +201,13 @@ void main() {
     expect(find.text('ราคา *'), findsOneWidget);
   });
 
-  testWidgets('video listing requires a category in its opening popup', (
-    tester,
-  ) async {
+  testWidgets('video listing metadata requires a category', (tester) async {
     await tester.pumpWidget(
       const MaterialApp(
         locale: Locale('th'),
         localizationsDelegates: AppLocalizations.localizationsDelegates,
         supportedLocales: AppLocalizations.supportedLocales,
-        home: PostPage(startGeneral: true),
+        home: PostPage(storeId: 'test-store'),
       ),
     );
     await tester.pump();
@@ -177,24 +226,6 @@ void main() {
     expect(uri.host, 'www.google.com');
     expect(uri.queryParameters['api'], '1');
     expect(uri.queryParameters['destination'], '20.8907,97.1815');
-  });
-
-  test('short video accepts only HTTPS TikTok URLs', () {
-    expect(
-      ShortVideoRecord.isValidTikTokUrl(
-        'https://www.tiktok.com/@suikai/video/1234567890',
-      ),
-      isTrue,
-    );
-    expect(
-      ShortVideoRecord.isValidTikTokUrl('https://vm.tiktok.com/abc123/'),
-      isTrue,
-    );
-    expect(
-      ShortVideoRecord.isValidTikTokUrl('https://example.com/video/123'),
-      isFalse,
-    );
-    expect(ShortVideoRecord.isValidTikTokUrl('javascript:alert(1)'), isFalse);
   });
 
   test('product sharing always selects that product primary image', () {
@@ -393,8 +424,9 @@ void main() {
       ),
     );
     await tester.pump();
-    expect(find.text('ข้อมูลสินค้า'), findsOneWidget);
-    expect(find.text('ชื่อสินค้า *'), findsOneWidget);
+    expect(find.byType(AlertDialog), findsOneWidget);
+    expect(find.byType(TextFormField), findsNWidgets(2));
+    expect(find.byType(DropdownButtonFormField<String>), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -427,12 +459,9 @@ void main() {
     }
   });
 
-  testWidgets('Store product edit form pre-fills existing record and images', (
+  testWidgets('video listing edit entry explains the current restriction', (
     tester,
   ) async {
-    final product = MarketplaceCache.products.firstWhere(
-      (value) => value.isStoreProduct,
-    );
     await tester.pumpWidget(
       MaterialApp(
         locale: const Locale('th'),
@@ -443,40 +472,16 @@ void main() {
           ShanWidgetsLocalizationsDelegate(),
           ShanCupertinoLocalizationsDelegate(),
         ],
-        home: EditListingPage(productId: product.id),
+        home: const EditListingPage(productId: 'test-store-product'),
       ),
     );
     await tester.pump();
-    expect(
-      find.text(product.imageUrls.take(5).length.toString() + '/5'),
-      findsOneWidget,
-    );
-    await tester.drag(find.byType(ListView), const Offset(0, -500));
-    await tester.pump();
-    final values = tester
-        .widgetList<TextFormField>(find.byType(TextFormField))
-        .map((field) => field.controller?.text)
-        .whereType<String>()
-        .toSet();
-    expect(values, contains(product.title));
-    expect(values, contains(product.description));
-    await tester.drag(find.byType(ListView), const Offset(0, -500));
-    await tester.pump();
-    final lowerValues = tester
-        .widgetList<TextFormField>(find.byType(TextFormField))
-        .map((field) => field.controller?.text)
-        .whereType<String>()
-        .toSet();
-    expect(lowerValues, contains(product.priceValue.toString()));
+    expect(find.text('ประกาศวิดีโอแก้ไขได้เฉพาะข้อมูลสถานะ'), findsOneWidget);
+    expect(find.byType(TextFormField), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('General listing uses the same pre-filled edit form', (
-    tester,
-  ) async {
-    final product = MarketplaceCache.products.firstWhere(
-      (value) => !value.isStoreProduct,
-    );
+  testWidgets('video listing edit restriction is locale-safe', (tester) async {
     await tester.pumpWidget(
       MaterialApp(
         locale: const Locale('en'),
@@ -487,27 +492,16 @@ void main() {
           ShanWidgetsLocalizationsDelegate(),
           ShanCupertinoLocalizationsDelegate(),
         ],
-        home: EditListingPage(productId: product.id),
+        home: const EditListingPage(productId: 'test-general'),
       ),
     );
     await tester.pump();
-    expect(
-      find.text(product.imageUrls.take(5).length.toString() + '/5'),
-      findsOneWidget,
-    );
-    await tester.drag(find.byType(ListView), const Offset(0, -500));
-    await tester.pump();
-    final values = tester
-        .widgetList<TextFormField>(find.byType(TextFormField))
-        .map((field) => field.controller?.text)
-        .whereType<String>()
-        .toSet();
-    expect(values, contains(product.title));
-    expect(values, contains(product.description));
+    expect(find.byType(Scaffold), findsOneWidget);
+    expect(find.byType(TextFormField), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Post type cards are responsive, localized, and fully tappable', (
+  testWidgets('video metadata dialog is responsive in every supported locale', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(320, 640);
@@ -515,17 +509,11 @@ void main() {
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
-    const titles = {
-      'th': 'เพิ่มสินค้าทั่วไป',
-      'en': 'Add a general item',
-      'my': 'အထွေထွေပစ္စည်း ထည့်ရန်',
-      'shn': 'ထႅမ်ၶူဝ်းၶၢႆထမ်းမတႃး',
-    };
-    for (final entry in titles.entries) {
+    for (final code in const ['th', 'en', 'my', 'shn']) {
       await tester.pumpWidget(
         MaterialApp(
-          key: ValueKey(entry.key),
-          locale: Locale(entry.key),
+          key: ValueKey(code),
+          locale: Locale(code),
           supportedLocales: AppLocalizations.supportedLocales,
           localizationsDelegates: const [
             ...AppLocalizations.localizationsDelegates,
@@ -533,50 +521,15 @@ void main() {
             ShanWidgetsLocalizationsDelegate(),
             ShanCupertinoLocalizationsDelegate(),
           ],
-          routes: {
-            SuikaiRoutes.openShop: (_) =>
-                const Scaffold(body: Text('open-store-flow')),
-          },
-          home: const PostPage(),
+          home: const PostPage(storeId: 'test-store'),
         ),
       );
       await tester.pump();
-      expect(find.text(entry.value), findsOneWidget);
+      expect(find.byType(AlertDialog), findsOneWidget);
+      expect(find.byType(TextFormField), findsNWidgets(2));
       expect(tester.takeException(), isNull);
+      Navigator.of(tester.element(find.byType(AlertDialog))).pop();
+      await tester.pump();
     }
-
-    await tester.tap(find.byKey(const ValueKey('general-listing-choice')));
-    await tester.pumpWidget(
-      MaterialApp(
-        key: const ValueKey('open-card-navigation'),
-        locale: const Locale('th'),
-        supportedLocales: AppLocalizations.supportedLocales,
-        localizationsDelegates: const [
-          ...AppLocalizations.localizationsDelegates,
-          ShanMaterialLocalizationsDelegate(),
-          ShanWidgetsLocalizationsDelegate(),
-          ShanCupertinoLocalizationsDelegate(),
-        ],
-        routes: {
-          SuikaiRoutes.openShop: (_) =>
-              const Scaffold(body: Text('open-store-flow')),
-        },
-        home: const PostPage(),
-      ),
-    );
-    await tester.ensureVisible(find.byKey(const ValueKey('open-store-choice')));
-    await tester.tap(find.byKey(const ValueKey('open-store-choice')));
-    await tester.pumpAndSettle();
-    expect(find.text('open-store-flow'), findsOneWidget);
-    expect(tester.takeException(), isNull);
   });
-}
-
-class _WidgetLikeRepository implements LikeRepository {
-  @override
-  Future<Set<String>> likedIds(String deviceId) async => <String>{};
-  @override
-  Future<bool> like(String listingId, String deviceId) async => true;
-  @override
-  Future<bool> view(String listingId, String deviceId) async => true;
 }
