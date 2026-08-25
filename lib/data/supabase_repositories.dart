@@ -1423,6 +1423,10 @@ class SupabaseAdminRepository implements AdminRepository {
             'thumbnail_media_assets:media_assets!listing_videos_thumbnail_media_id_fkey(object_path)),'
             'listing_images(id,image_url,media_id,sort_order,media_assets(bucket,object_path))',
           )
+          // Admin deletion is a soft delete. Keep deleted listings out of the
+          // management lists too, so the dashboard immediately matches the
+          // public app after a successful delete.
+          .isFilter('deleted_at', null)
           .order('created_at', ascending: false)
           .range(page * pageSize, (page + 1) * pageSize - 1),
     );
