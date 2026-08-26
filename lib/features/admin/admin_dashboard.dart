@@ -667,37 +667,164 @@ class _AdminMap extends StatelessWidget {
     final label = '${row[isStore ? 'name' : 'title'] ?? ''}'.trim();
     return fmap.Marker(
       point: LatLng(latitude, longitude),
-      width: 54,
-      height: 54,
+      width: isStore ? 112 : 64,
+      height: isStore ? 96 : 64,
       child: Tooltip(
         message: label.isEmpty ? (isStore ? 'ร้านค้า' : 'สินค้า') : label,
         child: InkWell(
-          onTap: () => showDialog<void>(
-            context: context,
-            builder: (_) => AlertDialog(
-              title: Text(
-                label.isEmpty ? (isStore ? 'ร้านค้า' : 'สินค้า') : label,
-              ),
-              content: Text(
-                '${isStore ? 'ร้านค้า' : 'สินค้า'}\n${adminLocationText(latitude, longitude)}',
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('ปิด'),
+          onTap: () => isStore
+              ? _showStoreDetails(context, label, latitude, longitude)
+              : _showListingVideo(context, row, label),
+          child: isStore
+              ? _StoreMapMarker(
+                  label: label,
+                  logoUrl: '${row['logo_url'] ?? ''}',
+                )
+              : _ListingMapMarker(
+                  video: row['listing_video'],
+                  images: row['images'],
                 ),
-              ],
-            ),
-          ),
-          child: Icon(
-            isStore ? Icons.storefront_rounded : Icons.sell_rounded,
-            color: isStore ? Colors.blue.shade700 : AppTheme.orange,
-            size: 38,
-          ),
         ),
       ),
     );
   }
+
+  Future<void> _showStoreDetails(
+    BuildContext context,
+    String label,
+    double latitude,
+    double longitude,
+  ) => showDialog<void>(
+    context: context,
+    builder: (_) => AlertDialog(
+      title: Text(label.isEmpty ? 'ร้านค้า' : label),
+      content: Text('ร้านค้า\n${adminLocationText(latitude, longitude)}'),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('ปิด'),
+        ),
+      ],
+    ),
+  );
+
+  Future<void> _showListingVideo(
+    BuildContext context,
+    Map<String, dynamic> listing,
+    String label,
+  ) => showDialog<void>(
+    context: context,
+    builder: (_) => AlertDialog(
+      title: Text(label.isEmpty ? 'วิดีโอสินค้า' : label),
+      content: SizedBox(
+        width: 420,
+        child: AspectRatio(
+          aspectRatio: 9 / 16,
+          child: _AdminVideoPreview(
+            video: listing['listing_video'],
+            images: listing['images'],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('ปิด'),
+        ),
+      ],
+    ),
+  );
+}
+
+class _StoreMapMarker extends StatelessWidget {
+  const _StoreMapMarker({required this.label, required this.logoUrl});
+  final String label;
+  final String logoUrl;
+
+  @override
+  Widget build(BuildContext context) => Column(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Container(
+        width: 56,
+        height: 56,
+        padding: const EdgeInsets.all(3),
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: Colors.white,
+          border: Border.all(color: Colors.blue.shade700, width: 2),
+          boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)],
+        ),
+        child: ClipOval(
+          child: logoUrl.trim().isEmpty
+              ? const ColoredBox(
+                  color: AppTheme.orangeSoft,
+                  child: Icon(Icons.storefront_rounded),
+                )
+              : Image.network(
+                  logoUrl,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, _, _) => const ColoredBox(
+                    color: AppTheme.orangeSoft,
+                    child: Icon(Icons.storefront_rounded),
+                  ),
+                ),
+        ),
+      ),
+      const SizedBox(height: 2),
+      Container(
+        constraints: const BoxConstraints(maxWidth: 112),
+        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(8),
+          boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 3)],
+        ),
+        child: Text(
+          label.isEmpty ? 'ร้านค้า' : label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700),
+        ),
+      ),
+    ],
+  );
+}
+
+class _ListingMapMarker extends StatelessWidget {
+  const _ListingMapMarker({required this.video, required this.images});
+  final dynamic video;
+  final dynamic images;
+
+  @override
+  Widget build(BuildContext context) => Stack(
+    alignment: Alignment.center,
+    children: [
+      Container(
+        width: 60,
+        height: 60,
+        padding: const EdgeInsets.all(2),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: _VideoThumb(video: video, images: images),
+        ),
+      ),
+      const IgnorePointer(
+        child: Icon(
+          Icons.play_circle_fill_rounded,
+          color: Colors.white,
+          size: 28,
+          shadows: [Shadow(color: Colors.black54, blurRadius: 4)],
+        ),
+      ),
+    ],
+  );
 }
 
 class _AdminFullScreenMap extends StatefulWidget {

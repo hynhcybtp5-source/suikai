@@ -141,6 +141,12 @@ extension MobileLocalizations on AppLocalizations {
         'ၶၼ်တေႇတၵ်းလႆႈဢမ်ႇဢေႇၵႂႃႇၶၼ်ၶၢႆ',
       ],
       'password': ['รหัสผ่าน', 'Password', 'စကားဝှက်', 'ၶေႃႈလပ်ႉ'],
+      'confirmPassword': [
+        'ยืนยันรหัสผ่าน',
+        'Confirm password',
+        'အတည်ပြု စကားဝှက်',
+        'ယိုၼ်ယၼ်ၶေႃႈလပ်ႉ',
+      ],
       'name': ['ชื่อ', 'Name', 'အမည်', 'ၸိုဝ်ႈ'],
       'phone': ['เบอร์โทร', 'Phone', 'ဖုန်း', 'ၾူၼ်း'],
       'completeRegistration': [

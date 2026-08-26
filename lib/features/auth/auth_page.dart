@@ -322,12 +322,17 @@ class _RegisterPageState extends State<RegisterPage> {
       phone = TextEditingController(),
       city = TextEditingController(),
       email = TextEditingController(),
-      password = TextEditingController();
+      password = TextEditingController(),
+      confirmPassword = TextEditingController();
   bool busy = false;
   bool _acceptedUgcTerms = false;
+  bool _obscurePassword = true;
+  bool _obscureConfirmPassword = true;
   @override
   void dispose() {
-    for (final c in [name, phone, city, email, password]) c.dispose();
+    for (final c in [name, phone, city, email, password, confirmPassword]) {
+      c.dispose();
+    }
     super.dispose();
   }
 
@@ -352,7 +357,8 @@ class _RegisterPageState extends State<RegisterPage> {
     }
     if (name.text.trim().isEmpty ||
         email.text.trim().isEmpty ||
-        password.text.length < 6) {
+        password.text.length < 6 ||
+        password.text != confirmPassword.text) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
@@ -465,8 +471,35 @@ class _RegisterPageState extends State<RegisterPage> {
           const SizedBox(height: 12),
           TextField(
             controller: password,
-            obscureText: true,
-            decoration: InputDecoration(labelText: l10n.ui('password')),
+            obscureText: _obscurePassword,
+            decoration: InputDecoration(
+              labelText: l10n.ui('password'),
+              suffixIcon: IconButton(
+                onPressed: () =>
+                    setState(() => _obscurePassword = !_obscurePassword),
+                icon: Icon(
+                  _obscurePassword ? Icons.visibility_off : Icons.visibility,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: confirmPassword,
+            obscureText: _obscureConfirmPassword,
+            decoration: InputDecoration(
+              labelText: l10n.ui('confirmPassword'),
+              suffixIcon: IconButton(
+                onPressed: () => setState(
+                  () => _obscureConfirmPassword = !_obscureConfirmPassword,
+                ),
+                icon: Icon(
+                  _obscureConfirmPassword
+                      ? Icons.visibility_off
+                      : Icons.visibility,
+                ),
+              ),
+            ),
           ),
           const SizedBox(height: 14),
           Row(
