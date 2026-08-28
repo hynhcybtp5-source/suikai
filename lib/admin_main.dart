@@ -27,7 +27,7 @@ class _AdminStartupErrorApp extends StatelessWidget {
         child: Padding(
           padding: EdgeInsets.all(24),
           child: Text(
-            'ไม่สามารถเริ่มระบบ Admin ได้ กรุณาตรวจสอบ SUPABASE_URL และ SUPABASE_PUBLISHABLE_KEY',
+            'ไม่สามารถเริ่มระบบ Admin ได้ กรุณาตรวจสอบ SUPABASE_URL, SUPABASE_FALLBACK_URL และ SUPABASE_PUBLISHABLE_KEY',
             textAlign: TextAlign.center,
           ),
         ),

@@ -4,6 +4,8 @@ import 'dart:typed_data';
 import 'package:video_compress/video_compress.dart';
 import 'package:video_player/video_player.dart';
 
+import 'video_post_validation.dart';
+
 class PreparedVideoPost {
   final String path;
   final Uint8List thumbnailBytes;
@@ -19,12 +21,10 @@ class PreparedVideoPost {
 
 /// Native-only processing. The result is MP4/AAC from the platform encoder.
 class VideoPostProcessor {
-  static const _maxDurationMs = 30 * 1000;
-  static const _maxSizeBytes = 5 * 1024 * 1024;
   static Future<PreparedVideoPost> prepare(String sourcePath) async {
     final original = await VideoCompress.getMediaInfo(sourcePath);
     final originalDuration = original.duration?.round() ?? 0;
-    if (originalDuration > _maxDurationMs) {
+    if (originalDuration > VideoPostValidation.maxDurationMilliseconds) {
       throw const FormatException('video_duration_exceeds_30_seconds');
     }
     final source = File(sourcePath);
@@ -35,7 +35,7 @@ class VideoPostProcessor {
     // third-party compressor can create an MP4 whose container is valid but
     // whose H.264 frames no longer decode. Uploading the camera original is
     // both lossless and reliable when it is already within our limit.
-    if (sourceSizeBytes <= _maxSizeBytes) {
+    if (sourceSizeBytes <= VideoPostValidation.maxSizeBytes) {
       return _prepareOriginal(
         sourcePath: sourcePath,
         durationMilliseconds: originalDuration,
@@ -55,12 +55,12 @@ class VideoPostProcessor {
     }
     final output = File(path);
     final sizeBytes = await output.length();
-    if (sizeBytes > _maxSizeBytes) {
+    if (sizeBytes > VideoPostValidation.maxSizeBytes) {
       throw const FormatException('video_size_exceeds_5_mb');
     }
     await _verifyPlayableOutput(path);
     final duration = compressed?.duration?.round() ?? originalDuration;
-    if (duration > _maxDurationMs) {
+    if (duration > VideoPostValidation.maxDurationMilliseconds) {
       throw const FormatException('video_duration_exceeds_30_seconds');
     }
     final thumbnail = await VideoCompress.getByteThumbnail(

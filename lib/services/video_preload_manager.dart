@@ -88,7 +88,10 @@ class VideoPreloadManager {
   ) async {
     if (_disposed) return;
     final activeKey = _key(active);
-    for (final entry in _controllers.entries) {
+    // Loading a neighbour is asynchronous and may add a controller while the
+    // active item is being switched. Iterate a snapshot so a page swipe never
+    // mutates this map during iteration.
+    for (final entry in _controllers.entries.toList()) {
       if (entry.key != activeKey && entry.value.value.isPlaying) {
         await entry.value.pause();
       }

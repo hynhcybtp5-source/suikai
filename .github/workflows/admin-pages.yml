@@ -35,6 +35,11 @@ jobs:
         run: |
           printf '%s' '${{ secrets.DART_DEFINES }}' > dart_defines.json
 
+      - name: Validate Supabase endpoint defines
+        run: |
+          grep -q '"SUPABASE_URL"' dart_defines.json
+          grep -q '"SUPABASE_FALLBACK_URL"' dart_defines.json
+
       - name: Build Admin Web
         run: |
           flutter build web \

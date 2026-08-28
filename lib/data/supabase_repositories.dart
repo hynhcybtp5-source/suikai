@@ -10,7 +10,11 @@ import 'package:uuid/uuid.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../core/telegram_callback_uri.dart';
+import '../core/telegram_callback_url.dart';
+import '../core/password_recovery_uri.dart';
 import '../core/legal_versions.dart';
+import '../core/supabase_endpoint_bootstrap.dart';
+import '../core/supabase_media_url.dart';
 import 'models.dart';
 import 'repositories.dart';
 
@@ -23,13 +27,50 @@ class SupabaseEndpointUnreachableException implements Exception {
 
 class SupabaseBackend {
   static const url = String.fromEnvironment('SUPABASE_URL');
+  static const fallbackUrl = String.fromEnvironment('SUPABASE_FALLBACK_URL');
   static const publishableKey = String.fromEnvironment(
     'SUPABASE_PUBLISHABLE_KEY',
   );
   static String get clientKey => publishableKey;
+  static var _legacyImageHostLogCount = 0;
 
-  static bool get enabled => url.isNotEmpty && clientKey.isNotEmpty;
-  static late final Uri selectedEndpoint;
+  static bool get enabled =>
+      url.isNotEmpty && fallbackUrl.isNotEmpty && clientKey.isNotEmpty;
+  static final _bootstrap = SupabaseEndpointBootstrap(
+    direct: endpointForConfiguration(url),
+    fallback: endpointForConfiguration(fallbackUrl),
+    selector: SupabaseEndpointSelector(
+      probe: probeSupabaseEndpoint,
+      onProbeCompleted: (result) {
+        final name = result.kind == SupabaseEndpointKind.direct
+            ? 'direct'
+            : 'proxy';
+        debugPrint(
+          'Supabase endpoint race: $name=${result.elapsed.inMilliseconds}ms '
+          '${result.reachable ? 'reachable' : 'unreachable'}',
+        );
+      },
+    ),
+  );
+  static Uri get selectedEndpoint => _bootstrap.selection.endpoint;
+  static String normalizeLegacyMediaUrl(String value) {
+    try {
+      final normalized = normalizeSupabaseMediaUrl(value, selectedEndpoint);
+      if (normalized != value && _legacyImageHostLogCount < 2) {
+        final host = Uri.tryParse(normalized)?.host;
+        if (host != null && host.isNotEmpty) {
+          _legacyImageHostLogCount++;
+          debugPrint('IMAGE HOST: $host');
+        }
+      }
+      return normalized;
+    } on StateError {
+      // Widget tests can render legacy URL values without initializing
+      // Supabase. In a real session, bootstrap always selects first.
+      return value;
+    }
+  }
+
   static final authOptions = FlutterAuthClientOptions(
     authFlowType: AuthFlowType.pkce,
     detectSessionInUriPredicate: shouldSupabaseHandleAuthDeepLink,
@@ -37,23 +78,25 @@ class SupabaseBackend {
 
   static Future<void> initialize() async {
     if (!enabled) return;
-    selectedEndpoint = endpointForConfiguration(url);
-    debugPrint('SUPABASE ENDPOINT: PRODUCTION');
-    debugPrint(
-      'Supabase initialize: scheme=${selectedEndpoint.scheme} '
-      'host=${selectedEndpoint.host}',
-    );
     try {
-      await Supabase.initialize(
-        url: selectedEndpoint.toString(),
-        publishableKey: clientKey,
-        authOptions: authOptions,
-      );
-      debugPrint('Supabase initialize: complete host=${selectedEndpoint.host}');
+      await _bootstrap.initialize((selection) async {
+        debugPrint(
+          'Supabase endpoint selected: '
+          '${selection.isFallback ? 'fallback' : 'direct'}',
+        );
+        await Supabase.initialize(
+          url: selection.endpoint.toString(),
+          publishableKey: clientKey,
+          authOptions: authOptions,
+        );
+      });
     } catch (error, stackTrace) {
       debugPrint('Supabase initialize failed: $error');
       debugPrintStack(stackTrace: stackTrace);
-      throw const SupabaseEndpointUnreachableException();
+      if (error is SupabaseEndpointsUnavailableException) {
+        throw const SupabaseEndpointUnreachableException();
+      }
+      rethrow;
     }
   }
 
@@ -114,6 +157,7 @@ List<String> _listingImageUrls(SupabaseClient client, dynamic relation) {
         url = client.storage.from(bucket).getPublicUrl(path);
       }
     }
+    url = SupabaseBackend.normalizeLegacyMediaUrl(url);
     if (url.isNotEmpty && !urls.contains(url)) urls.add(url);
   }
   return urls;
@@ -181,12 +225,10 @@ Future<void> _deleteMediaIfOrphan(
 
 class SupabaseAuthRepository implements AuthRepository {
   static const _telegramAuthorizationUrl = 'https://oauth.telegram.org/auth';
-  static const _telegramCallbackUri = String.fromEnvironment(
-    'TELEGRAM_CALLBACK_URL',
-  );
   static const _telegramClientId = String.fromEnvironment('TELEGRAM_CLIENT_ID');
   static const _telegramStatePreference = 'telegram_oauth_state';
   static const _telegramVerifierPreference = 'telegram_oauth_code_verifier';
+  static const _telegramCallbackPreference = 'telegram_oauth_callback_url';
 
   final SupabaseClient client;
   SupabaseAuthRepository(this.client);
@@ -269,9 +311,20 @@ class SupabaseAuthRepository implements AuthRepository {
   }
 
   @override
+  Future<void> requestPasswordReset(String email) =>
+      client.auth.resetPasswordForEmail(
+        normalizeAuthEmail(email),
+        redirectTo: passwordRecoveryRedirectUrl,
+      );
+
+  @override
+  Future<void> updatePassword(String password) =>
+      client.auth.updateUser(UserAttributes(password: password));
+
+  @override
   Future<void> loginWithTelegram() async {
     debugPrint('LOGIN START provider=telegram');
-    if (_telegramClientId.isEmpty || _telegramCallbackUri.isEmpty) {
+    if (_telegramClientId.isEmpty) {
       throw StateError('telegram_client_id_not_configured');
     }
 
@@ -282,15 +335,21 @@ class SupabaseAuthRepository implements AuthRepository {
         .encode(sha256.convert(utf8.encode(verifier)).bytes)
         .replaceAll('=', '');
 
+    // Freeze this URL with the PKCE transaction. The endpoint bootstrap has
+    // already initialized the client exactly once, so it cannot switch while
+    // Telegram is open or before the authorization code is redeemed.
+    final callbackUri = telegramCallbackUrlForEndpoint(
+      SupabaseBackend.selectedEndpoint,
+    );
+    final callbackUrl = callbackUri.toString();
     await preferences.setString(_telegramStatePreference, state);
     await preferences.setString(_telegramVerifierPreference, verifier);
-
-    final callbackUri = Uri.parse(_telegramCallbackUri);
+    await preferences.setString(_telegramCallbackPreference, callbackUrl);
     final authorizationUri = Uri.parse(_telegramAuthorizationUrl).replace(
       queryParameters: {
         'response_type': 'code',
         'client_id': _telegramClientId,
-        'redirect_uri': _telegramCallbackUri,
+        'redirect_uri': callbackUrl,
         'origin': callbackUri.origin,
         'scope': 'openid',
         'state': state,
@@ -333,9 +392,13 @@ class SupabaseAuthRepository implements AuthRepository {
     final receivedState = callbackUri.queryParameters['state'];
     final expectedState = preferences.getString(_telegramStatePreference);
     final verifier = preferences.getString(_telegramVerifierPreference);
+    final transactionCallback = preferences.getString(
+      _telegramCallbackPreference,
+    );
 
     await preferences.remove(_telegramStatePreference);
     await preferences.remove(_telegramVerifierPreference);
+    await preferences.remove(_telegramCallbackPreference);
 
     final stateValid =
         expectedState != null &&
@@ -354,6 +417,9 @@ class SupabaseAuthRepository implements AuthRepository {
     if (code == null || code.isEmpty) {
       throw StateError('telegram_authorization_code_missing');
     }
+    if (transactionCallback == null || transactionCallback.isEmpty) {
+      throw StateError('telegram_oauth_callback_missing');
+    }
 
     debugPrint('TOKEN EXCHANGE START');
     late final FunctionResponse response;
@@ -363,7 +429,7 @@ class SupabaseAuthRepository implements AuthRepository {
         body: {
           'code': code,
           'code_verifier': verifier,
-          'redirect_uri': _telegramCallbackUri,
+          'redirect_uri': transactionCallback,
         },
       );
       debugPrint('TOKEN EXCHANGE SUCCESS');
@@ -480,7 +546,9 @@ UserProfile _profileFromRow(Map<String, dynamic> row, {User? user}) =>
       name: '${row['name'] ?? ''}',
       phone: '${row['phone'] ?? ''}',
       email: '${row['email'] ?? user?.email ?? ''}',
-      avatar: '${user?.userMetadata?['avatar_url'] ?? ''}',
+      avatar: SupabaseBackend.normalizeLegacyMediaUrl(
+        '${user?.userMetadata?['avatar_url'] ?? ''}',
+      ),
       city: '${row['city'] ?? ''}',
       cityId: row['city_id']?.toString(),
       viber: '${row['viber_phone'] ?? ''}',
@@ -517,7 +585,9 @@ class SupabaseProfileRepository implements ProfileRepository {
         name: profile.name,
         phone: '',
         email: '',
-        avatar: '${data['avatar'] ?? ''}',
+        avatar: SupabaseBackend.normalizeLegacyMediaUrl(
+          '${data['avatar'] ?? ''}',
+        ),
         city: profile.city,
         cityId: profile.cityId,
         viber: '',
@@ -547,7 +617,7 @@ class SupabaseProfileRepository implements ProfileRepository {
       name: profile.name,
       phone: profile.phone,
       email: profile.email,
-      avatar: '${data['avatar']}',
+      avatar: SupabaseBackend.normalizeLegacyMediaUrl('${data['avatar']}'),
       city: profile.city,
       cityId: profile.cityId,
       viber: profile.viber,
@@ -1058,6 +1128,12 @@ class SupabaseStoreRepository implements StoreRepository {
   List<StoreRecord> _records(List<dynamic> rows) {
     return rows.map((row) {
       final data = _json(row);
+      data['logo_url'] = SupabaseBackend.normalizeLegacyMediaUrl(
+        '${data['logo_url'] ?? ''}',
+      );
+      data['cover_url'] = SupabaseBackend.normalizeLegacyMediaUrl(
+        '${data['cover_url'] ?? ''}',
+      );
       return StoreRecord.fromJson({
         ...data,
         'category': data['category_id'] ?? data['category'] ?? '',

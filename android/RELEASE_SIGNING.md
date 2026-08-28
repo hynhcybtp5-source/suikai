@@ -31,13 +31,15 @@ upload key requires an upload-key reset in Play Console. Neither
 
 ## Build
 
-Use the local ignored `dart_defines.json` for Supabase and legal release
-configuration:
+Use the local ignored `dart_defines.production.json` for Supabase and legal
+release configuration. It must contain both `SUPABASE_URL` (the direct
+endpoint) and `SUPABASE_FALLBACK_URL` (the proxy endpoint), in addition to the
+publishable key and legal settings:
 
 ```sh
 flutter clean
 flutter pub get
-flutter build appbundle --release --dart-define-from-file=dart_defines.json
+flutter build appbundle --release --dart-define-from-file=dart_defines.production.json
 ```
 
 Set these legal values in that local file before production release:

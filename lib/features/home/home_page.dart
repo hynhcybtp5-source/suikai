@@ -19,9 +19,13 @@ import '../../l10n/mobile_localizations.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/category_icons.dart';
 import '../../services/suikai_service.dart';
+import '../../services/listing_publish_error.dart';
 import '../../services/video_preload_manager.dart';
+import '../../services/video_segment_merger.dart';
+import '../../services/video_segment_session.dart';
 import '../../services/fx_service.dart';
 import '../../data/models.dart';
+import '../../data/supabase_repositories.dart';
 import '../../widgets/youtube_embed_player.dart';
 import '../../widgets/location_picker_map.dart';
 import '../admin/admin_dashboard.dart';
@@ -943,6 +947,7 @@ Widget persistentImage(
   BoxFit? fit,
   Widget Function(BuildContext, Object, StackTrace?)? errorBuilder,
 }) {
+  source = SupabaseBackend.normalizeLegacyMediaUrl(source);
   if (source.isNotEmpty && !source.startsWith('http')) {
     return Image.file(
       key: key ?? ValueKey('file-image-$source'),
@@ -4141,6 +4146,7 @@ class _PostPageState extends State<PostPage> {
   String _condition = 'มือหนึ่ง';
   bool _isLocationVisible = true;
   bool _submitting = false;
+  late final String _submissionKey;
   latlng.LatLng? _listingPosition;
   ProductStatus _listingStatus = ProductStatus.available;
   final List<SelectedImage> _selectedImages = [];
@@ -4148,6 +4154,7 @@ class _PostPageState extends State<PostPage> {
   @override
   void initState() {
     super.initState();
+    _submissionKey = SubmissionGuard.newSessionKey(flow: 'listing');
     _showGeneralWizard = widget.startGeneral || widget.storeId != null;
     _category = widget.storeId == null
         ? ''
@@ -5370,7 +5377,7 @@ class _PostPageState extends State<PostPage> {
           Expanded(
             flex: 2,
             child: _primaryButton(
-              _submitting ? 'กำลังบันทึก...' : 'ยืนยันการลงขาย',
+              _submitting ? 'กำลังส่งประกาศ...' : 'ยืนยันการลงขาย',
               _submitting
                   ? null
                   : () async {
@@ -5402,9 +5409,33 @@ class _PostPageState extends State<PostPage> {
                         return;
                       }
                       if (!await ensureUgcLegalAcceptance(context)) return;
+                      final guardResult = await SubmissionGuard.begin(
+                        _submissionKey,
+                      );
+                      if (!context.mounted) return;
+                      if (guardResult ==
+                          SubmissionStartResult.alreadySubmitting) {
+                        showInfo(
+                          context,
+                          AppLocalizations.of(context).source(
+                            'กำลังส่งข้อมูลนี้อยู่ กรุณารอสักครู่',
+                          ),
+                        );
+                        return;
+                      }
+                      if (guardResult ==
+                          SubmissionStartResult.alreadySubmitted) {
+                        showInfo(
+                          context,
+                          AppLocalizations.of(context).source(
+                            'รายการนี้ลงขายแล้ว',
+                          ),
+                        );
+                        return;
+                      }
                       setState(() => _submitting = true);
                       try {
-                        await SuikaiService.createListing(
+                        final created = await SuikaiService.createListing(
                           title: normalizeText(_nameController.text),
                           description: normalizeText(_detailsController.text),
                           category: _category,
@@ -5424,10 +5455,19 @@ class _PostPageState extends State<PostPage> {
                           isLocationVisible:
                               widget.storeId != null || _isLocationVisible,
                         );
+                        await SubmissionGuard.succeed(
+                          _submissionKey,
+                          referenceId: created?['id']?.toString(),
+                        );
                         if (!context.mounted) {
                           return;
                         }
-                        showInfo(context, 'ลงประกาศสำเร็จ');
+                        showInfo(
+                          context,
+                          AppLocalizations.of(context).source(
+                            'ลงประกาศสำเร็จ',
+                          ),
+                        );
                         if (Navigator.canPop(context)) {
                           Navigator.pop(context, true);
                         } else {
@@ -5437,13 +5477,19 @@ class _PostPageState extends State<PostPage> {
                           );
                         }
                       } catch (error, stackTrace) {
+                        await SubmissionGuard.fail(_submissionKey);
                         debugPrint(
                           'Submit listing failed: $error\n$stackTrace',
                         );
                         if (!context.mounted) {
                           return;
                         }
-                        showInfo(context, 'ลงประกาศไม่สำเร็จ: $error');
+                        showInfo(
+                          context,
+                          AppLocalizations.of(context).source(
+                            ListingPublishError.messageKeyFor(error),
+                          ),
+                        );
                         setState(() => _submitting = false);
                       }
                     },
@@ -5784,6 +5830,7 @@ class _VideoPostPageState extends State<VideoPostPage> {
   String _progressMessage = '';
   late final String _submissionKey;
   SelectedVideoPost? _video;
+  List<SelectedImage> _images = const [];
   VideoPlayerController? _preview;
 
   @override
@@ -6002,6 +6049,11 @@ class _VideoPostPageState extends State<VideoPostPage> {
               onTap: () => Navigator.pop(context, ImageSource.camera),
             ),
             ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: Text(l10n.source('เลือกรูปจากคลัง (สูงสุด 10 รูป)')),
+              onTap: () => Navigator.pop(context, ImageSource.gallery),
+            ),
+            ListTile(
               leading: const Icon(Icons.video_library_outlined),
               title: Text(l10n.source('เลือกจากคลัง')),
               onTap: () => Navigator.pop(context, ImageSource.gallery),
@@ -6026,6 +6078,35 @@ class _VideoPostPageState extends State<VideoPostPage> {
           selected = await SuikaiService.prepareVideoPost(recording.path);
         }
       } else {
+        final wantsImages = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: const LocalizedText('เลือกสื่อ'),
+            content: const LocalizedText('ต้องการเลือกวิดีโอหรือรูปภาพ?'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: const LocalizedText('รูปภาพ'),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const LocalizedText('วิดีโอ'),
+              ),
+            ],
+          ),
+        );
+        if (wantsImages == true) {
+          final images = await SuikaiService.pickImages(maxCount: 10);
+          if (!mounted || images.isEmpty) return;
+          await _preview?.dispose();
+          setState(() {
+            _video = null;
+            _preview = null;
+            _images = images;
+            _progressMessage = '';
+          });
+          return;
+        }
         selected = await SuikaiService.pickVideoPost(source: source);
       }
       if (selected == null || !mounted) return;
@@ -6040,6 +6121,7 @@ class _VideoPostPageState extends State<VideoPostPage> {
       }
       setState(() {
         _video = selected;
+        _images = const [];
         _preview = controller;
         _progressMessage = '';
       });
@@ -6065,7 +6147,7 @@ class _VideoPostPageState extends State<VideoPostPage> {
 
   Future<void> _publish() async {
     final video = _video;
-    if (video == null) return;
+    if (video == null && _images.isEmpty) return;
     final l10n = AppLocalizations.of(context);
     if (SuikaiService.currentUserId?.trim().isEmpty != false) {
       showInfo(context, 'กรุณาเข้าสู่ระบบก่อนโพสต์สินค้า');
@@ -6075,11 +6157,14 @@ class _VideoPostPageState extends State<VideoPostPage> {
     final guardResult = await SubmissionGuard.begin(_submissionKey);
     if (!mounted) return;
     if (guardResult == SubmissionStartResult.alreadySubmitting) {
-      showInfo(context, 'กำลังส่งข้อมูลนี้อยู่ กรุณารอสักครู่');
+      showInfo(
+        context,
+        l10n.source('กำลังส่งข้อมูลนี้อยู่ กรุณารอสักครู่'),
+      );
       return;
     }
     if (guardResult == SubmissionStartResult.alreadySubmitted) {
-      showInfo(context, 'รายการนี้ลงขายแล้ว');
+      showInfo(context, l10n.source('รายการนี้ลงขายแล้ว'));
       return;
     }
     setState(() {
@@ -6140,6 +6225,7 @@ class _VideoPostPageState extends State<VideoPostPage> {
         listingType: widget.storeId == null ? 'general' : 'store',
         storeId: widget.storeId,
         video: video,
+        images: _images,
         latitude: latitude,
         longitude: longitude,
         isLocationVisible: widget.storeId != null || latitude != null,
@@ -6150,11 +6236,17 @@ class _VideoPostPageState extends State<VideoPostPage> {
       );
       if (mounted) {
         HapticFeedback.mediumImpact();
+        showInfo(context, l10n.source('ลงประกาศสำเร็จ'));
         Navigator.pop(context, true);
       }
     } catch (error) {
       await SubmissionGuard.fail(_submissionKey);
-      if (mounted) showInfo(context, 'ลงประกาศไม่สำเร็จ: $error');
+      if (mounted) {
+        showInfo(
+          context,
+          l10n.source(ListingPublishError.messageKeyFor(error)),
+        );
+      }
     } finally {
       if (mounted) {
         setState(() {
@@ -6176,7 +6268,7 @@ class _VideoPostPageState extends State<VideoPostPage> {
         ? const SizedBox.shrink()
         : Padding(
             padding: const EdgeInsets.all(16),
-            child: _preview == null
+            child: _preview == null && _images.isEmpty
                 ? _posting
                       ? _VideoPreparingState(message: _progressMessage)
                       : Center(
@@ -6189,31 +6281,60 @@ class _VideoPostPageState extends State<VideoPostPage> {
                 : Column(
                     children: [
                       Expanded(
-                        child: AspectRatio(
-                          aspectRatio: _preview!.value.aspectRatio,
-                          child: VideoPlayer(_preview!),
+                        child: _preview != null
+                            ? AspectRatio(
+                                aspectRatio: _preview!.value.aspectRatio,
+                                child: VideoPlayer(_preview!),
+                              )
+                            : PageView.builder(
+                                itemCount: _images.length,
+                                itemBuilder: (_, index) => Image.file(
+                                  File(_images[index].file.path),
+                                  fit: BoxFit.contain,
+                                ),
+                              ),
+                      ),
+                      if (_preview != null)
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            IconButton(
+                              onPressed: () => setState(
+                                () => _preview!.value.isPlaying
+                                    ? _preview!.pause()
+                                    : _preview!.play(),
+                              ),
+                              icon: Icon(
+                                _preview!.value.isPlaying
+                                    ? Icons.pause
+                                    : Icons.play_arrow,
+                              ),
+                            ),
+                            Text(
+                              '${(_video!.prepared.durationMilliseconds / 1000).toStringAsFixed(1)} ${AppLocalizations.of(context).source('วินาที')}',
+                            ),
+                          ],
                         ),
-                      ),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          IconButton(
-                            onPressed: () => setState(
-                              () => _preview!.value.isPlaying
-                                  ? _preview!.pause()
-                                  : _preview!.play(),
-                            ),
-                            icon: Icon(
-                              _preview!.value.isPlaying
-                                  ? Icons.pause
-                                  : Icons.play_arrow,
-                            ),
-                          ),
-                          Text(
-                            '${(_video!.prepared.durationMilliseconds / 1000).toStringAsFixed(1)} ${AppLocalizations.of(context).source('วินาที')}',
-                          ),
-                        ],
-                      ),
+                      if (_images.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Text('${_images.length} / 10 รูป'),
+                        Wrap(
+                          spacing: 6,
+                          children: [
+                            for (var index = 0; index < _images.length; index++)
+                              ActionChip(
+                                label: Text('ลบ ${index + 1}'),
+                                onPressed: _posting
+                                    ? null
+                                    : () => setState(
+                                        () =>
+                                            _images = [..._images]
+                                              ..removeAt(index),
+                                      ),
+                              ),
+                          ],
+                        ),
+                      ],
                       if (_posting && _progressMessage.isNotEmpty) ...[
                         const SizedBox(height: 12),
                         const LinearProgressIndicator(),
@@ -6343,23 +6464,36 @@ class VideoRecorderPage extends StatefulWidget {
   State<VideoRecorderPage> createState() => _VideoRecorderPageState();
 }
 
-class _VideoRecorderPageState extends State<VideoRecorderPage> {
+class _VideoRecorderPageState extends State<VideoRecorderPage>
+    with WidgetsBindingObserver {
   static const _maximum = Duration(seconds: 30);
   CameraController? _camera;
   VideoPlayerController? _preview;
   Timer? _timer;
   Duration _elapsed = Duration.zero;
-  XFile? _recording;
+  final _segments = VideoSegmentSession();
   String? _error;
   bool _initializing = true;
   bool _isRecording = false;
   bool _isStopping = false;
+  bool _isMerging = false;
+  bool _handoffCompleted = false;
   bool _front = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initializeCamera();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Camera plugins can lose their active surface in background. Stop the
+    // current segment cleanly; the user can resume with another segment.
+    if (state != AppLifecycleState.resumed && _isRecording) {
+      unawaited(_stopRecording());
+    }
   }
 
   Future<void> _initializeCamera() async {
@@ -6420,7 +6554,7 @@ class _VideoRecorderPageState extends State<VideoRecorderPage> {
       await camera.startVideoRecording();
       if (!mounted) return;
       setState(() {
-        _elapsed = Duration.zero;
+        _elapsed = _segments.totalDuration;
         _isRecording = true;
       });
       _timer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
@@ -6452,19 +6586,17 @@ class _VideoRecorderPageState extends State<VideoRecorderPage> {
     });
     try {
       final recording = await camera.stopVideoRecording();
-      final preview = VideoPlayerController.file(File(recording.path));
-      await preview.initialize();
-      await preview.setLooping(true);
-      if (!mounted) {
-        await preview.dispose();
+      final probe = VideoPlayerController.file(File(recording.path));
+      await probe.initialize();
+      final duration = probe.value.duration;
+      await probe.dispose();
+      if (duration <= Duration.zero || duration > _segments.remaining) {
+        await File(recording.path).delete().catchError((_) {});
+        if (mounted) showInfo(context, 'วิดีโอเกินเวลาที่เหลือ');
         return;
       }
-      await _preview?.dispose();
-      setState(() {
-        _recording = recording;
-        _preview = preview;
-      });
-      await preview.play();
+      _segments.add(VideoSegment(path: recording.path, duration: duration));
+      if (mounted) setState(() => _elapsed = _segments.totalDuration);
     } on CameraException catch (error) {
       if (mounted)
         showInfo(context, error.description ?? 'ไม่สามารถบันทึกวิดีโอได้');
@@ -6473,19 +6605,38 @@ class _VideoRecorderPageState extends State<VideoRecorderPage> {
     }
   }
 
-  Future<void> _retake() async {
-    await _preview?.dispose();
-    if (mounted) {
-      setState(() {
-        _preview = null;
-        _recording = null;
-        _elapsed = Duration.zero;
-      });
+  Future<void> _deleteLastSegment() async {
+    final segment = _segments.removeLast();
+    if (segment != null) await File(segment.path).delete().catchError((_) {});
+    if (mounted) setState(() => _elapsed = _segments.totalDuration);
+  }
+
+  Future<void> _done() async {
+    if (_segments.segments.isEmpty || _isRecording || _isStopping || _isMerging)
+      return;
+    setState(() => _isMerging = true);
+    try {
+      final output =
+          '${Directory.systemTemp.path}/suikai-segments-${DateTime.now().microsecondsSinceEpoch}.mp4';
+      final merged = await VideoSegmentMerger.merge(
+        sourcePaths: _segments.segments.map((segment) => segment.path).toList(),
+        outputPath: output,
+      );
+      for (final segment in _segments.segments) {
+        if (segment.path != merged)
+          await File(segment.path).delete().catchError((_) {});
+      }
+      _handoffCompleted = true;
+      if (mounted) Navigator.pop(context, XFile(merged));
+    } catch (_) {
+      if (mounted) showInfo(context, 'ไม่สามารถรวมวิดีโอได้');
+    } finally {
+      if (mounted) setState(() => _isMerging = false);
     }
   }
 
   Future<void> _switchCamera() async {
-    if (_isRecording || _recording != null) return;
+    if (_isRecording) return;
     final cameras = await availableCameras();
     final wantsFront = !_front;
     final next = cameras
@@ -6518,15 +6669,20 @@ class _VideoRecorderPageState extends State<VideoRecorderPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _timer?.cancel();
     _preview?.dispose();
     _camera?.dispose();
+    if (!_handoffCompleted) {
+      for (final segment in _segments.segments) {
+        unawaited(File(segment.path).delete().catchError((_) {}));
+      }
+    }
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final preview = _preview;
     final progress = _elapsed.inMilliseconds / _maximum.inMilliseconds;
     final screenPadding = MediaQuery.paddingOf(context);
     return Scaffold(
@@ -6534,12 +6690,7 @@ class _VideoRecorderPageState extends State<VideoRecorderPage> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          if (preview != null)
-            _FullscreenCameraSurface(
-              aspectRatio: preview.value.aspectRatio,
-              child: VideoPlayer(preview),
-            )
-          else if (_camera != null && _camera!.value.isInitialized)
+          if (_camera != null && _camera!.value.isInitialized)
             _FullscreenCameraSurface(
               aspectRatio: _camera!.value.aspectRatio,
               childHandlesAspectRatio: true,
@@ -6558,7 +6709,7 @@ class _VideoRecorderPageState extends State<VideoRecorderPage> {
                       ),
                     ),
             ),
-          if (preview == null && _camera != null)
+          if (_camera != null)
             const Positioned.fill(
               child: IgnorePointer(child: _RuleOfThirdsGrid()),
             ),
@@ -6567,10 +6718,12 @@ class _VideoRecorderPageState extends State<VideoRecorderPage> {
             left: 12,
             child: _VideoOverlayButton(
               icon: Icons.close_rounded,
-              onTap: _isRecording ? null : () => Navigator.pop(context),
+              onTap: _isRecording || _isMerging
+                  ? null
+                  : () => Navigator.pop(context),
             ),
           ),
-          if (preview == null && _camera != null)
+          if (_camera != null)
             Positioned(
               top: screenPadding.top + 10,
               right: 12,
@@ -6579,7 +6732,7 @@ class _VideoRecorderPageState extends State<VideoRecorderPage> {
                 onTap: _isRecording ? null : _switchCamera,
               ),
             ),
-          if (preview == null)
+          if (_camera != null)
             Positioned(
               top: screenPadding.top + 16,
               left: 0,
@@ -6605,6 +6758,26 @@ class _VideoRecorderPageState extends State<VideoRecorderPage> {
                       backgroundColor: Colors.white30,
                     ),
                   ),
+                  if (_segments.segments.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: 180,
+                      child: Row(
+                        children: [
+                          for (final segment in _segments.segments)
+                            Expanded(
+                              child: Container(
+                                height: 4,
+                                margin: const EdgeInsets.symmetric(
+                                  horizontal: 1,
+                                ),
+                                color: Colors.white,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 5),
                   const LocalizedText(
                     'บันทึกได้สูงสุด 30 วินาที',
@@ -6617,60 +6790,74 @@ class _VideoRecorderPageState extends State<VideoRecorderPage> {
             left: 20,
             right: 20,
             bottom: screenPadding.bottom + 24,
-            child: preview == null
-                ? Center(
-                    child: GestureDetector(
-                      onTap: _isStopping
-                          ? null
-                          : _isRecording
-                          ? _stopRecording
-                          : _startRecording,
-                      child: Container(
-                        width: 72,
-                        height: 72,
-                        padding: const EdgeInsets.all(5),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: _isRecording
-                                ? AppTheme.orange
-                                : Colors.white,
-                            width: 3,
-                          ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Center(
+                  child: GestureDetector(
+                    onTap: _isStopping
+                        ? null
+                        : _isRecording
+                        ? _stopRecording
+                        : _segments.isFull
+                        ? null
+                        : _startRecording,
+                    child: Container(
+                      width: 72,
+                      height: 72,
+                      padding: const EdgeInsets.all(5),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: _isRecording ? AppTheme.orange : Colors.white,
+                          width: 3,
                         ),
-                        child: DecoratedBox(
-                          decoration: BoxDecoration(
-                            color: AppTheme.orange,
-                            borderRadius: BorderRadius.circular(
-                              _isRecording ? 10 : 32,
-                            ),
+                      ),
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: AppTheme.orange,
+                          borderRadius: BorderRadius.circular(
+                            _isRecording ? 10 : 32,
                           ),
                         ),
                       ),
                     ),
-                  )
-                : Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton(
-                          onPressed: _retake,
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: Colors.white,
-                            side: const BorderSide(color: Colors.white70),
-                          ),
-                          child: const LocalizedText('ถ่ายใหม่'),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: ElevatedButton(
-                          onPressed: () => Navigator.pop(context, _recording),
-                          child: const LocalizedText('ใช้วิดีโอนี้'),
-                        ),
-                      ),
-                    ],
                   ),
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: _isRecording || _segments.segments.isEmpty
+                            ? null
+                            : _deleteLastSegment,
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.white,
+                          side: const BorderSide(color: Colors.white70),
+                        ),
+                        child: const LocalizedText('ลบช่วงล่าสุด'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed:
+                            _isRecording ||
+                                _segments.segments.isEmpty ||
+                                _isMerging
+                            ? null
+                            : _done,
+                        child: LocalizedText(
+                          _isMerging ? 'กำลังรวม...' : 'เสร็จสิ้น',
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -7860,7 +8047,7 @@ class _MapPageState extends State<MapPage> {
     borderRadius: BorderRadius.circular(18),
     child: InkWell(
       borderRadius: BorderRadius.circular(18),
-      onTap: () => product.hasVideo
+      onTap: () => (product.hasVideo || product.imageUrls.isNotEmpty)
           ? Navigator.of(context).push(
               MaterialPageRoute<void>(
                 builder: (_) => FullscreenListingVideoViewer(
@@ -9003,67 +9190,108 @@ class _ProfilePageState extends State<ProfilePage> {
     );
   }
 
-  Widget _manageSection(
-    BuildContext context,
-    List<ProductViewModel> owned,
-  ) => Column(
-    key: const ValueKey('manage'),
-    children: [
-      ListTile(
-        leading: const Icon(Icons.history_rounded),
-        title: const LocalizedText('ประวัติการขาย'),
-        subtitle: LocalizedText(
-          '${owned.where((item) => item.status == ProductStatus.sold).length} รายการขายแล้ว',
-        ),
-      ),
-      ListTile(
-        leading: const Icon(Icons.settings_outlined),
-        title: const LocalizedText('ตั้งค่า'),
-        onTap: () => _editProfile(context),
-      ),
-      ListTile(
-        leading: const Icon(Icons.logout_rounded),
-        title: const LocalizedText('ออกจากระบบ'),
-        onTap: () => _logout(context),
-      ),
-      const Divider(),
-      const Align(
-        alignment: Alignment.centerLeft,
-        child: LocalizedText(
+  Widget _manageSection(BuildContext context, List<ProductViewModel> owned) {
+    final videoItems = owned.where((item) => item.hasVideo).toList();
+
+    return Column(
+      key: const ValueKey('manage'),
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const LocalizedText(
           'จัดการสถานะสินค้า',
           style: TextStyle(fontWeight: FontWeight.w800),
         ),
-      ),
-      const SizedBox(height: 8),
-      for (final item in owned)
-        ListTile(
-          dense: true,
-          title: Text(item.title, maxLines: 1, overflow: TextOverflow.ellipsis),
-          trailing: DropdownButton<ProductStatus>(
-            value: _statusEdits[item.id] ?? item.status,
-            items:
-                (item.isStoreProduct
-                        ? const [
-                            ProductStatus.available,
-                            ProductStatus.outOfStock,
-                            ProductStatus.deleted,
-                          ]
-                        : const [
-                            ProductStatus.available,
-                            ProductStatus.reserved,
-                            ProductStatus.sold,
-                          ])
-                    .map(
-                      (status) => DropdownMenuItem(
-                        value: status,
-                        child: Text(_statusLabel(context, status)),
-                      ),
-                    )
-                    .toList(),
-            onChanged: (value) => _changeStatus(item, value),
+        const SizedBox(height: 8),
+        for (final item in owned)
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            minVerticalPadding: 8,
+            leading: _manageListingPreview(context, item, videoItems),
+            title: Text(
+              item.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            trailing: DropdownButton<ProductStatus>(
+              value: _statusEdits[item.id] ?? item.status,
+              items:
+                  (item.isStoreProduct
+                          ? const [
+                              ProductStatus.available,
+                              ProductStatus.outOfStock,
+                              ProductStatus.deleted,
+                            ]
+                          : const [
+                              ProductStatus.available,
+                              ProductStatus.reserved,
+                              ProductStatus.sold,
+                            ])
+                      .map(
+                        (status) => DropdownMenuItem(
+                          value: status,
+                          child: Text(_statusLabel(context, status)),
+                        ),
+                      )
+                      .toList(),
+              onChanged: (value) => _changeStatus(item, value),
+            ),
           ),
+      ],
+    );
+  }
+
+  Widget _manageListingPreview(
+    BuildContext context,
+    ProductViewModel item,
+    List<ProductViewModel> videoItems,
+  ) => Material(
+    color: Colors.transparent,
+    borderRadius: BorderRadius.circular(8),
+    clipBehavior: Clip.antiAlias,
+    child: InkWell(
+      onTap: item.hasVideo
+          ? () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => FullscreenListingVideoViewer(
+                  items: videoItems,
+                  initialProductId: item.id,
+                ),
+              ),
+            )
+          : null,
+      child: SizedBox(
+        width: 56,
+        height: 56,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            item.hasVideo
+                ? FutureBuilder<String>(
+                    future: SuikaiService.signedThumbnailUrl(item.video!),
+                    builder: (_, snapshot) => snapshot.hasData
+                        ? persistentImage(snapshot.data!, fit: BoxFit.cover)
+                        : const _VideoPreviewPlaceholder(),
+                  )
+                : persistentImage(
+                    item.image,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => Container(
+                      color: AppTheme.orangeSoft,
+                      child: const Icon(Icons.image_outlined),
+                    ),
+                  ),
+            if (item.hasVideo)
+              const Center(
+                child: Icon(
+                  Icons.play_circle_fill_rounded,
+                  color: Colors.white,
+                  size: 28,
+                ),
+              ),
+          ],
         ),
-    ],
+      ),
+    ),
   );
 
   Future<void> _changeStatus(
@@ -11557,7 +11785,7 @@ class _OpenShopPageState extends State<OpenShopPage> {
           controlAffinity: ListTileControlAffinity.leading,
         ),
         _primaryButton(
-          _submitting ? 'กำลังบันทึก...' : 'ยืนยันการเปิดร้าน',
+          _submitting ? 'กำลังส่งคำขอเปิดร้าน...' : 'ยืนยันการเปิดร้าน',
           _accepted && !_submitting
               ? () async {
                   if (!_formKey.currentState!.validate()) {
@@ -11588,11 +11816,21 @@ class _OpenShopPageState extends State<OpenShopPage> {
                   );
                   if (!context.mounted) return;
                   if (guardResult == SubmissionStartResult.alreadySubmitting) {
-                    showInfo(context, 'กำลังส่งข้อมูลนี้อยู่ กรุณารอสักครู่');
+                    showInfo(
+                      context,
+                      AppLocalizations.of(context).source(
+                        'กำลังส่งข้อมูลนี้อยู่ กรุณารอสักครู่',
+                      ),
+                    );
                     return;
                   }
                   if (guardResult == SubmissionStartResult.alreadySubmitted) {
-                    showInfo(context, 'ร้านนี้ถูกส่งคำขอแล้ว');
+                    showInfo(
+                      context,
+                      AppLocalizations.of(context).source(
+                        'ร้านนี้ถูกส่งคำขอแล้ว',
+                      ),
+                    );
                     return;
                   }
                   setState(() => _submitting = true);
@@ -11621,14 +11859,24 @@ class _OpenShopPageState extends State<OpenShopPage> {
                     if (!context.mounted) {
                       return;
                     }
-                    showInfo(context, 'ส่งคำขอเปิดร้านแล้ว รอการอนุมัติ');
+                    showInfo(
+                      context,
+                      AppLocalizations.of(context).source(
+                        'ส่งคำขอเปิดร้านแล้ว รอการอนุมัติ',
+                      ),
+                    );
                     Navigator.pop(context, true);
                   } catch (_) {
                     await SubmissionGuard.fail(_submissionKey);
                     if (!context.mounted) {
                       return;
                     }
-                    showInfo(context, 'ส่งคำขอเปิดร้านไม่สำเร็จ');
+                    showInfo(
+                      context,
+                      AppLocalizations.of(context).source(
+                        'ส่งคำขอเปิดร้านไม่สำเร็จ กรุณาลองใหม่',
+                      ),
+                    );
                     setState(() => _submitting = false);
                   }
                 }
@@ -12038,7 +12286,9 @@ class _FullscreenListingVideoViewerState
   @override
   void initState() {
     super.initState();
-    _items = widget.items.where((item) => item.hasVideo).toList();
+    _items = widget.items
+        .where((item) => item.hasVideo || item.imageUrls.isNotEmpty)
+        .toList();
     final index = _items.indexWhere(
       (item) => item.id == widget.initialProductId,
     );
@@ -12059,23 +12309,29 @@ class _FullscreenListingVideoViewerState
     if (route != null) appRouteObserver.subscribe(this, route);
   }
 
-  List<ListingVideoRecord> get _videos =>
-      _items.map((item) => item.video!).toList(growable: false);
+  List<ListingVideoRecord> get _videos => _items
+      .where((item) => item.hasVideo)
+      .map((item) => item.video!)
+      .toList(growable: false);
 
   Future<void> _activate(int index) async {
     if (_items.isEmpty || !_playbackActive) return;
+    final video = _items[index].video;
+    if (video == null) {
+      await _preload.pauseAll();
+      return;
+    }
+    final videoIndex =
+        _items.take(index + 1).where((item) => item.hasVideo).length - 1;
     unawaited(
       _preload.prepareWindow(
         videos: _videos,
-        activeIndex: index,
+        activeIndex: videoIndex,
         resolveUrl: SuikaiService.signedVideoUrl,
       ),
     );
     try {
-      await _preload.playOnly(
-        _items[index].video!,
-        SuikaiService.signedVideoUrl,
-      );
+      await _preload.playOnly(video, SuikaiService.signedVideoUrl);
       // The controller may finish loading after another page has covered this
       // route. Do not allow that delayed completion to restart audio/video.
       if (!_playbackActive) {
@@ -12221,6 +12477,7 @@ class _ListingVideoPageState extends State<_ListingVideoPage> {
   @override
   Widget build(BuildContext context) {
     final product = _product;
+    if (!product.hasVideo) return _ListingImagePage(product: product);
     final sellerName = _store?.name ?? 'ผู้ขาย Suikai';
     return SafeArea(
       child: GestureDetector(
@@ -12341,6 +12598,110 @@ class _ListingVideoPageState extends State<_ListingVideoPage> {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _ListingImagePage extends StatefulWidget {
+  final ProductViewModel product;
+  const _ListingImagePage({required this.product});
+
+  @override
+  State<_ListingImagePage> createState() => _ListingImagePageState();
+}
+
+class _ListingImagePageState extends State<_ListingImagePage> {
+  late final PageController _images = PageController();
+  int _index = 0;
+
+  @override
+  void dispose() {
+    _images.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final product = widget.product;
+    final urls = product.imageUrls;
+    return SafeArea(
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          ColoredBox(
+            color: Colors.black,
+            child: PageView.builder(
+              controller: _images,
+              itemCount: urls.length,
+              onPageChanged: (value) => setState(() => _index = value),
+              itemBuilder: (_, index) => Image.network(
+                urls[index],
+                fit: BoxFit.contain,
+                errorBuilder: (_, _, _) => const Center(
+                  child: Icon(Icons.broken_image_outlined, color: Colors.white),
+                ),
+              ),
+            ),
+          ),
+          const DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  Color(0x66000000),
+                  Colors.transparent,
+                  Color(0xC9000000),
+                ],
+                stops: [0, .36, 1],
+              ),
+            ),
+          ),
+          Positioned(
+            top: 8,
+            left: 8,
+            child: _VideoOverlayButton(
+              icon: Icons.arrow_back_rounded,
+              onTap: () => Navigator.pop(context),
+            ),
+          ),
+          Positioned(
+            top: 12,
+            right: 16,
+            child: TextButton.icon(
+              onPressed: () => Navigator.pushNamed(
+                context,
+                SuikaiRoutes.report,
+                arguments: product.id,
+              ),
+              icon: const Icon(Icons.flag_outlined, size: 15),
+              label: const LocalizedText('รายงาน'),
+              style: TextButton.styleFrom(foregroundColor: Colors.white70),
+            ),
+          ),
+          if (urls.length > 1)
+            Positioned(
+              top: 52,
+              right: 18,
+              child: Text(
+                '${_index + 1}/${urls.length}',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          Positioned(
+            left: 18,
+            right: 18,
+            bottom: 20,
+            child: _VideoProductInfo(
+              product: product,
+              sellerName: 'ผู้ขาย Suikai',
+            ),
+          ),
+        ],
       ),
     );
   }

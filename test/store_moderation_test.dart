@@ -5,18 +5,60 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:suikai/data/models.dart';
+import 'package:suikai/data/repositories.dart';
 import 'package:suikai/features/admin/admin_dashboard.dart';
 import 'package:suikai/services/suikai_service.dart';
 import 'package:suikai/services/video_post_processor.dart';
 
 import 'support/in_memory_repositories.dart';
 
-SelectedVideoPost _selectedVideo() => SelectedVideoPost(
+class _CountingStorageService extends InMemoryStorageService {
+  int privateBinaryUploads = 0;
+  int privateBytesUploads = 0;
+
+  @override
+  Future<StoredMedia> persistPrivateBinary({
+    required String sourcePath,
+    required String bucket,
+    required String objectPrefix,
+    required String extension,
+    required String mimeType,
+  }) {
+    privateBinaryUploads++;
+    return super.persistPrivateBinary(
+      sourcePath: sourcePath,
+      bucket: bucket,
+      objectPrefix: objectPrefix,
+      extension: extension,
+      mimeType: mimeType,
+    );
+  }
+
+  @override
+  Future<StoredMedia> persistPrivateBytes({
+    required List<int> bytes,
+    required String bucket,
+    required String objectPrefix,
+    required String extension,
+    required String mimeType,
+  }) {
+    privateBytesUploads++;
+    return super.persistPrivateBytes(
+      bytes: bytes,
+      bucket: bucket,
+      objectPrefix: objectPrefix,
+      extension: extension,
+      mimeType: mimeType,
+    );
+  }
+}
+
+SelectedVideoPost _selectedVideo({int sizeBytes = 1024}) => SelectedVideoPost(
   PreparedVideoPost(
     path: '/tmp/suikai-test-video.mp4',
     thumbnailBytes: Uint8List.fromList([0xFF, 0xD8, 0xFF]),
     durationMilliseconds: 1000,
-    sizeBytes: 1024,
+    sizeBytes: sizeBytes,
   ),
 );
 
@@ -50,6 +92,7 @@ void main() {
     TestDatabase.adminNotifications = await Hive.openBox('admin_notifications');
     TestDatabase.notifications = await Hive.openBox('notifications');
     TestDatabase.shortVideos = await Hive.openBox('short_videos');
+    await File('/tmp/suikai-test-video.mp4').writeAsBytes([0]);
     final auth = InMemoryAuthRepository();
     SuikaiService.auth = auth;
     SuikaiService.legalConsents = InMemoryLegalConsentRepository(
@@ -71,6 +114,11 @@ void main() {
   });
 
   tearDownAll(() async {
+    try {
+      await File('/tmp/suikai-test-video.mp4').delete();
+    } on FileSystemException {
+      // The fixture can already be gone when a test runner cleans /tmp.
+    }
     await Hive.close();
     await databaseDirectory.delete(recursive: true);
   });
@@ -100,10 +148,44 @@ void main() {
         isA<StateError>().having(
           (error) => error.message,
           'message',
-          'listing_video_required',
+          'listing_media_required',
         ),
       ),
     );
+  });
+
+  test('oversized video is rejected before any listing media upload', () async {
+    final profile = await SuikaiService.register(
+      name: 'Oversized video',
+      phone: '0910000001',
+      email: 'oversized-video@suikai.local',
+      password: 'password123',
+      city: 'Muang Nge',
+      acceptedUgcTerms: true,
+    );
+    await SuikaiService.login(profile.email, 'password123');
+    final storage = _CountingStorageService();
+    SuikaiService.storage = storage;
+    try {
+      await expectLater(
+        SuikaiService.createListing(
+          title: 'Too large',
+          description: '',
+          category: 'listing_mobile',
+          phone: profile.phone,
+          viber: '',
+          price: 1,
+          currency: 'MMK',
+          listingType: 'general',
+          video: _selectedVideo(sizeBytes: 5 * 1024 * 1024 + 1),
+        ),
+        throwsFormatException,
+      );
+      expect(storage.privateBinaryUploads, 0);
+      expect(storage.privateBytesUploads, 0);
+    } finally {
+      SuikaiService.storage = InMemoryStorageService();
+    }
   });
 
   test(

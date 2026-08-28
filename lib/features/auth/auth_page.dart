@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../core/theme/app_theme.dart';
+import '../../core/password_recovery_uri.dart';
 import '../../data/supabase_repositories.dart';
 import '../../services/suikai_service.dart';
 import '../../data/models.dart';
@@ -14,7 +15,12 @@ import '../legal/legal_pages.dart';
 
 class LoginPage extends StatefulWidget {
   final String pendingRoute;
-  const LoginPage({super.key, required this.pendingRoute});
+  final bool observeAuth;
+  const LoginPage({
+    super.key,
+    required this.pendingRoute,
+    this.observeAuth = true,
+  });
   @override
   State<LoginPage> createState() => _LoginPageState();
 }
@@ -23,6 +29,7 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
   final email = TextEditingController(), password = TextEditingController();
   bool busy = false;
   bool telegramBusy = false;
+  bool _obscurePassword = true;
   bool _didNavigate = false;
   AuthChangeEvent? _lastAuthEvent;
   bool? _lastSessionWasNull;
@@ -31,6 +38,7 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    if (!widget.observeAuth) return;
     WidgetsBinding.instance.addObserver(this);
     _authSubscription = SupabaseBackend.client.auth.onAuthStateChange.listen(
       (data) {
@@ -111,12 +119,20 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
   }
 
   Future<void> login() async {
+    if (!isValidAuthEmail(email.text)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(AppLocalizations.of(context).ui('invalidEmail')),
+        ),
+      );
+      return;
+    }
     setState(() => busy = true);
     try {
       await SuikaiService.login(email.text, password.text);
       await _completeLoginFromAuthCallback();
     } catch (_) {
-      if (mounted)
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
@@ -124,9 +140,101 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
             ),
           ),
         );
+      }
     } finally {
       if (mounted) setState(() => busy = false);
     }
+  }
+
+  Future<void> _forgotPassword() async {
+    final controller = TextEditingController(
+      text: normalizeAuthEmail(email.text),
+    );
+    var sending = false;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (_, setDialogState) => AlertDialog(
+          title: Text(AppLocalizations.of(context).ui('forgotPassword')),
+          content: TextField(
+            controller: controller,
+            keyboardType: TextInputType.emailAddress,
+            decoration: InputDecoration(
+              labelText: AppLocalizations.of(context).ui('email'),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: sending ? null : () => Navigator.pop(dialogContext),
+              child: Text(AppLocalizations.of(context).ui('cancel')),
+            ),
+            ElevatedButton(
+              onPressed: sending
+                  ? null
+                  : () async {
+                      if (!isValidAuthEmail(controller.text)) {
+                        ScaffoldMessenger.of(dialogContext).showSnackBar(
+                          SnackBar(
+                            content: Text(
+                              AppLocalizations.of(context).ui('invalidEmail'),
+                            ),
+                          ),
+                        );
+                        return;
+                      }
+                      setDialogState(() => sending = true);
+                      try {
+                        await SuikaiService.requestPasswordReset(
+                          controller.text,
+                        );
+                        if (dialogContext.mounted) {
+                          Navigator.pop(dialogContext);
+                        }
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                AppLocalizations.of(
+                                  context,
+                                ).ui('passwordResetSent'),
+                              ),
+                            ),
+                          );
+                        }
+                      } catch (_) {
+                        // Return the same non-enumerating response even if Auth does
+                        // not disclose whether the address exists.
+                        if (dialogContext.mounted) {
+                          Navigator.pop(dialogContext);
+                        }
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                AppLocalizations.of(
+                                  context,
+                                ).ui('passwordResetSent'),
+                              ),
+                            ),
+                          );
+                        }
+                      }
+                    },
+              child: sending
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Text(AppLocalizations.of(context).ui('sendResetLink')),
+            ),
+          ],
+        ),
+      ),
+    );
+    // Dialog removal is animated; dispose after its final frame so the
+    // departing TextField cannot observe a disposed controller.
+    WidgetsBinding.instance.addPostFrameCallback((_) => controller.dispose());
   }
 
   Future<void> _loginWithTelegram() async {
@@ -241,8 +349,27 @@ class _LoginPageState extends State<LoginPage> with WidgetsBindingObserver {
           const SizedBox(height: 12),
           TextField(
             controller: password,
-            obscureText: true,
-            decoration: InputDecoration(labelText: l10n.ui('password')),
+            obscureText: _obscurePassword,
+            decoration: InputDecoration(
+              labelText: l10n.ui('password'),
+              suffixIcon: IconButton(
+                tooltip: l10n.ui(
+                  _obscurePassword ? 'showPassword' : 'hidePassword',
+                ),
+                onPressed: () =>
+                    setState(() => _obscurePassword = !_obscurePassword),
+                icon: Icon(
+                  _obscurePassword ? Icons.visibility_off : Icons.visibility,
+                ),
+              ),
+            ),
+          ),
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton(
+              onPressed: busy ? null : _forgotPassword,
+              child: Text(l10n.ui('forgotPassword')),
+            ),
           ),
           const SizedBox(height: 20),
           ElevatedButton(
@@ -357,6 +484,7 @@ class _RegisterPageState extends State<RegisterPage> {
     }
     if (name.text.trim().isEmpty ||
         email.text.trim().isEmpty ||
+        !isValidAuthEmail(email.text) ||
         password.text.length < 6 ||
         password.text != confirmPassword.text) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -389,16 +517,38 @@ class _RegisterPageState extends State<RegisterPage> {
         Navigator.pop(context);
       }
     } catch (_) {
-      if (mounted)
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(AppLocalizations.of(context).ui('emailExists')),
-          ),
-        );
+      if (mounted) _showExistingEmailActions();
     } finally {
       if (mounted) setState(() => busy = false);
     }
   }
+
+  void _showExistingEmailActions() => showDialog<void>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      content: Text(AppLocalizations.of(context).ui('emailMayExist')),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext),
+          child: Text(AppLocalizations.of(context).ui('cancel')),
+        ),
+        TextButton(
+          onPressed: () {
+            Navigator.pop(dialogContext);
+            Navigator.pop(context);
+          },
+          child: Text(AppLocalizations.of(context).ui('login')),
+        ),
+        TextButton(
+          onPressed: () {
+            Navigator.pop(dialogContext);
+            Navigator.pop(context);
+          },
+          child: Text(AppLocalizations.of(context).ui('forgotPassword')),
+        ),
+      ],
+    ),
+  );
 
   Future<void> _loginWithTelegram() async {
     if (!_acceptedUgcTerms) {
@@ -565,6 +715,88 @@ class _RegisterPageState extends State<RegisterPage> {
                   ? l10n.ui('openingTelegram')
                   : l10n.ui('registerWithTelegram'),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class ResetPasswordPage extends StatefulWidget {
+  const ResetPasswordPage({super.key});
+
+  @override
+  State<ResetPasswordPage> createState() => _ResetPasswordPageState();
+}
+
+class _ResetPasswordPageState extends State<ResetPasswordPage> {
+  final _password = TextEditingController();
+  final _confirmPassword = TextEditingController();
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    _password.dispose();
+    _confirmPassword.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final l10n = AppLocalizations.of(context);
+    if (_password.text.length < 6) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(l10n.ui('passwordTooShort'))));
+      return;
+    }
+    if (_password.text != _confirmPassword.text) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(l10n.ui('passwordMismatch'))));
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      await SuikaiService.updatePassword(_password.text);
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(l10n.ui('passwordResetSuccess'))));
+      Navigator.of(context).popUntil((route) => route.isFirst);
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(l10n.ui('passwordResetFailed'))));
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context);
+    return Scaffold(
+      appBar: AppBar(title: Text(l10n.ui('resetPassword'))),
+      body: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          TextField(
+            controller: _password,
+            obscureText: true,
+            decoration: InputDecoration(labelText: l10n.ui('newPassword')),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _confirmPassword,
+            obscureText: true,
+            decoration: InputDecoration(labelText: l10n.ui('confirmPassword')),
+          ),
+          const SizedBox(height: 20),
+          ElevatedButton(
+            onPressed: _busy ? null : _submit,
+            child: Text(_busy ? l10n.ui('saving') : l10n.ui('resetPassword')),
           ),
         ],
       ),
@@ -881,7 +1113,7 @@ class _BlockedUsersPageState extends State<BlockedUsersPage> {
     } catch (error, stackTrace) {
       debugPrint('Unblock seller failed: id=${user.id} error=$error');
       debugPrintStack(stackTrace: stackTrace);
-      if (mounted)
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
@@ -889,6 +1121,7 @@ class _BlockedUsersPageState extends State<BlockedUsersPage> {
             ),
           ),
         );
+      }
     } finally {
       if (mounted) setState(() => _busyId = null);
     }

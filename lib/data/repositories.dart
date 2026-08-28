@@ -12,6 +12,8 @@ abstract interface class AuthRepository {
     required bool acceptedUgcTerms,
   });
   Future<UserProfile> login(String email, String password);
+  Future<void> requestPasswordReset(String email);
+  Future<void> updatePassword(String password);
   Future<void> loginWithTelegram();
   Future<void> completeTelegramWebLogin();
   Future<void> syncCurrentProfile();

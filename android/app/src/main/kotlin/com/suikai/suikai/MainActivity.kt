@@ -12,6 +12,8 @@ import androidx.media3.effect.BitmapOverlay
 import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.StaticOverlaySettings
 import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.EditedMediaItemSequence
+import androidx.media3.transformer.Composition
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
@@ -34,12 +36,48 @@ class MainActivity : FlutterActivity() {
 		super.configureFlutterEngine(flutterEngine)
 		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, watermarkChannel)
 			.setMethodCallHandler { call, result ->
-				if (call.method != "apply") {
-					result.notImplemented()
-					return@setMethodCallHandler
+				when (call.method) {
+					"apply" -> watermarkVideo(call, result)
+					"merge" -> mergeVideos(call, result)
+					else -> result.notImplemented()
 				}
-				watermarkVideo(call, result)
 			}
+	}
+
+	private fun mergeVideos(call: MethodCall, result: MethodChannel.Result) {
+		val sourcePaths = call.argument<List<String>>("sourcePaths")
+		val outputPath = call.argument<String>("outputPath")
+		if (sourcePaths.isNullOrEmpty() || outputPath.isNullOrBlank() || sourcePaths.any { !File(it).isFile }) {
+			result.error("invalid_arguments", "sourcePaths and outputPath are required", null)
+			return
+		}
+		val output = File(outputPath)
+		if (output.exists() && !output.delete()) {
+			result.error("output_cleanup_failed", "Could not replace merge output", null)
+			return
+		}
+		val sequence = EditedMediaItemSequence.Builder(
+			sourcePaths.map { EditedMediaItem.Builder(MediaItem.fromUri(Uri.fromFile(File(it)))).build() }
+		).build()
+		val composition = Composition.Builder(sequence).build()
+		val transformer = Transformer.Builder(applicationContext)
+			.setVideoMimeType(MimeTypes.VIDEO_H264)
+			.setAudioMimeType(MimeTypes.AUDIO_AAC)
+			.addListener(object : Transformer.Listener {
+				override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+					if (!output.isFile || output.length() == 0L) {
+						result.error("empty_output", "Segment merge produced no video", null)
+					} else result.success(outputPath)
+				}
+				override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {
+					if (output.exists()) output.delete()
+					result.error("merge_failed", exportException.message, null)
+				}
+			}).build()
+		try { transformer.start(composition, outputPath) } catch (error: Exception) {
+			if (output.exists()) output.delete()
+			result.error("merge_start_failed", error.message, null)
+		}
 	}
 
 	private fun watermarkVideo(call: MethodCall, result: MethodChannel.Result) {

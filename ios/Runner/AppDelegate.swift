@@ -21,11 +21,11 @@ import AVFoundation
       binaryMessenger: registrar.messenger()
     )
     channel.setMethodCallHandler { [weak self] call, result in
-      guard call.method == "apply" else {
-        result(FlutterMethodNotImplemented)
-        return
+      switch call.method {
+      case "apply": self?.watermarkVideo(call: call, result: result)
+      case "merge": self?.mergeVideos(call: call, result: result)
+      default: result(FlutterMethodNotImplemented)
       }
-      self?.watermarkVideo(call: call, result: result)
     }
   }
 
@@ -117,5 +117,44 @@ import AVFoundation
         result(outputPath)
       }
     }
+  }
+
+  private func mergeVideos(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let arguments = call.arguments as? [String: Any],
+          let sourcePaths = arguments["sourcePaths"] as? [String], !sourcePaths.isEmpty,
+          let outputPath = arguments["outputPath"] as? String,
+          sourcePaths.allSatisfy({ FileManager.default.fileExists(atPath: $0) }) else {
+      result(FlutterError(code: "invalid_arguments", message: "sourcePaths and outputPath are required", details: nil)); return
+    }
+    let outputURL = URL(fileURLWithPath: outputPath)
+    try? FileManager.default.removeItem(at: outputURL)
+    let composition = AVMutableComposition()
+    guard let videoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+      result(FlutterError(code: "merge_unavailable", message: "Could not create video track", details: nil)); return
+    }
+    let audioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+    var cursor = CMTime.zero
+    do {
+      for path in sourcePaths {
+        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        guard let sourceVideo = asset.tracks(withMediaType: .video).first else { throw NSError(domain: "Suikai", code: 1) }
+        try videoTrack.insertTimeRange(CMTimeRange(start: .zero, duration: asset.duration), of: sourceVideo, at: cursor)
+        if let sourceAudio = asset.tracks(withMediaType: .audio).first, let audioTrack {
+          try audioTrack.insertTimeRange(CMTimeRange(start: .zero, duration: asset.duration), of: sourceAudio, at: cursor)
+        }
+        cursor = CMTimeAdd(cursor, asset.duration)
+      }
+    } catch { result(FlutterError(code: "merge_failed", message: error.localizedDescription, details: nil)); return }
+    guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
+      result(FlutterError(code: "merge_unavailable", message: "Could not create exporter", details: nil)); return
+    }
+    exporter.outputURL = outputURL; exporter.outputFileType = .mp4; exporter.shouldOptimizeForNetworkUse = true
+    exporter.exportAsynchronously { DispatchQueue.main.async {
+      guard exporter.status == .completed, FileManager.default.fileExists(atPath: outputPath) else {
+        try? FileManager.default.removeItem(at: outputURL)
+        result(FlutterError(code: "merge_failed", message: exporter.error?.localizedDescription ?? "Merge failed", details: nil)); return
+      }
+      result(outputPath)
+    }}
   }
 }

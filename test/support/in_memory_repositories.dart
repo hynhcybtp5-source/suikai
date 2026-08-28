@@ -107,6 +107,10 @@ class TestDatabase {
 }
 
 class InMemoryAuthRepository implements AuthRepository {
+  int passwordResetRequests = 0;
+  int passwordUpdates = 0;
+  Object? passwordResetError;
+  Object? passwordUpdateError;
   static const _session = 'local_session_user_id';
   String? _current;
   @override
@@ -178,6 +182,25 @@ class InMemoryAuthRepository implements AuthRepository {
     _current = '${row['id']}';
     (await SharedPreferences.getInstance()).setString(_session, _current!);
     return UserProfile.fromJson(row);
+  }
+
+  @override
+  Future<void> requestPasswordReset(String email) async {
+    passwordResetRequests++;
+    if (passwordResetError != null) throw passwordResetError!;
+  }
+
+  @override
+  Future<void> updatePassword(String password) async {
+    passwordUpdates++;
+    if (passwordUpdateError != null) throw passwordUpdateError!;
+    final userId = currentUserId;
+    if (userId == null) throw StateError('login_required');
+    final row = _map(TestDatabase.users.get(userId));
+    await TestDatabase.users.put(userId, {
+      ...row,
+      'password_hash': _hash(password),
+    });
   }
 
   @override

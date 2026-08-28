@@ -40,6 +40,10 @@
                     android:scheme="suikai"
                     android:host="auth"
                     android:path="/telegram" />
+                <data
+                    android:scheme="suikai"
+                    android:host="auth"
+                    android:path="/reset-password" />
             </intent-filter>
         </activity>
         <!-- Don't delete the meta-data below.

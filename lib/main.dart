@@ -5,21 +5,110 @@ import 'package:camera_android/camera_android.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'l10n/app_localizations.dart';
 import 'l10n/mobile_localizations.dart';
 import 'core/locale_controller.dart';
 import 'core/app_route_observer.dart';
 import 'core/operation_status.dart';
+import 'core/pending_telegram_callback.dart';
+import 'core/password_recovery_uri.dart';
+import 'core/password_recovery_navigation_guard.dart';
 import 'core/theme/app_theme.dart';
 import 'data/supabase_repositories.dart';
 import 'features/home/home_page.dart';
+import 'features/auth/auth_page.dart';
 import 'features/startup/network_blocked_screen.dart';
 import 'services/suikai_service.dart';
 
 final _navigatorKey = GlobalKey<NavigatorState>();
 final _telegramLoginLoading = ValueNotifier(false);
 bool _telegramCallbackInProgress = false;
+bool _supabaseReadyForTelegramCallback = false;
+final _pendingTelegramCallback = PendingTelegramCallback();
+StreamSubscription<Uri>? _telegramAppLinkSubscription;
+StreamSubscription<AuthState>? _passwordRecoveryAuthSubscription;
+bool _pendingPasswordRecovery = false;
+final _resetPasswordNavigationGuard = PasswordRecoveryNavigationGuard();
+
+Future<void> _receiveTelegramCallback(Uri uri) async {
+  if (!_pendingTelegramCallback.capture(uri)) return;
+  debugPrint(
+    'TELEGRAM CALLBACK PENDING hasCode=${uri.queryParameters['code']?.isNotEmpty == true} '
+    'hasError=${uri.queryParameters['error']?.isNotEmpty == true}',
+  );
+  if (_supabaseReadyForTelegramCallback) {
+    await _processPendingTelegramCallback();
+  }
+}
+
+Future<void> _processPendingTelegramCallback() =>
+    _pendingTelegramCallback.process(_completeTelegramCallback);
+
+void _startTelegramAppLinkListener() {
+  if (kIsWeb || _telegramAppLinkSubscription != null) return;
+  final appLinks = AppLinks();
+  _telegramAppLinkSubscription = appLinks.uriLinkStream.listen(
+    _receiveAppLink,
+    onError: (Object error, StackTrace stackTrace) {
+      debugPrint('Telegram app-link stream failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    },
+  );
+  unawaited(() async {
+    try {
+      final initialLink = await appLinks.getInitialLink().timeout(
+        const Duration(seconds: 3),
+        onTimeout: () => null,
+      );
+      if (initialLink != null) await _receiveAppLink(initialLink);
+    } catch (error, stackTrace) {
+      debugPrint('Telegram initial app-link failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    }
+  }());
+}
+
+Future<void> _receiveAppLink(Uri uri) async {
+  if (isPasswordRecoveryUri(uri)) {
+    _pendingPasswordRecovery = true;
+    debugPrint('PASSWORD RECOVERY DEEP LINK RECEIVED');
+    if (_supabaseReadyForTelegramCallback) _openPendingPasswordRecovery();
+    return;
+  }
+  await _receiveTelegramCallback(uri);
+}
+
+void _openPendingPasswordRecovery() {
+  if (!_pendingPasswordRecovery || !_resetPasswordNavigationGuard.tryOpen()) return;
+  _pendingPasswordRecovery = false;
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    final navigator = _navigatorKey.currentState;
+    if (navigator == null) {
+      _resetPasswordNavigationGuard.close();
+      _pendingPasswordRecovery = true;
+      return;
+    }
+    navigator
+        .push(MaterialPageRoute<void>(builder: (_) => const ResetPasswordPage()))
+        .whenComplete(_resetPasswordNavigationGuard.close);
+  });
+}
+
+void _startPasswordRecoveryListener() {
+  if (_passwordRecoveryAuthSubscription != null) return;
+  _passwordRecoveryAuthSubscription = SupabaseBackend
+      .client
+      .auth
+      .onAuthStateChange
+      .listen((data) {
+        if (data.event != AuthChangeEvent.passwordRecovery) return;
+        _pendingPasswordRecovery = true;
+        debugPrint('PASSWORD RECOVERY EVENT RECEIVED');
+        _openPendingPasswordRecovery();
+      });
+}
 
 Future<void> _completeTelegramCallback(Uri uri) async {
   if (uri.scheme != 'suikai' && !kIsWeb) return;
@@ -76,6 +165,8 @@ Future<void> _initializeApplication(ValueChanged<String> updateStatus) async {
   debugPrint('MAIN 1 start');
   updateStatus('กำลังตรวจสอบการเชื่อมต่อ...');
   await SuikaiService.initialize();
+  _supabaseReadyForTelegramCallback = true;
+  _startPasswordRecoveryListener();
   updateStatus('กำลังโหลดข้อมูลเริ่มต้น...');
   // Telegram redirects to the app root, which normally builds HomePage rather
   // than LoginPage. Consume the OAuth callback before building routes so the
@@ -92,16 +183,8 @@ Future<void> _initializeApplication(ValueChanged<String> updateStatus) async {
   }
   if (!kIsWeb) {
     updateStatus('กำลังเตรียมการเข้าสู่ระบบ...');
-    final appLinks = AppLinks();
-    final initialLink = await appLinks.getInitialLink();
-    if (initialLink != null) await _completeTelegramCallback(initialLink);
-    appLinks.uriLinkStream.listen(
-      _completeTelegramCallback,
-      onError: (Object error, StackTrace stackTrace) {
-        debugPrint('Telegram app-link stream failed: $error');
-        debugPrintStack(stackTrace: stackTrace);
-      },
-    );
+    await _processPendingTelegramCallback();
+    _openPendingPasswordRecovery();
   }
   debugPrint('MAIN 2 service initialized');
 }
@@ -122,6 +205,10 @@ class _BootstrapAppState extends State<_BootstrapApp> {
   @override
   void initState() {
     super.initState();
+    // Start after Flutter has mounted the app, but before the first network
+    // probe. Some Android devices do not expose a cold-start intent to
+    // app_links until the widget binding has a mounted application.
+    _startTelegramAppLinkListener();
     _slowConnectionTimer = Timer(const Duration(seconds: 8), () {
       if (mounted && !_ready) {
         setState(

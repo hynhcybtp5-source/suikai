@@ -13,6 +13,7 @@ import '../data/repositories.dart';
 import '../data/supabase_repositories.dart';
 import '../core/legal_versions.dart';
 import 'video_post_processor.dart';
+import 'video_post_validation.dart';
 import 'video_watermark_processor.dart';
 
 class SelectedImage {
@@ -98,7 +99,7 @@ class SuikaiService {
     if (!usesSupabase) {
       throw StateError(
         'Supabase configuration is required. Provide SUPABASE_URL and '
-        'SUPABASE_PUBLISHABLE_KEY.',
+        'SUPABASE_FALLBACK_URL and SUPABASE_PUBLISHABLE_KEY.',
       );
     }
     try {
@@ -314,6 +315,10 @@ class SuikaiService {
 
   static Future<UserProfile> login(String email, String password) =>
       auth.login(email, password);
+  static Future<void> requestPasswordReset(String email) =>
+      auth.requestPasswordReset(email);
+  static Future<void> updatePassword(String password) =>
+      auth.updatePassword(password);
   static Future<void> loginWithTelegram() => auth.loginWithTelegram();
   static Future<void> logout() => auth.logout();
   static Future<void> deleteOwnAccount() => auth.deleteOwnAccount();
@@ -555,11 +560,13 @@ class SuikaiService {
     final ext = picked.name.contains('.')
         ? picked.name.split('.').last.toLowerCase()
         : '';
-    if (!const {'jpg', 'jpeg', 'png', 'webp'}.contains(ext))
+    if (!const {'jpg', 'jpeg', 'png', 'webp'}.contains(ext)) {
       throw const FormatException('รองรับเฉพาะ JPG, PNG และ WebP');
+    }
     final bytes = await picked.readAsBytes();
-    if (bytes.lengthInBytes > 10 * 1024 * 1024)
+    if (bytes.lengthInBytes > 10 * 1024 * 1024) {
       throw const FormatException('รูปต้องมีขนาดไม่เกิน 10MB');
+    }
     return SelectedImage(file: picked, bytes: bytes);
   }
 
@@ -642,7 +649,6 @@ class SuikaiService {
     String? storeId,
     String status = 'available',
     SelectedVideoPost? video,
-    @Deprecated('Listings are video-only.')
     List<SelectedImage> images = const [],
     double? latitude,
     double? longitude,
@@ -653,9 +659,23 @@ class SuikaiService {
     if (title.trim().isEmpty || category.trim().isEmpty || price < 0) {
       throw StateError('listing_required_fields_missing');
     }
-    // Reject an invalid video-only listing before checking optional profile
-    // completion, giving callers a stable and actionable validation result.
-    if (video == null) throw StateError('listing_video_required');
+    // A listing has one final video or one-or-more still images.  Segments are
+    // merged locally before this method is called, so storage/schema still see
+    // the established single-video shape.
+    if (video == null && images.isEmpty) {
+      throw StateError('listing_media_required');
+    }
+    if (images.length > 10) throw StateError('listing_image_limit_exceeded');
+    // Check the actual finished MP4 before any Storage request. This must
+    // happen before images as well, so an oversized video leaves no uploaded
+    // listing media behind.
+    if (video != null) {
+      await VideoPostValidation.validateFinalFile(
+        path: video.prepared.path,
+        durationMilliseconds: video.prepared.durationMilliseconds,
+        sizeBytes: video.prepared.sizeBytes,
+      );
+    }
     // Existing clients and listings did not have an original price. Keep that
     // flow compatible while validating a discount whenever it is provided.
     if (listingType == 'general' &&
