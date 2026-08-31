@@ -890,6 +890,38 @@ class InMemoryAdminRepository implements AdminRepository {
   }
 
   @override
+  Future<void> actOnReportTarget({
+    required String reportId,
+    required String action,
+  }) async {
+    _guard();
+    final report = TestDatabase.reports.get(reportId);
+    if (report == null) throw StateError('Report not found');
+    final row = _map(report);
+    final listingId = row['listing_id'] ?? row['target_id'];
+    final storeId = row['store_id'] ?? row['target_id'];
+    final userId = row['reported_user_id'] ?? row['target_id'];
+    switch (action) {
+      case 'listing_hide':
+        await setListingStatus('$listingId', 'hidden');
+      case 'listing_restore':
+        await setListingStatus('$listingId', 'visible');
+      case 'listing_delete':
+        await deleteListing('$listingId');
+      case 'store_suspend':
+        await setStoreStatus('$storeId', 'suspended');
+      case 'store_restore':
+        await setStoreStatus('$storeId', 'active');
+      case 'user_suspend':
+        await setUserStatus('$userId', 'suspended');
+      case 'user_restore':
+        await setUserStatus('$userId', 'active');
+      default:
+        throw StateError('Invalid report target action');
+    }
+  }
+
+  @override
   Future<void> reviewReport(String id, bool reviewed) async {
     _guard();
     final row = TestDatabase.reports.get(id);

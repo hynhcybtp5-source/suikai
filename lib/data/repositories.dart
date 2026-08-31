@@ -174,6 +174,12 @@ abstract interface class AdminRepository {
   Future<void> deleteListing(String id);
   Future<void> setStoreStatus(String id, String status);
   Future<void> deleteStore(String id);
+  /// Performs a target action in the context of a report and records that
+  /// context in the existing server-side admin audit log.
+  Future<void> actOnReportTarget({
+    required String reportId,
+    required String action,
+  });
   Future<void> reviewReport(String id, bool reviewed);
   Future<List<Map<String, dynamic>>> storeEditRequests();
   Future<List<Map<String, dynamic>>> promotionRequests();

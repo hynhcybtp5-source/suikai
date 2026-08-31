@@ -1947,6 +1947,15 @@ class SupabaseAdminRepository implements AdminRepository {
   Future<void> deleteStore(String id) => setStoreStatus(id, 'suspended');
 
   @override
+  Future<void> actOnReportTarget({
+    required String reportId,
+    required String action,
+  }) => client.rpc(
+    'admin_act_on_report_target',
+    params: {'p_report_id': reportId, 'p_action': action},
+  );
+
+  @override
   Future<void> reviewReport(String id, bool reviewed) => reviewed
       ? client.rpc(
           'review_report',

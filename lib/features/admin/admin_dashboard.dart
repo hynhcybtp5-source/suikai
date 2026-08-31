@@ -3109,32 +3109,25 @@ class _ReportTargetDialogState extends State<_ReportTargetDialog> {
   Future<void> _act(String action) async {
     final target = _target;
     if (target == null || _busy) return;
+    final destructive = action == 'delete' || action == 'suspend';
+    if (destructive) {
+      final labels = {
+        'listing:delete': 'ลบประกาศนี้แบบซ่อนจากระบบหรือไม่?',
+        'store:suspend': 'ระงับร้านนี้หรือไม่?',
+        'user:suspend': 'ระงับบัญชีผู้ใช้นี้หรือไม่?',
+      };
+      final confirmed = await _confirm(
+        context,
+        labels['${widget.report['type']}:$action'] ?? 'ยืนยันการดำเนินการหรือไม่?',
+      );
+      if (!confirmed || !mounted) return;
+    }
     setState(() => _busy = true);
     try {
-      final id = '${target['id']}';
-      switch ('${widget.report['type']}:$action') {
-        case 'listing:hide':
-          await SuikaiService.admin.setListingStatus(id, 'hidden');
-          break;
-        case 'listing:restore':
-          await SuikaiService.admin.setListingStatus(id, 'visible');
-          break;
-        case 'listing:delete':
-          await SuikaiService.admin.deleteListing(id);
-          break;
-        case 'store:suspend':
-          await SuikaiService.admin.setStoreStatus(id, 'suspended');
-          break;
-        case 'store:restore':
-          await SuikaiService.admin.setStoreStatus(id, 'active');
-          break;
-        case 'user:suspend':
-          await SuikaiService.admin.setUserStatus(id, 'suspended');
-          break;
-        case 'user:restore':
-          await SuikaiService.admin.setUserStatus(id, 'active');
-          break;
-      }
+      await SuikaiService.admin.actOnReportTarget(
+        reportId: '${widget.report['id']}',
+        action: '${widget.report['type']}_$action',
+      );
       await widget.onChanged();
       if (mounted) Navigator.pop(context);
     } catch (error, stackTrace) {
