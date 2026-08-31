@@ -2893,16 +2893,23 @@ class _Reports extends StatelessWidget {
                 separatorBuilder: (_, _) => const SizedBox(height: 8),
                 itemBuilder: (_, i) {
                   final r = rows[i];
+                  final reviewed = r['reviewed'] == true;
                   return Card(
                     child: CheckboxListTile(
-                      value: r['reviewed'] == true,
-                      onChanged: (v) async {
-                        await SuikaiService.admin.reviewReport(
-                          '${r['id']}',
-                          v ?? false,
-                        );
-                        await changed();
-                      },
+                      value: reviewed,
+                      // A reviewed report is final in the current moderation
+                      // workflow.  Keep the control disabled so the UI never
+                      // promises an unsupported return to the pending state.
+                      onChanged: reviewed
+                          ? null
+                          : (v) async {
+                              if (v != true) return;
+                              await SuikaiService.admin.reviewReport(
+                                '${r['id']}',
+                                true,
+                              );
+                              await changed();
+                            },
                       title: Text('${r['reason']}'),
                       subtitle: Text(
                         '${r['type']} • ${r['target_id']}\n${r['created_at']}',
