@@ -77,5 +77,30 @@ void main() {
       expect(adminReportTargetName(report, missingLabel: missing), missing);
       expect(adminReportTargetIdDetail(report), '12345678…');
     });
+
+    test(
+      'shows target moderation status without changing report review state',
+      () {
+        expect(adminReportTargetStatus({'target': null}), 'ถูกลบแล้ว');
+        expect(
+          adminReportTargetStatus({
+            'target': {'status': 'available', 'is_hidden': true},
+          }),
+          'ซ่อนแล้ว',
+        );
+        expect(
+          adminReportTargetStatus({
+            'target': {'status': 'suspended'},
+          }),
+          'ระงับแล้ว',
+        );
+        expect(
+          adminReportTargetStatus({
+            'target': {'status': 'sold'},
+          }),
+          'ขายแล้ว',
+        );
+      },
+    );
   });
 }

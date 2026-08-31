@@ -57,6 +57,21 @@ String adminReportTargetIdDetail(Map<String, dynamic> report) {
   return id.length > 8 ? '${id.substring(0, 8)}…' : id;
 }
 
+String adminReportTargetStatus(Map<String, dynamic> report) {
+  final target = report['target'];
+  if (target is! Map) return 'ถูกลบแล้ว';
+  final value = Map<String, dynamic>.from(target);
+  if (value['deleted_at'] != null) return 'ถูกลบแล้ว';
+  if (value['is_hidden'] == true) return 'ซ่อนแล้ว';
+  final status = '${value['status'] ?? ''}';
+  return switch (status) {
+    'suspended' => 'ระงับแล้ว',
+    'sold' => 'ขายแล้ว',
+    'available' || 'approved' || 'active' => 'พร้อมใช้งาน',
+    _ => status.isEmpty ? 'ไม่พบข้อมูล' : status,
+  };
+}
+
 Future<void> _showAdminFullScreenMap(
   BuildContext context, {
   required String title,
@@ -551,7 +566,22 @@ class _AdminPanelState extends State<_AdminPanel>
             stores: stores,
           ),
         ),
-        _tabBody(5, _Reports(rows: reports, changed: () => _reloadTab(5))),
+        _tabBody(
+          5,
+          _Reports(
+            rows: reports,
+            changed: () => _reloadTab(5),
+            openManagement: (type) async {
+              final tab = switch (type) {
+                'listing' => 2,
+                'store' => 3,
+                _ => 1,
+              };
+              _selectTab(tab);
+              await _reloadTab(tab);
+            },
+          ),
+        ),
         _tabBody(
           6,
           _StoreRequests(
@@ -2902,7 +2932,12 @@ class _StoreRequests extends StatelessWidget {
 class _Reports extends StatefulWidget {
   final List<Map<String, dynamic>> rows;
   final Future<void> Function() changed;
-  const _Reports({required this.rows, required this.changed});
+  final Future<void> Function(String type) openManagement;
+  const _Reports({
+    required this.rows,
+    required this.changed,
+    required this.openManagement,
+  });
 
   @override
   State<_Reports> createState() => _ReportsState();
@@ -2937,6 +2972,15 @@ class _ReportsState extends State<_Reports> {
       if (mounted) setState(() => _reviewingIds.remove(id));
     }
   }
+
+  Future<void> _openTarget(Map<String, dynamic> report) => showDialog<void>(
+    context: context,
+    builder: (_) => _ReportTargetDialog(
+      report: report,
+      onChanged: widget.changed,
+      onOpenManagement: widget.openManagement,
+    ),
+  );
 
   @override
   Widget build(BuildContext context) {
@@ -3000,6 +3044,7 @@ class _ReportsState extends State<_Reports> {
                       pendingLabel: l10n.ui('reportPending'),
                       reviewedLabel: l10n.ui('reportReviewed'),
                     );
+                    final targetStatus = adminReportTargetStatus(r);
                     return Card(
                       child: CheckboxListTile(
                         value: reviewed,
@@ -3012,28 +3057,223 @@ class _ReportsState extends State<_Reports> {
                                 if (v != true) return;
                                 await _markReviewed(id);
                               },
-                        title: Text(targetName),
+                        title: InkWell(
+                          onTap: () => _openTarget(r),
+                          child: Text(targetName),
+                        ),
                         subtitle: Text(
-                          '${r['reason']}\n$status • ID: '
+                          '${r['reason']}\n$status • $targetStatus • ID: '
                           '${adminReportTargetIdDetail(r)}',
                         ),
                         isThreeLine: true,
-                        secondary: r['type'] == 'user'
-                            ? const Icon(Icons.person_outline_rounded)
-                            : IconButton(
-                                icon: const Icon(Icons.open_in_new_rounded),
-                                onPressed: () => Navigator.pushNamed(
-                                  context,
-                                  r['type'] == 'store'
-                                      ? '/store-detail'
-                                      : '/product-detail',
-                                  arguments: r['target_id'],
-                                ),
-                              ),
+                        secondary: IconButton(
+                          tooltip: 'ดูเป้าหมายรายงาน',
+                          icon: Icon(
+                            r['type'] == 'user'
+                                ? Icons.person_outline_rounded
+                                : Icons.open_in_new_rounded,
+                          ),
+                          onPressed: () => _openTarget(r),
+                        ),
                       ),
                     );
                   },
                 ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ReportTargetDialog extends StatefulWidget {
+  final Map<String, dynamic> report;
+  final Future<void> Function() onChanged;
+  final Future<void> Function(String type) onOpenManagement;
+  const _ReportTargetDialog({
+    required this.report,
+    required this.onChanged,
+    required this.onOpenManagement,
+  });
+
+  @override
+  State<_ReportTargetDialog> createState() => _ReportTargetDialogState();
+}
+
+class _ReportTargetDialogState extends State<_ReportTargetDialog> {
+  bool _busy = false;
+
+  Map<String, dynamic>? get _target => widget.report['target'] is Map
+      ? Map<String, dynamic>.from(widget.report['target'] as Map)
+      : null;
+
+  Future<void> _act(String action) async {
+    final target = _target;
+    if (target == null || _busy) return;
+    setState(() => _busy = true);
+    try {
+      final id = '${target['id']}';
+      switch ('${widget.report['type']}:$action') {
+        case 'listing:hide':
+          await SuikaiService.admin.setListingStatus(id, 'hidden');
+          break;
+        case 'listing:restore':
+          await SuikaiService.admin.setListingStatus(id, 'visible');
+          break;
+        case 'listing:delete':
+          await SuikaiService.admin.deleteListing(id);
+          break;
+        case 'store:suspend':
+          await SuikaiService.admin.setStoreStatus(id, 'suspended');
+          break;
+        case 'store:restore':
+          await SuikaiService.admin.setStoreStatus(id, 'active');
+          break;
+        case 'user:suspend':
+          await SuikaiService.admin.setUserStatus(id, 'suspended');
+          break;
+        case 'user:restore':
+          await SuikaiService.admin.setUserStatus(id, 'active');
+          break;
+      }
+      await widget.onChanged();
+      if (mounted) Navigator.pop(context);
+    } catch (error, stackTrace) {
+      debugPrint('Report target action failed: action=$action error=$error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('จัดการเป้าหมายรายงานไม่สำเร็จ')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _openOwner(Map<String, dynamic> owner) => showDialog<void>(
+    context: context,
+    builder: (_) => AlertDialog(
+      title: Text('${owner['name'] ?? 'ไม่พบข้อมูล'}'),
+      content: SelectableText(
+        'ID: ${owner['id'] ?? '-'}\n'
+        'สถานะ: ${owner['status'] ?? '-'}\n'
+        'Email: ${owner['email'] ?? '-'}\n'
+        'Phone: ${owner['phone'] ?? '-'}\n'
+        'เมือง: ${owner['city'] ?? '-'}',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('ปิด'),
+        ),
+      ],
+    ),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    final target = _target;
+    final type = '${widget.report['type']}';
+    if (target == null) {
+      return AlertDialog(
+        title: const Text('ไม่พบข้อมูล / ถูกลบแล้ว'),
+        content: SelectableText(
+          'เหตุผลรายงาน: ${widget.report['reason']}\n'
+          'ID: ${adminReportTargetIdDetail(widget.report)}',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('ปิด'),
+          ),
+        ],
+      );
+    }
+    final owner = target['owner'] is Map
+        ? Map<String, dynamic>.from(target['owner'] as Map)
+        : null;
+    final images = target['listing_images'] is List
+        ? (target['listing_images'] as List).whereType<Map>().toList()
+        : const <Map>[];
+    final imageUrl = images.isEmpty ? '' : '${images.first['image_url'] ?? ''}';
+    final hidden = target['is_hidden'] == true;
+    final suspended = '${target['status']}' == 'suspended';
+    final actionLabel = switch (type) {
+      'listing' => hidden ? 'ยกเลิกการซ่อน' : 'ซ่อนประกาศ',
+      'store' => suspended ? 'ยกเลิกการระงับ' : 'ระงับร้าน',
+      _ => suspended ? 'ยกเลิกระงับบัญชี' : 'ระงับบัญชี',
+    };
+    final action = switch (type) {
+      'listing' => hidden ? 'restore' : 'hide',
+      'store' => suspended ? 'restore' : 'suspend',
+      _ => suspended ? 'restore' : 'suspend',
+    };
+    return AlertDialog(
+      title: Text('${target['title'] ?? target['name'] ?? 'ไม่พบข้อมูล'}'),
+      content: SizedBox(
+        width: 560,
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (imageUrl.isNotEmpty)
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: Image.network(
+                    imageUrl,
+                    height: 180,
+                    width: double.infinity,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, _, _) => const SizedBox.shrink(),
+                  ),
+                ),
+              if (imageUrl.isNotEmpty) const SizedBox(height: 12),
+              SelectableText(
+                'สถานะเป้าหมาย: ${adminReportTargetStatus(widget.report)}\n'
+                'เจ้าของ: ${owner?['name'] ?? '-'}\n'
+                'เมือง: ${target['city'] ?? '-'}\n'
+                'หมวดหมู่: ${target['category'] ?? target['category_id'] ?? '-'}\n'
+                'รายละเอียด: ${target['description'] ?? '-'}\n\n'
+                'เหตุผลรายงาน: ${widget.report['reason']}\n'
+                'วันที่รายงาน: ${widget.report['created_at']}',
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        if (owner != null)
+          TextButton(
+            onPressed: () => _openOwner(owner),
+            child: Text(type == 'store' ? 'ดูเจ้าของร้าน' : 'ดูเจ้าของ'),
+          ),
+        TextButton(
+          onPressed: _busy
+              ? null
+              : () async {
+                  Navigator.pop(context);
+                  await widget.onOpenManagement(type);
+                },
+          child: Text(
+            type == 'listing'
+                ? 'ดูประกาศ'
+                : type == 'store'
+                ? 'ดูร้าน'
+                : 'ดูผู้ใช้',
+          ),
+        ),
+        TextButton(
+          onPressed: _busy ? null : () => _act(action),
+          child: Text(actionLabel),
+        ),
+        if (type == 'listing')
+          TextButton(
+            onPressed: _busy ? null : () => _act('delete'),
+            child: const Text('ลบประกาศ'),
+          ),
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.pop(context),
+          child: const Text('ปิด'),
         ),
       ],
     );

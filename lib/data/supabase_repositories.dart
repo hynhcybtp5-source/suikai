@@ -1756,9 +1756,14 @@ class SupabaseAdminRepository implements AdminRepository {
           .select(
             'id,listing_id,store_id,reported_user_id,reason,status,'
             'workflow_status,created_at,reviewed_at,'
-            'listing:listings!reports_listing_id_fkey(title),'
-            'store:stores!reports_store_id_fkey(name),'
-            'reported_user:profiles!reports_reported_user_id_fkey(name)',
+            'listing:listings!reports_listing_id_fkey('
+            'id,title,description,owner_id,status,is_hidden,is_published,deleted_at,city,category,category_id,'
+            'listing_images(image_url,sort_order),'
+            'owner:profiles!listings_owner_id_fkey(id,name,email,phone,city,status)), '
+            'store:stores!reports_store_id_fkey('
+            'id,name,description,owner_id,status,lifecycle_status,is_hidden,deleted_at,city,category,category_id,phone,'
+            'owner:profiles!stores_owner_id_fkey(id,name,email,phone,city,status)), '
+            'reported_user:profiles!reports_reported_user_id_fkey(id,name,email,phone,city,status)',
           )
           .order('created_at', ascending: false)
           .range(page * pageSize, (page + 1) * pageSize - 1),
@@ -1780,6 +1785,8 @@ class SupabaseAdminRepository implements AdminRepository {
         _ => value['reported_user'],
       });
       final targetRow = target.isEmpty ? null : _json(target.first);
+      value['target'] = targetRow;
+      value['target_missing'] = targetRow == null;
       value['target_name'] = switch (value['type']) {
         'listing' => '${targetRow?['title'] ?? ''}'.trim(),
         _ => '${targetRow?['name'] ?? ''}'.trim(),
