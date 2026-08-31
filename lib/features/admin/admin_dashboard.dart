@@ -22,6 +22,10 @@ String adminLocationText(double? latitude, double? longitude) {
       'Longitude: ${longitude.toStringAsFixed(6)}';
 }
 
+/// Reviewed reports are final in the current moderation workflow.
+bool canMarkReportReviewed(Map<String, dynamic> report) =>
+    report['reviewed'] != true;
+
 Future<void> _showAdminFullScreenMap(
   BuildContext context, {
   required String title,
@@ -2864,10 +2868,44 @@ class _StoreRequests extends StatelessWidget {
   }
 }
 
-class _Reports extends StatelessWidget {
+class _Reports extends StatefulWidget {
   final List<Map<String, dynamic>> rows;
   final Future<void> Function() changed;
   const _Reports({required this.rows, required this.changed});
+
+  @override
+  State<_Reports> createState() => _ReportsState();
+}
+
+class _ReportsState extends State<_Reports> {
+  final Set<String> _reviewingIds = {};
+
+  Future<void> _markReviewed(String id) async {
+    if (_reviewingIds.contains(id)) return;
+    setState(() => _reviewingIds.add(id));
+    try {
+      await SuikaiService.admin.reviewReport(id, true);
+      await widget.changed();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('ทำเครื่องหมายตรวจสอบแล้ว')),
+        );
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Admin report review failed: id=$id error=$error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('บันทึกสถานะรายงานไม่สำเร็จ โปรดลองอีกครั้ง'),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _reviewingIds.remove(id));
+    }
+  }
+
   @override
   Widget build(BuildContext context) => Column(
     children: [
@@ -2877,38 +2915,36 @@ class _Reports extends StatelessWidget {
             'ตรวจสอบรายงานจากผู้ใช้งานและทำเครื่องหมายเมื่อดำเนินการแล้ว',
         action: IconButton(
           tooltip: 'รีเฟรชรายงาน',
-          onPressed: changed,
+          onPressed: widget.changed,
           icon: const Icon(Icons.refresh_rounded),
         ),
       ),
       Expanded(
-        child: rows.isEmpty
+        child: widget.rows.isEmpty
             ? const AdminEmptyState(
                 icon: Icons.flag_outlined,
                 title: 'ไม่มีรายงานที่ต้องตรวจ',
                 message: 'ขณะนี้ไม่มีรายงานจากผู้ใช้งาน',
               )
             : ListView.separated(
-                itemCount: rows.length,
+                itemCount: widget.rows.length,
                 separatorBuilder: (_, _) => const SizedBox(height: 8),
                 itemBuilder: (_, i) {
-                  final r = rows[i];
+                  final r = widget.rows[i];
                   final reviewed = r['reviewed'] == true;
+                  final id = '${r['id']}';
+                  final saving = _reviewingIds.contains(id);
                   return Card(
                     child: CheckboxListTile(
                       value: reviewed,
                       // A reviewed report is final in the current moderation
                       // workflow.  Keep the control disabled so the UI never
                       // promises an unsupported return to the pending state.
-                      onChanged: reviewed
+                      onChanged: !canMarkReportReviewed(r) || saving
                           ? null
                           : (v) async {
                               if (v != true) return;
-                              await SuikaiService.admin.reviewReport(
-                                '${r['id']}',
-                                true,
-                              );
-                              await changed();
+                              await _markReviewed(id);
                             },
                       title: Text('${r['reason']}'),
                       subtitle: Text(
