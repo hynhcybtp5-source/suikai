@@ -26,6 +26,18 @@ String adminLocationText(double? latitude, double? longitude) {
 bool canMarkReportReviewed(Map<String, dynamic> report) =>
     report['reviewed'] != true;
 
+enum AdminReportFilter { pending, all }
+
+List<Map<String, dynamic>> filterAdminReports(
+  List<Map<String, dynamic>> reports,
+  AdminReportFilter filter,
+) => filter == AdminReportFilter.all
+    ? reports
+    : reports.where(canMarkReportReviewed).toList();
+
+String adminReportStatusLabel(Map<String, dynamic> report) =>
+    canMarkReportReviewed(report) ? 'รอตรวจ' : 'ตรวจแล้ว';
+
 Future<void> _showAdminFullScreenMap(
   BuildContext context, {
   required String title,
@@ -2879,6 +2891,7 @@ class _Reports extends StatefulWidget {
 
 class _ReportsState extends State<_Reports> {
   final Set<String> _reviewingIds = {};
+  AdminReportFilter _filter = AdminReportFilter.pending;
 
   Future<void> _markReviewed(String id) async {
     if (_reviewingIds.contains(id)) return;
@@ -2907,69 +2920,95 @@ class _ReportsState extends State<_Reports> {
   }
 
   @override
-  Widget build(BuildContext context) => Column(
-    children: [
-      AdminPageTitle(
-        title: 'รายงาน',
-        description:
-            'ตรวจสอบรายงานจากผู้ใช้งานและทำเครื่องหมายเมื่อดำเนินการแล้ว',
-        action: IconButton(
-          tooltip: 'รีเฟรชรายงาน',
-          onPressed: widget.changed,
-          icon: const Icon(Icons.refresh_rounded),
-        ),
-      ),
-      Expanded(
-        child: widget.rows.isEmpty
-            ? const AdminEmptyState(
-                icon: Icons.flag_outlined,
-                title: 'ไม่มีรายงานที่ต้องตรวจ',
-                message: 'ขณะนี้ไม่มีรายงานจากผู้ใช้งาน',
-              )
-            : ListView.separated(
-                itemCount: widget.rows.length,
-                separatorBuilder: (_, _) => const SizedBox(height: 8),
-                itemBuilder: (_, i) {
-                  final r = widget.rows[i];
-                  final reviewed = r['reviewed'] == true;
-                  final id = '${r['id']}';
-                  final saving = _reviewingIds.contains(id);
-                  return Card(
-                    child: CheckboxListTile(
-                      value: reviewed,
-                      // A reviewed report is final in the current moderation
-                      // workflow.  Keep the control disabled so the UI never
-                      // promises an unsupported return to the pending state.
-                      onChanged: !canMarkReportReviewed(r) || saving
-                          ? null
-                          : (v) async {
-                              if (v != true) return;
-                              await _markReviewed(id);
-                            },
-                      title: Text('${r['reason']}'),
-                      subtitle: Text(
-                        '${r['type']} • ${r['target_id']}\n${r['created_at']}',
-                      ),
-                      isThreeLine: true,
-                      secondary: r['type'] == 'user'
-                          ? const Icon(Icons.person_outline_rounded)
-                          : IconButton(
-                              icon: const Icon(Icons.open_in_new_rounded),
-                              onPressed: () => Navigator.pushNamed(
-                                context,
-                                r['type'] == 'store'
-                                    ? '/store-detail'
-                                    : '/product-detail',
-                                arguments: r['target_id'],
-                              ),
-                            ),
-                    ),
-                  );
-                },
+  Widget build(BuildContext context) {
+    final visibleReports = filterAdminReports(widget.rows, _filter);
+    return Column(
+      children: [
+        AdminPageTitle(
+          title: 'รายงาน',
+          description:
+              'ตรวจสอบรายงานจากผู้ใช้งานและทำเครื่องหมายเมื่อดำเนินการแล้ว',
+          action: Wrap(
+            spacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              ChoiceChip(
+                label: const Text('รอตรวจ'),
+                selected: _filter == AdminReportFilter.pending,
+                onSelected: (_) =>
+                    setState(() => _filter = AdminReportFilter.pending),
               ),
-      ),
-    ],
-  );
+              ChoiceChip(
+                label: const Text('ทั้งหมด'),
+                selected: _filter == AdminReportFilter.all,
+                onSelected: (_) =>
+                    setState(() => _filter = AdminReportFilter.all),
+              ),
+              IconButton(
+                tooltip: 'รีเฟรชรายงาน',
+                onPressed: widget.changed,
+                icon: const Icon(Icons.refresh_rounded),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: visibleReports.isEmpty
+              ? AdminEmptyState(
+                  icon: Icons.flag_outlined,
+                  title: _filter == AdminReportFilter.pending
+                      ? 'ไม่มีรายงานที่ต้องตรวจ'
+                      : 'ยังไม่มีรายงาน',
+                  message: _filter == AdminReportFilter.pending
+                      ? 'ขณะนี้ไม่มีรายงานที่รอตรวจ'
+                      : 'ขณะนี้ไม่มีรายงานจากผู้ใช้งาน',
+                )
+              : ListView.separated(
+                  itemCount: visibleReports.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 8),
+                  itemBuilder: (_, i) {
+                    final r = visibleReports[i];
+                    final reviewed = r['reviewed'] == true;
+                    final id = '${r['id']}';
+                    final saving = _reviewingIds.contains(id);
+                    return Card(
+                      child: CheckboxListTile(
+                        value: reviewed,
+                        // A reviewed report is final in the current moderation
+                        // workflow.  Keep the control disabled so the UI never
+                        // promises an unsupported return to the pending state.
+                        onChanged: !canMarkReportReviewed(r) || saving
+                            ? null
+                            : (v) async {
+                                if (v != true) return;
+                                await _markReviewed(id);
+                              },
+                        title: Text('${r['reason']}'),
+                        subtitle: Text(
+                          '${adminReportStatusLabel(r)} • ${r['type']} • '
+                          '${r['target_id']}\n${r['created_at']}',
+                        ),
+                        isThreeLine: true,
+                        secondary: r['type'] == 'user'
+                            ? const Icon(Icons.person_outline_rounded)
+                            : IconButton(
+                                icon: const Icon(Icons.open_in_new_rounded),
+                                onPressed: () => Navigator.pushNamed(
+                                  context,
+                                  r['type'] == 'store'
+                                      ? '/store-detail'
+                                      : '/product-detail',
+                                  arguments: r['target_id'],
+                                ),
+                              ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
 }
 
 class _Categories extends StatelessWidget {
