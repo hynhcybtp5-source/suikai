@@ -138,6 +138,23 @@ List<dynamic> _relationRows(dynamic value) => switch (value) {
   _ => const [],
 };
 
+/// Adds owner profiles resolved by one batched query to listing/store targets.
+/// A missing profile is intentional: callers retain the target and use the UI
+/// fallback instead of treating it as a failed reports query.
+void attachAdminReportTargetOwners(
+  List<Map<String, dynamic>> reports,
+  Map<String, Map<String, dynamic>> ownersById,
+) {
+  for (final report in reports) {
+    final target = report['target'];
+    if (target is! Map) continue;
+    final targetRow = Map<String, dynamic>.from(target);
+    final owner = ownersById['${targetRow['owner_id'] ?? ''}'];
+    if (owner != null) targetRow['owner'] = owner;
+    report['target'] = targetRow;
+  }
+}
+
 List<String> _listingImageUrls(SupabaseClient client, dynamic relation) {
   final rows = _relationRows(relation).map(_json).toList()
     ..sort(
@@ -1749,7 +1766,7 @@ class SupabaseAdminRepository implements AdminRepository {
     int pageSize = 50,
   }) async {
     _guard();
-    return (await _timed(
+    final rows = (await _timed(
       'reports.page_1',
       () => client
           .from('reports')
@@ -1758,17 +1775,21 @@ class SupabaseAdminRepository implements AdminRepository {
             'workflow_status,created_at,reviewed_at,'
             'listing:listings!reports_listing_id_fkey('
             'id,title,description,owner_id,status,is_hidden,is_published,deleted_at,city,category,category_id,'
-            'listing_images(image_url,sort_order),'
-            'owner:profiles!listings_owner_id_fkey(id,name,email,phone,city,status)), '
+            'listing_images(image_url,sort_order)), '
             'store:stores!reports_store_id_fkey('
             'id,name,description,owner_id,status,lifecycle_status,is_hidden,deleted_at,city,category,category_id,phone,'
-            'owner:profiles!stores_owner_id_fkey(id,name,email,phone,city,status)), '
+            '), '
             'reported_user:profiles!reports_reported_user_id_fkey(id,name,email,phone,city,status)',
           )
           .order('created_at', ascending: false)
           .range(page * pageSize, (page + 1) * pageSize - 1),
-    )).map((row) {
-      final value = _json(row);
+    )).map(_json).toList();
+
+    // listings.owner_id and stores.owner_id reference auth.users in the live
+    // schema, not profiles.  PostgREST therefore cannot embed profiles from
+    // either target.  Resolve every owner in one batched profiles query.
+    final ownerIds = <String>{};
+    for (final value in rows) {
       value['target_id'] =
           value['listing_id'] ?? value['store_id'] ?? value['reported_user_id'];
       value['type'] = value['listing_id'] != null
@@ -1787,6 +1808,26 @@ class SupabaseAdminRepository implements AdminRepository {
       final targetRow = target.isEmpty ? null : _json(target.first);
       value['target'] = targetRow;
       value['target_missing'] = targetRow == null;
+      final ownerId = '${targetRow?['owner_id'] ?? ''}'.trim();
+      if (ownerId.isNotEmpty) ownerIds.add(ownerId);
+    }
+    final ownersById = <String, Map<String, dynamic>>{};
+    if (ownerIds.isNotEmpty) {
+      final owners = await client
+          .from('profiles')
+          .select('id,name,email,phone,city,status')
+          .inFilter('id', ownerIds.toList());
+      for (final owner in owners) {
+        final profile = _json(owner);
+        ownersById['${profile['id']}'] = profile;
+      }
+    }
+
+    attachAdminReportTargetOwners(rows, ownersById);
+    return rows.map((value) {
+      final targetRow = value['target'] is Map
+          ? Map<String, dynamic>.from(value['target'] as Map)
+          : null;
       value['target_name'] = switch (value['type']) {
         'listing' => '${targetRow?['title'] ?? ''}'.trim(),
         _ => '${targetRow?['name'] ?? ''}'.trim(),

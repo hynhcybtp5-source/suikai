@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:suikai/data/supabase_repositories.dart';
 import 'package:suikai/features/admin/admin_dashboard.dart';
 
 void main() {
@@ -102,5 +103,36 @@ void main() {
         );
       },
     );
+
+    test('batch owner resolution handles listing, store, user, and missing profiles', () {
+      final reports = <Map<String, dynamic>>[
+        {
+          'type': 'listing',
+          'target': {'owner_id': 'owner-1', 'title': 'Listing'},
+        },
+        {
+          'type': 'store',
+          'target': {'owner_id': 'owner-2', 'name': 'Store'},
+        },
+        {
+          'type': 'user',
+          'target': {'id': 'user-1', 'name': 'User'},
+        },
+        {
+          'type': 'listing',
+          'target': {'owner_id': 'deleted-owner', 'title': 'No owner'},
+        },
+      ];
+
+      attachAdminReportTargetOwners(reports, {
+        'owner-1': {'id': 'owner-1', 'name': 'Listing owner'},
+        'owner-2': {'id': 'owner-2', 'name': 'Store owner'},
+      });
+
+      expect(reports[0]['target']['owner']['name'], 'Listing owner');
+      expect(reports[1]['target']['owner']['name'], 'Store owner');
+      expect(reports[2]['target']['name'], 'User');
+      expect(reports[3]['target']['owner'], isNull);
+    });
   });
 }
