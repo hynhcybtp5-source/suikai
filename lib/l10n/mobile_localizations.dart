@@ -11,6 +11,19 @@ extension MobileLocalizations on AppLocalizations {
         'ချိတ်ဆက်၍မရပါ',
         'ဢမ်ႇၸၢင်ႈၵပ်းသိုပ်ႇလႆႈ',
       ],
+      'reportPending': [
+        'รอตรวจ',
+        'Pending review',
+        'စစ်ဆေးရန် စောင့်ဆိုင်းနေသည်',
+        'တႃႇထတ်းတူၺ်း',
+      ],
+      'reportReviewed': ['ตรวจแล้ว', 'Reviewed', 'စစ်ဆေးပြီး', 'ထတ်းတူၺ်းယဝ်ႉ'],
+      'reportTargetMissing': [
+        'ไม่พบข้อมูล',
+        'Information unavailable',
+        'အချက်အလက် မတွေ့ပါ',
+        'ဢမ်ႇႁၼ်ၶေႃႈမုၼ်း',
+      ],
       'networkBlockedMessage': [
         'เครือข่ายที่คุณกำลังใช้อยู่อาจจำกัดการเข้าถึงบริการที่ Suikai จำเป็นต้องใช้ กรุณาเปิด VPN แล้วลองใหม่อีกครั้ง',
         'Your current network may restrict access to services required by Suikai. Please turn on a VPN and try again.',

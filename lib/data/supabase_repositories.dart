@@ -1755,7 +1755,10 @@ class SupabaseAdminRepository implements AdminRepository {
           .from('reports')
           .select(
             'id,listing_id,store_id,reported_user_id,reason,status,'
-            'workflow_status,created_at,reviewed_at',
+            'workflow_status,created_at,reviewed_at,'
+            'listing:listings!reports_listing_id_fkey(title),'
+            'store:stores!reports_store_id_fkey(name),'
+            'reported_user:profiles!reports_reported_user_id_fkey(name)',
           )
           .order('created_at', ascending: false)
           .range(page * pageSize, (page + 1) * pageSize - 1),
@@ -1768,6 +1771,19 @@ class SupabaseAdminRepository implements AdminRepository {
           : value['store_id'] != null
           ? 'store'
           : 'user';
+      // Target details are embedded in this same query so the report list does
+      // not issue one lookup per row. A missing/deleted target simply yields an
+      // empty display name and is handled by the UI fallback.
+      final target = _relationRows(switch (value['type']) {
+        'listing' => value['listing'],
+        'store' => value['store'],
+        _ => value['reported_user'],
+      });
+      final targetRow = target.isEmpty ? null : _json(target.first);
+      value['target_name'] = switch (value['type']) {
+        'listing' => '${targetRow?['title'] ?? ''}'.trim(),
+        _ => '${targetRow?['name'] ?? ''}'.trim(),
+      };
       // New reports use canonical workflow_status=pending while the legacy
       // status remains open; honour both formats so no pending row disappears.
       value['reviewed'] =

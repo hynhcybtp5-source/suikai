@@ -25,8 +25,57 @@ void main() {
     });
 
     test('uses clear labels for report status', () {
-      expect(adminReportStatusLabel({'reviewed': false}), 'รอตรวจ');
-      expect(adminReportStatusLabel({'reviewed': true}), 'ตรวจแล้ว');
+      expect(
+        adminReportStatusLabel(
+          {'reviewed': false},
+          pendingLabel: 'Pending review',
+          reviewedLabel: 'Reviewed',
+        ),
+        'Pending review',
+      );
+      expect(
+        adminReportStatusLabel(
+          {'reviewed': true},
+          pendingLabel: 'Pending review',
+          reviewedLabel: 'Reviewed',
+        ),
+        'Reviewed',
+      );
+    });
+
+    test('uses listing and store names as report targets', () {
+      expect(
+        adminReportTargetName({
+          'type': 'listing',
+          'target_name': 'โทรศัพท์มือสอง',
+        }, missingLabel: 'Information unavailable'),
+        'โทรศัพท์มือสอง',
+      );
+      expect(
+        adminReportTargetName({
+          'type': 'store',
+          'target_name': 'Suikai Phone Shop',
+        }, missingLabel: 'Information unavailable'),
+        'Suikai Phone Shop',
+      );
+      expect(
+        adminReportTargetName({
+          'type': 'user',
+          'target_name': 'Nok',
+        }, missingLabel: 'Information unavailable'),
+        'Nok',
+      );
+    });
+
+    test('uses a readable fallback for a missing target', () {
+      const missing = 'Information unavailable';
+      final report = {
+        'target_name': '',
+        'target_id': '12345678-90ab-cdef-1234-567890abcdef',
+      };
+
+      expect(adminReportTargetName(report, missingLabel: missing), missing);
+      expect(adminReportTargetIdDetail(report), '12345678…');
     });
   });
 }

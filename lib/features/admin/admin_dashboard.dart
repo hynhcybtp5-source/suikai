@@ -6,6 +6,8 @@ import 'package:video_player/video_player.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/category_icons.dart';
 import '../../data/models.dart';
+import '../../l10n/app_localizations.dart';
+import '../../l10n/mobile_localizations.dart';
 import '../../services/suikai_service.dart';
 import '../../widgets/location_picker_map.dart';
 import 'admin_ui.dart';
@@ -35,8 +37,25 @@ List<Map<String, dynamic>> filterAdminReports(
     ? reports
     : reports.where(canMarkReportReviewed).toList();
 
-String adminReportStatusLabel(Map<String, dynamic> report) =>
-    canMarkReportReviewed(report) ? 'รอตรวจ' : 'ตรวจแล้ว';
+String adminReportStatusLabel(
+  Map<String, dynamic> report, {
+  required String pendingLabel,
+  required String reviewedLabel,
+}) => canMarkReportReviewed(report) ? pendingLabel : reviewedLabel;
+
+String adminReportTargetName(
+  Map<String, dynamic> report, {
+  required String missingLabel,
+}) {
+  final name = '${report['target_name'] ?? ''}'.trim();
+  return name.isEmpty ? missingLabel : name;
+}
+
+String adminReportTargetIdDetail(Map<String, dynamic> report) {
+  final id = '${report['target_id'] ?? ''}'.trim();
+  if (id.isEmpty) return '—';
+  return id.length > 8 ? '${id.substring(0, 8)}…' : id;
+}
 
 Future<void> _showAdminFullScreenMap(
   BuildContext context, {
@@ -2922,6 +2941,7 @@ class _ReportsState extends State<_Reports> {
   @override
   Widget build(BuildContext context) {
     final visibleReports = filterAdminReports(widget.rows, _filter);
+    final l10n = AppLocalizations.of(context);
     return Column(
       children: [
         AdminPageTitle(
@@ -2971,6 +2991,15 @@ class _ReportsState extends State<_Reports> {
                     final reviewed = r['reviewed'] == true;
                     final id = '${r['id']}';
                     final saving = _reviewingIds.contains(id);
+                    final targetName = adminReportTargetName(
+                      r,
+                      missingLabel: l10n.ui('reportTargetMissing'),
+                    );
+                    final status = adminReportStatusLabel(
+                      r,
+                      pendingLabel: l10n.ui('reportPending'),
+                      reviewedLabel: l10n.ui('reportReviewed'),
+                    );
                     return Card(
                       child: CheckboxListTile(
                         value: reviewed,
@@ -2983,10 +3012,10 @@ class _ReportsState extends State<_Reports> {
                                 if (v != true) return;
                                 await _markReviewed(id);
                               },
-                        title: Text('${r['reason']}'),
+                        title: Text(targetName),
                         subtitle: Text(
-                          '${adminReportStatusLabel(r)} • ${r['type']} • '
-                          '${r['target_id']}\n${r['created_at']}',
+                          '${r['reason']}\n$status • ID: '
+                          '${adminReportTargetIdDetail(r)}',
                         ),
                         isThreeLine: true,
                         secondary: r['type'] == 'user'
