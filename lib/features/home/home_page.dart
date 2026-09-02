@@ -9170,6 +9170,25 @@ class _ProfilePageState extends State<ProfilePage> {
               .toList(),
           onChanged: (value) => setState(() => _selectedStoreId = value),
         ),
+        const SizedBox(height: 10),
+        for (final store in _myStores)
+          Card(
+            margin: const EdgeInsets.only(bottom: 10),
+            child: ListTile(
+              leading: const Icon(Icons.storefront_outlined),
+              title: Text(store.name),
+              subtitle: Text(
+                '${store.city} • ${store.effectiveStatus == 'approved' ? 'อนุมัติแล้ว' : store.effectiveStatus == 'rejected' ? 'ไม่ผ่านการอนุมัติ' : store.effectiveStatus == 'suspended' ? 'ระงับแล้ว' : 'รอการอนุมัติ'}',
+              ),
+              trailing: const Icon(Icons.chevron_right_rounded),
+              onTap: () => Navigator.pushNamed(
+                context,
+                SuikaiRoutes.storeDetail,
+                arguments: store.id,
+              ),
+            ),
+          ),
+        const Divider(height: 24),
         if (selected != null) ...[
           const SizedBox(height: 10),
           ListTile(
