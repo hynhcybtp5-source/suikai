@@ -9100,7 +9100,10 @@ class _ProfilePageState extends State<ProfilePage> {
   }
 
   Widget _storesSection(BuildContext context, List<ProductViewModel> products) {
-    if (_myStores.isEmpty) {
+    final visibleStores = _myStores
+        .where((store) => store.effectiveStatus != 'suspended')
+        .toList();
+    if (visibleStores.isEmpty) {
       return Padding(
         padding: const EdgeInsets.symmetric(vertical: 36),
         child: Column(
@@ -9119,50 +9122,18 @@ class _ProfilePageState extends State<ProfilePage> {
         ),
       );
     }
-    final selected = _myStores
+    final selected = visibleStores
         .where((store) => store.id == _selectedStoreId)
-        .firstOrNull;
-    if (selected != null && !selected.approved) {
-      return Container(
-        key: const ValueKey('pending-store'),
-        margin: const EdgeInsets.only(top: 14),
-        padding: const EdgeInsets.all(24),
-        decoration: BoxDecoration(
-          color: AppTheme.orangeSoft,
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(color: const Color(0xFFFFD6C1)),
-        ),
-        child: Column(
-          children: [
-            const Icon(
-              Icons.hourglass_top_rounded,
-              color: AppTheme.orange,
-              size: 32,
-            ),
-            const SizedBox(height: 12),
-            const LocalizedText(
-              'รออนุมัติ',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              'ร้าน ${selected.name} กำลังรอการตรวจสอบ',
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: AppTheme.textMuted),
-            ),
-          ],
-        ),
-      );
-    }
+        .firstOrNull ?? visibleStores.first;
     return Column(
       key: const ValueKey('store'),
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         DropdownButtonFormField<String>(
-          value: _selectedStoreId,
+          value: selected.id,
           isExpanded: true,
           decoration: const InputDecoration(labelText: 'เลือกร้านค้า'),
-          items: _myStores
+          items: visibleStores
               .map(
                 (store) =>
                     DropdownMenuItem(value: store.id, child: Text(store.name)),
@@ -9171,7 +9142,7 @@ class _ProfilePageState extends State<ProfilePage> {
           onChanged: (value) => setState(() => _selectedStoreId = value),
         ),
         const SizedBox(height: 10),
-        for (final store in _myStores)
+        for (final store in visibleStores)
           Card(
             margin: const EdgeInsets.only(bottom: 10),
             child: ListTile(
