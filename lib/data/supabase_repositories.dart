@@ -1777,7 +1777,7 @@ class SupabaseAdminRepository implements AdminRepository {
             'id,title,description,owner_id,status,is_hidden,is_published,deleted_at,city,category,category_id,'
             'listing_images(image_url,sort_order)), '
             'store:stores!reports_store_id_fkey('
-            'id,name,description,owner_id,status,lifecycle_status,is_hidden,deleted_at,city,category,category_id,phone,'
+            'id,name,description,owner_id,status,lifecycle_status,is_hidden,deleted_at,city,category,category_id,phone'
             '), '
             'reported_user:profiles!reports_reported_user_id_fkey(id,name,email,phone,city,status)',
           )
